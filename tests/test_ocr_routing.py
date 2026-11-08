@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from hannom.config import ApiSettings, BookConfig, OCRSettings, ProjectConfig
 from hannom.models import OCRLine, OCRResult, PageRecord
 from hannom.ocr.base import OCREngine
@@ -201,4 +203,4 @@ def test_page_confidence_is_mean_of_lines():
             OCRLine("b", ((0, 0),) * 4, confidence=0.4),
         ],
     )
-    assert page_confidence([result]) == 0.6
+    assert page_confidence([result]) == pytest.approx(0.6)

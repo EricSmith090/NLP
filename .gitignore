@@ -4,6 +4,11 @@
 /models/
 /artifacts/
 *.zip
+# Official dictionary drop received on 2026-11-04 (entries/*.jsonl + viewer
+# binaries + reference scans, ~3.4 GB). Keep out of git; wire into
+# configs/dictionary.yaml via entries_dir instead.
+/dictionaries-04-11-2026/
+/dictionaries/
 
 # Secrets
 .env

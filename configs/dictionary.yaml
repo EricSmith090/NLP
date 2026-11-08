@@ -1,9 +1,11 @@
-# The official 12-source JSONL dataset is optional. The pipeline works
-# without it and must not auto-red a character merely because a source is
-# missing. Put official files in dictionaries/entries/<source>.jsonl.
+# Official dictionary dataset received 2026-11-04 (not committed; ~3.1 GB of
+# entries JSONL, 12 sources, shared Entry/v1 schema: head, kind, script,
+# readings[{value,system}], senses[{text,lang}]). The pipeline discovers
+# every entries/*.jsonl by glob and works without them; dictionary misses
+# can never auto-red a character, only route it to review.
 dictionary:
-  entries_dir: "dictionaries/entries"
-  sources: []
+  entries_dir: "dictionaries-04-11-2026/entries"
+  sources: []  # discovery is by glob; this list is only a label fallback
   unihan_dir: "dictionaries/unihan"
   cedict_path: "dictionaries/cc_cedict.txt"
   makemeahanzi_path: "dictionaries/makemeahanzi.txt"

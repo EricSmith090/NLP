@@ -27,7 +27,7 @@ def sample_page_numbers(page_numbers: Iterable[int], count: int) -> set[int]:
         return set(numbers)
     if count == 1:
         return {numbers[len(numbers) // 2]}
-    indices = [round(i * (len(numbers) - 1) / (count - 1)) for i in range(count)]
+    indices = [int(i * (len(numbers) - 1) / (count - 1)) for i in range(count)]
     return {numbers[index] for index in indices}
 
 

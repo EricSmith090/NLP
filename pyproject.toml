@@ -26,13 +26,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest==8.4.2"]
 ocr = [
-  # Install and pin these only after the local OCR benchmark. They are
-  # intentionally not imported by the core pipeline or the test suite.
-  # "torch==...",
-  # "transformers==...",
-  # "paddleocr==...",
-  # "paddlepaddle==...",
-  # "opencv-python-headless==...",
+  # Benchmark (2026-11-08, artifacts/benchmark/ocr_benchmark.json) selected
+  # PP-OCRv5 on this CPU-only Windows host. Server models are unusable here
+  # (~313 s/page; the PIR oneDNN path in paddlepaddle 3.3.1 crashes on them),
+  # so the adapter uses PP-OCRv5 mobile det/rec (~21 s/nom page, ~42 s/QN page).
+  # paddlex 3.7.2 requires PyYAML==6.0.2; this package pins PyYAML==6.0.3
+  # (patch-level difference; the test suite passes with both).
+  "paddlepaddle==3.3.1",
+  "paddleocr==3.7.0",
 ]
 
 [project.scripts]

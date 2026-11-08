@@ -7,10 +7,13 @@ and submission packaging.
 
 **Deadline:** 2026-11-30  
 **Scope:** 3 books, 950 PDF pages, ≥95% similarity per book (not aggregate)  
-**Current status (2026-11-08):** deterministic stages complete and verified;
-the pipeline is correctly blocked at OCR because no local OCR runtime or
-Kim Hán Nôm token is installed. Final labels, alignment, report, and ZIP
-cannot be produced until OCR + human review are done.
+**Current status (2026-11-08):** deterministic stages (0-2) complete and
+verified; test suite is green (57 passed). Local OCR runtime is installed
+and benchmarked (PP-OCRv5 mobile, CPU, Book 3 pilot sample): QN ~42 s/page at
+mean confidence 0.89, Nôm ~21 s/page at 0.71; 20/20 sampled pages OK, 0 errors.
+No mass OCR has been run yet and no Kim Hán Nôm token is installed; final
+labels, alignment, report, and ZIP cannot be produced until OCR + human
+review are done.
 
 ## Assigned books
 
@@ -45,7 +48,13 @@ Extraction fidelity after the final re-extraction:
 - 950 unique JPEGs, one per page, no duplicate hashes;
 - 923 pages copied byte-for-byte from the embedded JPEG stream;
 - 27 rotated pages transposed losslessly at their native resolution;
-- no page was upscaled or rendered at a larger size.
+- no page was upscaled or rendered at a larger size;
+- `<BookName>_updated.pdf` was generated for the two books with rotated
+  pages (`data/output/<book_id>/<BookName>/`, built with
+  `python tools/build_updated_pdf.py --all`): one native image per page,
+  page count identical to the assigned PDF, embedded bytes identical to the
+  extracted JPEGs. Book 3 needed none. Merging them into the submission and
+  notifying the handout person is a mandatory human step before hand-in.
 
 ## Non-negotiable rules enforced by the code
 
@@ -89,7 +98,7 @@ Extraction fidelity after the final re-extraction:
 │   ├── benchmark_ocr.py
 │   ├── capture_screenshots.py
 │   └── validate_submission.py
-├── tests/                       # 44 tests, no OCR runtime required
+├── tests/                       # 57 tests, no OCR runtime required
 ├── docs/
 │   ├── decisions.md
 │   ├── pipeline.md
@@ -146,6 +155,7 @@ python -m hannom.cli ocr --book T1_SuaLoiQuyen --limit 3
 python -m hannom.cli extract --book T1_CamPhong_Tap2 --force
 python -m hannom.cli source-zip
 python -m hannom.cli split
+python tools/build_updated_pdf.py --all   # rebuild <Book>_updated.pdf if images changed
 ```
 
 `pilot` stops with `status=blocked_ocr` when no OCR engine is available
@@ -156,6 +166,11 @@ stages, hashes, and metrics so a rerun resumes rather than redoing work.
 
 - Local OCR is the primary path; Kim Hán Nôm API is a measured second
   opinion for low-confidence Nôm pages.
+- 2026-11-08 benchmark (`tools/benchmark_ocr.py`, see `artifacts/benchmark/`):
+  Book 3 stratified sample (20 pages), 0 errors, CPU-only. Nôm output is a
+  weak draft (mean confidence 0.71; vertical columns are read horizontally);
+  it is a comparison baseline, not a substitute for review or the measured
+  Kim Hán Nôm pass.
 - The API token is read from `KIMHANNOM_TOKEN` (`.env` is supported and is
   never packaged).
 - The API client is single-threaded, caches by image SHA-256, applies
@@ -220,7 +235,14 @@ review; drafts are never used as evidence.
 ## Environment used for verification
 
 - Windows 11, Python 3.13.9 (`D:\anaconda3\python.exe`), 15.7 GB RAM.
-- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (OCR stack not installed yet).
+- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (unused: paddlepaddle ships CPU-only
+  Windows wheels).
+- Local OCR: paddlepaddle 3.3.1, paddleocr 3.7.0 (+ opencv-contrib-python
+  4.10.0.84). paddlex defaults to oneDNN run mode, which crashes on this
+  host (`pir::ArrayAttribute<pir::DoubleAttribute>` on the PIR path); the
+  local adapter forces `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false` and uses
+  PP-OCRv5 mobile det/rec models. PyYAML stays at the pinned 6.0.3
+  (paddlex 3.7.2 requests 6.0.2).
 - PyMuPDF 1.28.2, NumPy 2.2.6, SciPy 1.16.3, Pillow 12.3.0,
   pandas 2.3.3, openpyxl 3.1.5, PyYAML 6.0.3, pydantic 2.12.4,
   Typer 0.20.0, Rich 14.2.0, Streamlit 1.51.0, pytest 8.4.2.
