@@ -252,11 +252,19 @@ class KimHanNomClient(OCREngine):
     def classify(self, file_name: str, image_sha256: str) -> ApiResponse:
         return self._request(
             "structure-classification",
-            json_payload={"file_name": file_name},
+            json_payload={
+                "file_name": file_name,
+                # v2.1 guideline (p.4): 0 = server auto-detect. The API
+                # manual's parameter table omits these; the server rejects
+                # requests without them (code 000108, verified 2026-11-08).
+                "ocr_id": 0,
+                "lang_type": 0,
+                "reading_direction": 0,
+            },
             image_sha256=image_sha256,
             # Classification is a function of the image, not of the temporary
             # server-side file_name. Omitting it makes the cache reusable.
-            cache_params={},
+            cache_params={"ocr_id": 0, "lang_type": 0, "reading_direction": 0},
         )
 
     def ocr(
@@ -320,30 +328,74 @@ class KimHanNomClient(OCREngine):
         )
 
     @staticmethod
-    def _extract_boxes(data: dict[str, Any]) -> tuple[list[str], list[Any]]:
-        # Documented shape.
+    def _extract_boxes(
+        data: dict[str, Any],
+    ) -> tuple[list[str], list[Any], list[float | None]]:
+        """Split the image-ocr data into (texts, boxes, confidences).
+
+        Documented shape (API manual v2026-10-10, ImageOcrData), verified
+        live on 2026-11-08:
+
+            result_ocr_text: list[str]
+            result_bbox:     list of [points, [transcription, confidence]],
+                             matched by index with result_ocr_text
+
+        The guideline-mentioned shape (details.details, a list of
+        {"transcription", "points", "difficult"}) is equally present on the
+        live server. ``points`` and per-box confidence are taken from
+        whichever shape is found; ``difficult`` is taken from
+        details.details when available.
+        """
         texts = data.get("result_ocr_text")
         boxes = data.get("result_bbox")
-        if isinstance(texts, str):
-            texts = [texts]
-        if isinstance(boxes, dict):
-            boxes = [boxes]
-        if texts is not None or boxes is not None:
-            return list(texts or []), list(boxes or [])
-
-        # Guideline-mentioned shape: details.details.
         details = data.get("details")
+        details_list = None
         if isinstance(details, dict):
-            details = details.get("details")
-        if isinstance(details, list):
-            texts = []
-            boxes = []
-            for item in details:
+            details_list = details.get("details")
+        if isinstance(details_list, list):
+            difficult = [item.get("difficult") if isinstance(item, dict) else None for item in details_list]
+        else:
+            difficult = None
+
+        if texts is not None or boxes is not None:
+            text_list = [texts] if isinstance(texts, str) else list(texts or [])
+            box_list = [boxes] if isinstance(boxes, dict) else list(boxes or [])
+            points_out: list[Any] = []
+            confidences: list[float | None] = []
+            for item in box_list:
+                points: Any = item
+                confidence: float | None = None
+                meta: Any = None
+                # [points, [transcription, confidence]] nesting (live shape).
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and isinstance(item[0], list)
+                ):
+                    points, meta = item
+                if isinstance(meta, (list, tuple)):
+                    if len(meta) >= 2 and isinstance(meta[1], (int, float)):
+                        confidence = float(meta[1])
+                elif isinstance(meta, dict):
+                    raw_conf = meta.get("confidence") or meta.get("score")
+                    if isinstance(raw_conf, (int, float)):
+                        confidence = float(raw_conf)
+                points_out.append(points)
+                confidences.append(confidence)
+            return list(text_list), points_out, confidences
+
+        if isinstance(details_list, list):
+            texts_out: list[str] = []
+            points_out = []
+            for item in details_list:
                 if isinstance(item, dict):
-                    texts.append(item.get("transcription", ""))
-                    boxes.append(item.get("points"))
-            return texts, boxes
-        return [], []
+                    texts_out.append(str(item.get("transcription", "")))
+                    points_out.append(item.get("points"))
+                else:
+                    texts_out.append("")
+                    points_out.append(None)
+            return texts_out, points_out, [None] * len(texts_out)
+        return [], [], []
 
     def recognize_page(self, page: PageRecord, script: str) -> OCRResult:
         if not self.is_available():
@@ -381,11 +433,17 @@ class KimHanNomClient(OCREngine):
         warnings: list[str] = []
         if script == "nom" and cdata.get("is_sino_nom") is False:
             warnings.append("API_CLASSIFIED_NOT_SINO_NOM")
-        texts, boxes = self._extract_boxes(response.data)
+        texts, boxes, confidences = self._extract_boxes(response.data)
+        difficulty: list[Any] | None = None
+        details = response.data.get("details")
+        if isinstance(details, dict) and isinstance(details.get("details"), list):
+            items = details["details"]
+            if len(items) == len(texts):
+                difficulty = [item.get("difficult") if isinstance(item, dict) else None for item in items]
         lines: list[OCRLine] = []
         if len(texts) != len(boxes):
             warnings.append(f"OCR_TEXT_BBOX_COUNT_MISMATCH:{len(texts)}:{len(boxes)}")
-        for text, box in zip(texts, boxes):
+        for index, (text, box) in enumerate(zip(texts, boxes)):
             if not text:
                 continue
             if box is None:
@@ -396,7 +454,11 @@ class KimHanNomClient(OCREngine):
             except ValueError as exc:
                 warnings.append(f"BBOX_INVALID:{exc}")
                 continue
-            lines.append(OCRLine(text=str(text), points=quad, script=script))
+            confidence = confidences[index] if index < len(confidences) else None
+            line_difficult = difficulty[index] if difficulty is not None else None
+            lines.append(
+                OCRLine(text=str(text), points=quad, confidence=confidence, script=script, difficult=line_difficult)
+            )
         if not lines:
             warnings.append("OCR_EMPTY")
         return OCRResult(

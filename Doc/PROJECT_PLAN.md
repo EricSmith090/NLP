@@ -351,6 +351,13 @@ PDF
 - Token in `.env`; never in logs, Git, or `source.zip`.
 - Single-threaded, delayed, exponential backoff, cache by image SHA-256, quota ledger.
 - Verify the actual `image-ocr` response schema on day one: the API manual says `result_ocr_text`/`result_bbox`; the project guideline mentions `details.details`. Do not code against an assumption.
+
+**Verified on 2026-11-08** (Book 3 p67, 4 quota calls total incl. one rejected attempt):
+- `structure-classification` REQUIRES `ocr_id=0, lang_type=0, reading_direction=0`; with file_name only, the server returns code 000108 (title `t_field_value_required`). The API manual's parameter table omits these fields -- the guideline (p.4) is authoritative; the client was fixed accordingly.
+- `image-ocr` returns BOTH documented `result_ocr_text` (array of str) / `result_bbox` AND `details.details` (`{transcription, points, difficult}`). Live `result_bbox` entries are `[points, [transcription, confidence]]` matched by index (not bare points arrays).
+- The classification response ALSO embeds a full annotated image (`result_image_base64`, undocumented) and a duplicate OCR payload (`result`). Not used for production; cached responses on disk are correspondingly larger.
+- p67 (Nom title page) yielded exactly 2 text regions, confidences 0.98 / 0.998 -- matches the page content (2 large text columns + `- 65 -` folio number, which is page chrome).
+- `.env` with `KIMHANNOM_TOKEN` is present (gitignored); ledger rows recorded for all 4 calls.
 - Rate limits: 25/minute, 50/hour, 200/day, 600/week.
 - Enums: `ocr_id` 1 normal vertical, 2 administrative, 3 outdoor, 4 normal horizontal; `lang_type` 0 unknown, 1 Hán, 2 Nôm; `reading_direction` 1 vertical, 2 horizontal; `epitaph` 0 normal, 1 epitaph.
 
