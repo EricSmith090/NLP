@@ -57,4 +57,4 @@ citations:
   - "Quy_định_đồ_án_v2.1.pdf — quy định đồ án (nguồn chuẩn)."
   - "Hướng dẫn sử dụng API Kim Hán Nôm, phiên bản 2026-10-10."
   - "Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ, v1 03/11/2026 (nguồn tùy chọn)."
-  - "PyMuPDF 1.28.2; PaddleOCR/PaddleOCR-VL; Vintern-1B-v2; PPOCRLabel; Streamlit 1.51.0; openpyxl 3.1.5."
+  - "PyMuPDF 1.28.2; PaddleOCR 3.7.0 (PP-OCRv5 mobile); PPOCRLabel; Streamlit 1.51.0; openpyxl 3.1.5."

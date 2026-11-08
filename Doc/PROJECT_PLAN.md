@@ -330,7 +330,7 @@ PDF
 
 **Model plan for 8 GB VRAM / 16 GB RAM:**
 
-- Quốc ngữ: `Vintern-1B-v2` primary; `PaddleOCR-VL` / PP-OCRv5 fallback.
+- Quốc ngữ: PP-OCRv5 (mobile) local primary — already benchmarked (Book 3 pilot, mean conf 0.89 on 11 QN pages, 2026-11-08). Kim Hán Nôm API is Hán/Nôm-only and must not receive QN pages. Vintern-1B-v2 evaluated and dropped 2026-11-08: uncalibrated adapter, no boxes, no measured benefit; kept only as a documented contingency if QN quality fails the gate.
 - Nôm: `PaddleOCR-VL` or PP-OCRv5 local primary; Kim Hán Nôm API for low-confidence pages and validation.
 - Run models **sequentially**, batch size 1–4; unload between stages. Do not attempt a 7B ensemble.
 - If PaddleOCR-VL installation fails on Windows, fall back to PP-OCRv5 or a Transformers-based OCR model.
@@ -550,7 +550,7 @@ scope: all
 expected_pages: 282
 ocr:
   nom: [paddleocr_vl, kimhannom]
-  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
+  quoc_ngu: [paddleocr_vl]
   ensemble: true
   api_mode: sample_then_low_confidence
 review_profile: strict
@@ -609,7 +609,7 @@ Review load estimate: 10–20% of Nôm pages (~42–84 pages), more if local Nô
 
 | Date | Work / gate |
 |---|---|
-| **Nov 8–10** | Install PyTorch/OCR stack; benchmark `Vintern-1B-v2` and `PaddleOCR-VL`; 20–30 page pilot; API sample if token; 5-page gold sample; decide if enhancement is needed. **Pilot go/no-go Nov 10.** |
+| **Nov 8–10** | OCR stack installed 2026-11-08 (paddlepaddle 3.3.1 + paddleocr 3.7.0, PP-OCRv5 mobile; Vintern-1B-v2 dropped); benchmark done, 20-page Book 3 sample, 0 errors; API sample if token; 5-page gold sample; decide if enhancement is needed. **Pilot go/no-go Nov 10.** |
 | **Nov 11–14** | Scaffold repo; extraction, classification, T1 mapping, label generation, validators; Book 3 end-to-end pilot. |
 | **Nov 15–20** | OCR production: local majority; API low-confidence; cleaning; start Book 2 (largest Nôm section). **OCR complete Nov 20.** |
 | **Nov 21–25** | Alignment and `text_diff`; per-book 95% gate; review queue. |

@@ -16,7 +16,7 @@ back_matter_is_toc: true
 
 ocr:
   nom: [paddleocr_vl, kimhannom]
-  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
+  quoc_ngu: [paddleocr_vl]
   ensemble: true
   api_mode: sample_then_low_confidence
   sample_pages: 12

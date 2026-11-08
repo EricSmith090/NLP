@@ -19,7 +19,7 @@ engines:
   vintern_1b_v2:
     kind: local
     adapter: "hannom.ocr.local_vintern:VinternEngine"
-    description: "Local Vintern-1B-v2 adapter for Quốc ngữ"
+    description: "Uncalibrated Vintern-1B-v2 VLM; disabled (2026-11-08 decision); kept only as a documented contingency if QN quality fails the gate"
 
 routing:
   nom:
@@ -28,8 +28,11 @@ routing:
     low_confidence_threshold: 0.70
     agreement_threshold: 0.85
   quoc_ngu:
-    primary: vintern_1b_v2
-    second_opinion: paddleocr_vl
+    primary: paddleocr_vl
+    # No second opinion configured for QN yet: the Kim Hán Nôm API is
+    # Hán/Nôm-only and must not receive QN pages. Vintern-1B-v2 was
+    # uncalibrated and offered no annotation advantage; dropped 2026-11-08.
+    second_opinion: none
     low_confidence_threshold: 0.75
     agreement_threshold: 0.85
   api_mode: sample_then_low_confidence

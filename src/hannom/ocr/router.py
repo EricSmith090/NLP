@@ -64,6 +64,16 @@ class OCRRouter:
         return (self.project.ocr_config or {}).get("engines", {})
 
     def build_engine(self, name: str) -> OCREngine:
+        # Cache one instance per engine per process; constructing a local
+        # engine per page would reload its models per page (~10-20 s each).
+        cache = getattr(self, "_engine_cache", None)
+        if cache is None:
+            cache = self._engine_cache = {}
+        if name not in cache:
+            cache[name] = self._build_engine_instance(name)
+        return cache[name]
+
+    def _build_engine_instance(self, name: str) -> OCREngine:
         configs = self._engine_configs()
         cfg = configs.get(name)
         if cfg is None:
