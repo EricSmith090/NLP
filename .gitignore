@@ -10,6 +10,9 @@
 /dictionaries-04-11-2026/
 /dictionaries/
 
+# Local credentials for the Hán Nôm website (never commit; never package)
+hannom_API.md
+
 # Secrets
 .env
 .env.*
