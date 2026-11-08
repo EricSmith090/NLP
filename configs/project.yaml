@@ -1,0 +1,41 @@
+# Project-level configuration. Paths are relative to the repository root.
+project:
+  name: "Hán Nôm–Quốc ngữ parallel corpus"
+  deadline: "2026-11-30"
+  # Only 24127189 is known. Replace the placeholders before packaging.
+  zip_stem: "24127189_MSSV2_MSSV3_MSSV4"
+  report_name: "24127189_MSSV2_MSSV3_MSSV4_report.pdf"
+  one_zip_for_all_books: true
+
+paths:
+  data: "data"
+  artifacts: "artifacts"
+  output: "data/output"
+  dictionaries: "dictionaries"
+  models: "models"
+
+books:
+  - "configs/books/T1_CamPhong_Tap1.yaml"
+  - "configs/books/T1_CamPhong_Tap2.yaml"
+  - "configs/books/T1_SuaLoiQuyen.yaml"
+
+api:
+  base_url: "https://kimhannom.fit.hcmus.edu.vn"
+  token_env: "KIMHANNOM_TOKEN"
+  # Exact documented value; do not substitute a python-requests default.
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+  limits:
+    per_minute: 25
+    per_hour: 50
+    per_day: 200
+    per_week: 600
+  min_delay_seconds: 3.0
+  timeout_seconds: 120
+  max_retries: 3
+  cache_dir: "data/ocr/api_cache"
+
+quality:
+  minimum_similarity: 95.0
+  yellow_ratio_warn: 0.05
+  null_ratio_warn: 0.05
+  max_poor_nom_page_ratio: 0.20

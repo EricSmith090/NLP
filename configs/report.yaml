@@ -1,0 +1,59 @@
+# Report configuration.
+#
+# The report validator intentionally fails while any member is missing a
+# full name, student ID, or email. Fill every field before packaging.
+# Only 24127189 is currently known (from the assigned folder name).
+members:
+  - full_name: ""          # TODO: fill before submission
+    student_id: "24127189"
+    email: ""              # TODO: fill before submission
+  # Add the other three members in the same shape, for example:
+  # - full_name: "Nguyễn Văn A"
+  #   student_id: "2412xxxx"
+  #   email: "a@example.com"
+
+# Mandatory appendix screenshots. Capture them after the final CSV/XLSX and
+# PPOCRLabel data exist, so the screenshots show the real submission, not a
+# mock or a stale draft. Use tools/capture_screenshots.py to capture and to
+# check dimensions/blankness before packaging.
+screenshots:
+  - caption: "PPOCRLabel — trang Nôm (thư mục ch/)"
+    path: "artifacts/screenshots/ppocrlabel_nom.png"
+    book_id: "T1_CamPhong_Tap1"
+    required: true
+  - caption: "PPOCRLabel — trang Quốc ngữ (thư mục vi/)"
+    path: "artifacts/screenshots/ppocrlabel_quoc_ngu.png"
+    book_id: "T1_CamPhong_Tap1"
+    required: true
+  - caption: "XLSX alignment mở trong Excel/LibreOffice, đúng cột và màu"
+    path: "artifacts/screenshots/xlsx_alignment.png"
+    book_id: "T1_CamPhong_Tap2"
+    required: true
+  - caption: "CSV alignment mở không lệch cột, UTF-8 có BOM"
+    path: "artifacts/screenshots/csv_alignment.png"
+    book_id: "T1_CamPhong_Tap2"
+    required: true
+
+method_notes:
+  - "Pipeline cục bộ: trích ảnh gốc, phân loại trang, OCR, PPOCRLabel, làm sạch, căn hàng, text_diff, đánh giá và đóng gói."
+  - "923/950 ảnh được sao chép nguyên byte từ JPEG nhúng; 27 ảnh xoay được chuyển hướng lossless ở độ phân giải gốc (không upscale)."
+  - "Kim Hán Nôm API chỉ dùng như ý kiến thứ hai có đo lường; không dùng nhiều tài khoản và không gửi ảnh mặc định."
+  - "Từ điển là tùy chọn; ký tự không có trong từ điển không bị tự động tô đỏ mà vào hàng đợi review."
+  - "Yellow không bao giờ được tạo tự động; chỉ dùng cho các trường hợp đặc biệt trong quy định và luôn được ghi lý do."
+  - "image_map.json ban đầu là phân hoạch theo khối lượng mực; phải đối chiếu lại với OCR/căn hàng trước khi nộp."
+
+yellow_reasons:
+  T1_CamPhong_Tap1: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
+  T1_CamPhong_Tap2: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
+  T1_SuaLoiQuyen: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
+
+book_notes:
+  T1_CamPhong_Tap1: "Biên Nôm đã kiểm tra trực quan: p147-276; p146 trống, p277 bắt đầu mục lục QN. 282 ảnh, tất cả 800x1135."
+  T1_CamPhong_Tap2: "Biên Nôm đã kiểm tra trực quan: p277-540; p541 bắt đầu mục lục QN. 550 ảnh: 525 ảnh 800x1135 và 25 bản scan xoay gốc 564x800 đã chuyển hướng lossless."
+  T1_SuaLoiQuyen: "Biên Nôm đã kiểm tra trực quan: p67-116; p117-118 là mục lục QN. p61 trống và không vào vi/. 118 ảnh 800x1135."
+
+citations:
+  - "Quy_định_đồ_án_v2.1.pdf — quy định đồ án (nguồn chuẩn)."
+  - "Hướng dẫn sử dụng API Kim Hán Nôm, phiên bản 2026-10-10."
+  - "Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ, v1 03/11/2026 (nguồn tùy chọn)."
+  - "PyMuPDF 1.28.2; PaddleOCR/PaddleOCR-VL; Vintern-1B-v2; PPOCRLabel; Streamlit 1.51.0; openpyxl 3.1.5."

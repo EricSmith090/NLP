@@ -1,0 +1,13 @@
+# The official 12-source JSONL dataset is optional. The pipeline works
+# without it and must not auto-red a character merely because a source is
+# missing. Put official files in dictionaries/entries/<source>.jsonl.
+dictionary:
+  entries_dir: "dictionaries/entries"
+  sources: []
+  unihan_dir: "dictionaries/unihan"
+  cedict_path: "dictionaries/cc_cedict.txt"
+  makemeahanzi_path: "dictionaries/makemeahanzi.txt"
+  cjkvi_ids_path: "dictionaries/cjkvi_ids.txt"
+  cjkvi_variants_path: "dictionaries/cjkvi_variants.txt"
+  book_lexicons_dir: "data/dictionary/book_lexicons"
+  require_for_final_gate: false

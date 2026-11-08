@@ -1,0 +1,23 @@
+book_id: T1_CamPhong_Tap1
+pdf: "CV20-24127189/T1_Cấm Phòng Cho Bổn Đạo (Tập 1).pdf"
+layout: T1
+scope: all
+expected_pages: 282
+# Verified from sample pages on 2026-11-08. Page numbers are PDF pages,
+# not printed page numbers. Front matter ends before the QN translation;
+# the Nôm block is detected from image evidence and should include p147-276.
+front_matter_end: 20
+nom_start_hint: 147
+nom_end_hint: 276
+translation_start: 21
+translation_end: 144
+# QN TOC/back matter starts at p277.
+back_matter_is_toc: true
+
+ocr:
+  nom: [paddleocr_vl, kimhannom]
+  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
+  ensemble: true
+  api_mode: sample_then_low_confidence
+  sample_pages: 12
+review_profile: strict

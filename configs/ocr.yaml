@@ -1,0 +1,36 @@
+# OCR routing. The pipeline is local-first; the Kim Hán Nôm API is a
+# measured second opinion and must never receive images unless explicitly
+# enabled in project.yaml / the book config.
+engines:
+  mock:
+    kind: mock
+    description: "Deterministic fixture engine for tests and dry runs only"
+  kimhannom:
+    kind: api
+    description: "Approved external OCR service"
+  paddleocr_vl:
+    kind: local
+    adapter: "hannom.ocr.local_paddle:PaddleOCREngine"
+    description: "Local PP-OCR/PaddleOCR-VL adapter; import is lazy"
+  ppocrv5:
+    kind: local
+    adapter: "hannom.ocr.local_paddle:PaddleOCREngine"
+    description: "Fallback local PP-OCRv5 adapter"
+  vintern_1b_v2:
+    kind: local
+    adapter: "hannom.ocr.local_vintern:VinternEngine"
+    description: "Local Vintern-1B-v2 adapter for Quốc ngữ"
+
+routing:
+  nom:
+    primary: paddleocr_vl
+    second_opinion: kimhannom
+    low_confidence_threshold: 0.70
+    agreement_threshold: 0.85
+  quoc_ngu:
+    primary: vintern_1b_v2
+    second_opinion: paddleocr_vl
+    low_confidence_threshold: 0.75
+    agreement_threshold: 0.85
+  api_mode: sample_then_low_confidence
+  max_pages_per_api_batch: 12

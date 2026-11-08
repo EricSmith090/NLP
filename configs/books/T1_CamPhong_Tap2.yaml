@@ -1,0 +1,22 @@
+book_id: T1_CamPhong_Tap2
+pdf: "CV20-24127189/T1_Cấm Phòng Cho Bổn Đạo (Tập 2).pdf"
+layout: T1
+scope: all
+expected_pages: 550
+# Verified from sample pages on 2026-11-08 and re-checked visually:
+# the Nôm block runs p277-540; p540 is printed -538- and still Nôm.
+# QN back-matter TOC starts at p541 (earlier 277-539 note was off by one).
+front_matter_end: 8
+nom_start_hint: 277
+nom_end_hint: 540
+translation_start: 9
+translation_end: 275
+back_matter_is_toc: true
+
+ocr:
+  nom: [paddleocr_vl, kimhannom]
+  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
+  ensemble: true
+  api_mode: sample_then_low_confidence
+  sample_pages: 12
+review_profile: strict

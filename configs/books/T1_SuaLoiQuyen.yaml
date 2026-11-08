@@ -1,0 +1,22 @@
+book_id: T1_SuaLoiQuyen
+pdf: "CV20-24127189/T1_Sửa Lưỡi Quyển.pdf"
+layout: T1
+scope: all
+expected_pages: 118
+# Verified from sample pages on 2026-11-08 and re-checked visually:
+# Nôm runs p67-116; p117-118 is QN back-matter TOC (p116 is printed -114-
+# and still Nôm; the earlier 67-115 note was off by one).
+front_matter_end: 10
+nom_start_hint: 67
+nom_end_hint: 116
+translation_start: 11
+translation_end: 63
+back_matter_is_toc: true
+
+ocr:
+  nom: [paddleocr_vl, kimhannom]
+  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
+  ensemble: true
+  api_mode: sample_then_low_confidence
+  sample_pages: 12
+review_profile: strict

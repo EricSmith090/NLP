@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hannom-parallel"
+version = "0.1.0"
+description = "Local-first Hán Nôm–Quốc ngữ OCR, alignment, validation, and packaging pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "NLP Project team" }]
+dependencies = [
+  "pymupdf==1.28.2",
+  "numpy==2.2.6",
+  "scipy==1.16.3",
+  "pillow==12.3.0",
+  "pandas==2.3.3",
+  "openpyxl==3.1.5",
+  "PyYAML==6.0.3",
+  "pydantic==2.12.4",
+  "typer==0.20.0",
+  "rich==14.2.0",
+  "streamlit==1.51.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.2"]
+ocr = [
+  # Install and pin these only after the local OCR benchmark. They are
+  # intentionally not imported by the core pipeline or the test suite.
+  # "torch==...",
+  # "transformers==...",
+  # "paddleocr==...",
+  # "paddlepaddle==...",
+  # "opencv-python-headless==...",
+]
+
+[project.scripts]
+hannom = "hannom.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

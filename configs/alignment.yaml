@@ -1,0 +1,25 @@
+alignment:
+  # Length ratio is a weak but cheap prior for phonetic translation.
+  expected_syllables_per_nom_char: 1.0
+  max_group: 4
+  max_nm_group: 2
+  one_to_many_penalty: 0.35
+  many_to_one_penalty: 0.35
+  many_to_many_penalty: 0.90
+  low_confidence_threshold: 0.55
+  # If a sentence is predicted rather than read, mark text_diff warn only
+  # for the guideline-approved cases; never use yellow to inflate scores.
+  mark_cross_page_joins: true
+
+text_diff:
+  # Unknown readings are routed to review, never auto-red.
+  unknown_policy: review
+  require_dictionary_for_black: false
+  strip_diacritics_for_reading_match: true
+  proper_name_max_chars: 12
+  proper_name_max_syllables: 12
+
+evaluation:
+  minimum_similarity: 95.0
+  exclude_mask_from_denominator: true
+  exclude_yellow_from_denominator: true

@@ -1,0 +1,20 @@
+review:
+  queue_path: "data/review/queue.jsonl"
+  patches_path: "data/review/patches.jsonl"
+  streamlit_port: 8501
+  keyboard:
+    next: "j"
+    previous: "k"
+    accept: "a"
+    flag: "f"
+  profiles:
+    strict:
+      flag_low_ocr: true
+      flag_low_alignment: true
+      flag_dictionary_miss: true
+      flag_semantic_ambiguity: true
+    pilot:
+      flag_low_ocr: true
+      flag_low_alignment: true
+      flag_dictionary_miss: false
+      flag_semantic_ambiguity: true
