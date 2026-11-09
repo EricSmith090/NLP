@@ -35,6 +35,7 @@ def _row(
         review_status=status,
         review_reviewer=REVIEWER,
         character_token_mappings=mappings or [],
+        decision_integrity="valid",
     )
 
 

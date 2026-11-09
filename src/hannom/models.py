@@ -116,6 +116,10 @@ class AlignmentRow:
     # Reviewer identity attached to the effective decision (empty when
     # absent). Used for lexicon provenance.
     review_reviewer: str | None = None
+    # Effective decision integrity: "valid" | "stale" | "invalid" |
+    # "conflict" | None (no review events, or attributable history). Only a
+    # non-stale, conflict-free, valid decision authorizes learning.
+    decision_integrity: str | None = None
     # Reviewer-confirmed character-to-token mappings attached to the
     # effective decision (empty when absent). Used by lexicon learning;
     # never inferred from sentence-level dictionary membership.

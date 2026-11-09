@@ -173,7 +173,7 @@ def test_unmatched_decision_persists(tmp_path):
     assert rows[0].review_status == STATUS_UNMATCHED
 
 
-def test_latest_decision_wins_and_conflict_is_reported():
+def test_latest_decision_wins_and_supersession_is_legitimate():
     row = _row("Book.001.1")
     first = make_decision(
         book_id="b",
@@ -198,7 +198,218 @@ def test_latest_decision_wins_and_conflict_is_reported():
     rows, issues = apply_decisions([row], [first, second])
     (applied,) = rows
     assert applied.review_status == STATUS_ACCEPTED_MATCH
+    assert applied.decision_integrity == "valid"
+    assert not any("REVIEW_DECISION_CONFLICT" in issue for issue in issues)
+
+
+def test_mutually_exclusive_same_revision_verdicts_conflict():
+    row = _row("Book.001.1", ch="字", vi="thì")
+    match = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status=STATUS_ACCEPTED_MATCH,
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T00:00:00+00:00",
+    )
+    difference = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status=STATUS_ACCEPTED_DIFFERENCE,
+        reviewer="b",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T01:00:00+00:00",
+    )
+    rows, issues = apply_decisions([row], [match, difference])
+    (applied,) = rows
+    assert applied.review_status is None  # no trust in contradictory verdicts
+    assert applied.decision_integrity == "conflict"
+    assert "REVIEW_DECISION_CONFLICT" in applied.flags
     assert any("REVIEW_DECISION_CONFLICT" in issue for issue in issues)
+
+
+def test_mapping_contradiction_same_revision_conflicts():
+    row = _row("Book.001.1", ch="之小", vi="thì mà")
+    first = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="accepted_match",
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        character_token_mappings=[
+            {"nom_char": "之", "nom_position": 0, "qn_token": "thì", "qn_token_position": 0}
+        ],
+        timestamp="2026-11-09T00:00:00+00:00",
+    )
+    second = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="accepted_match",
+        reviewer="b",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        character_token_mappings=[
+            {"nom_char": "之", "nom_position": 0, "qn_token": "mà", "qn_token_position": 1}
+        ],
+        timestamp="2026-11-09T01:00:00+00:00",
+    )
+    rows, issues = apply_decisions([row], [first, second])
+    (applied,) = rows
+    assert applied.decision_integrity == "conflict"
+    assert applied.review_status is None
+    assert any("REVIEW_DECISION_CONFLICT" in issue for issue in issues)
+
+
+def test_stale_historical_decision_superseded_by_valid_approval():
+    row = _row("Book.001.1", ch="之", vi="thì")
+    stale = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="accepted_match",
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T00:00:00+00:00",
+    )
+    # Row content changes afterwards; the old decision is stale.
+    row.ch_txt = "其"
+    fresh = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="accepted_match",
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T02:00:00+00:00",
+    )
+    rows, issues = apply_decisions([row], [stale, fresh])
+    (applied,) = rows
+    assert applied.review_status == STATUS_ACCEPTED_MATCH
+    assert applied.decision_integrity == "valid"
+    assert not any("REVIEW_DECISION_STALE" in issue for issue in issues)
+
+
+def test_latest_stale_decision_is_not_overridden_by_older_valid():
+    row = _row("Book.001.1", ch="之", vi="thì")
+    fresh = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="accepted_match",
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T00:00:00+00:00",
+    )
+    row.ch_txt = "其"
+    stale = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="unresolved",
+        reviewer="b",
+        ch_txt="之",
+        vi_txt="thì",
+        text_diff_json=row.text_diff_json().replace("其", "之"),
+        timestamp="2026-11-09T01:00:00+00:00",
+    )
+    rows, issues = apply_decisions([row], [fresh, stale])
+    (applied,) = rows
+    assert applied.review_status is None
+    assert applied.decision_integrity == "stale"
+    assert any("REVIEW_DECISION_STALE" in issue for issue in issues)
+
+
+def test_latest_invalid_decision_blocks_fallback_to_older_approval():
+    row = _row("Book.001.1", ch="之", vi="thì")
+    valid = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status=STATUS_ACCEPTED_MATCH,
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T00:00:00+00:00",
+    )
+    # An invalid record (unsupported status) is the latest event for the row.
+    import json as _json
+
+    from hannom.review_decisions import ReviewDecision
+
+    invalid = ReviewDecision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="approved_magically",
+        reviewer="mallory",
+        content_sha256=valid.content_sha256,
+    )
+    rows, issues = apply_decisions([row], [valid, invalid], ["DECISION_INVALID:log:2:bad status"])
+    (applied,) = rows
+    assert applied.review_status is None
+    assert applied.decision_integrity == "invalid"
+    assert any("REVIEW_DECISION_INVALID" in issue for issue in issues)
+
+
+def test_decision_history_remains_append_only_and_intact(tmp_path):
+    row = _row("Book.001.1", ch="之", vi="thì")
+    path = tmp_path / "decisions.jsonl"
+    one = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status="unresolved",
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T00:00:00+00:00",
+    )
+    two = make_decision(
+        book_id="b",
+        sentence_id="Book.001.1",
+        status=STATUS_ACCEPTED_MATCH,
+        reviewer="a",
+        ch_txt=row.ch_txt,
+        vi_txt=row.vi_txt,
+        text_diff_json=row.text_diff_json(),
+        timestamp="2026-11-09T01:00:00+00:00",
+    )
+    append_decision(path, one)
+    append_decision(path, two)
+    raw_lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(raw_lines) == 2
+    statuses = [json.loads(line)["status"] for line in raw_lines]
+    assert statuses == ["unresolved", "accepted_match"]
+
+
+def test_multiple_legitimate_transitions_keep_latest_effective():
+    row = _row("Book.001.1")
+    chain = []
+    for index, status in enumerate(["content_edited", "unresolved", "alignment_reviewed"]):
+        chain.append(
+            make_decision(
+                book_id="b",
+                sentence_id="Book.001.1",
+                status=status,
+                reviewer="a",
+                ch_txt=row.ch_txt,
+                vi_txt=row.vi_txt,
+                text_diff_json=row.text_diff_json(),
+                timestamp=f"2026-11-09T0{index}:00:00+00:00",
+            )
+        )
+    rows, issues = apply_decisions([row], chain)
+    (applied,) = rows
+    assert applied.review_status == "alignment_reviewed"
+    assert applied.decision_integrity == "valid"
 
 
 def test_invalid_decision_is_rejected(tmp_path):

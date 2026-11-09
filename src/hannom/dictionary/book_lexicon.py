@@ -14,19 +14,29 @@ alignment, colouring or learning evidence until a human explicitly
 restores them.
 
 Learning policy — a reading is learned only when the reviewer explicitly
-confirmed the *position* of the character:
+confirmed the *position* of the character, and the complete decision
+history for the row is sound:
 
 1. The row must carry an explicit, non-stale verifying review decision
    (``alignment_reviewed`` / ``accepted_match`` / ``accepted_difference``)
-   recorded by a human; see ``hannom.review_decisions``.
+   whose ``decision_integrity`` is ``valid`` (see
+   ``hannom.review_decisions``). Rows whose latest decision is stale,
+   invalid, or in conflict never modify the active lexicon.
 2. Positional evidence, one of:
    a. an explicit ``character_token_mappings`` entry recorded on the
-      decision (the strongest evidence — usable even for multi-character
-      rows), or
+      decision. The **entire set is validated atomically** — set-level
+      uniqueness and monotonicity plus row-bound character/token checks.
+      If any mapping fails, no entry from that set is learned; or
    b. a single Nôm character paired with a single QN token that the
       reviewer explicitly accepted (1↔1 with no positional ambiguity).
 3. Dictionary membership in the sentence is **never** positional
    evidence; neither are repeated or multiple candidate readings.
+4. A log-wide integrity failure (unparseable decision log) disables
+   learning for the book entirely; row-specific failures exclude only
+   the affected row.
+5. Re-running learning is idempotent for identical decisions: a
+   character/syllable pair already backed by identical reviewer provenance
+   is not double-counted.
 
 Rows flagged ``NON_ONE_TO_ONE``, ``UNMATCHED_*``, ``ALIGN_LOW_CONF``,
 ``COSEGMENTED_UNANCHORED``, ``TEXT_DIFF_INVALID``, evidence- or
@@ -34,7 +44,6 @@ metadata- or decision-integrity failures are never used for the
 no-mapping single-token path. Automated learning can never consume its
 own unverified outputs.
 """
-
 from __future__ import annotations
 
 import json
@@ -45,7 +54,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..clean import is_nom_char
-from ..review_decisions import VERIFYING_STATUSES
+from ..review_decisions import (
+    VERIFYING_STATUSES,
+    CharacterTokenMapping,
+    validate_mappings_against_text,
+)
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -81,8 +94,6 @@ def qn_syllables(text: str) -> list[str]:
     return [m.group(0) for m in QN_TOKEN_RE.finditer(text)]
 
 
-def _normalize_reading(reading: str) -> str:
-    return unicodedata.normalize("NFC", reading.strip()).casefold()
 
 
 def _qn_token_spans(text: str) -> list[tuple[int, int, str]]:
@@ -328,35 +339,61 @@ class BookLexicon:
         skipped_empty = 0
         skipped_no_positional_evidence = 0
         skipped_invalid_mapping = 0
+        skipped_conflicted = 0
+        skipped_duplicate = 0
         for row in rows:
             ch_text, vi_text, sentence_id, image_name, flags = _row_tuple(row)
             flag_set = set(flags)
             review_status = _row_field(row, "review_status", None)
+            integrity = _row_field(row, "decision_integrity", None)
             reviewer = str(_row_field(row, "review_reviewer", "") or "")
             if review_status not in VERIFYING_STATUSES:
                 skipped_unreviewed += 1
+                continue
+            if integrity != "valid":
+                # No learning from conflicted, stale, invalid or
+                # unresolved decision histories (Issue B).
+                skipped_conflicted += 1
                 continue
             mappings = _mapping_items(row)
 
             # -- Path A: explicit reviewer character↔token mappings ------
             if mappings:
-                nom_positions = _nom_char_positions(ch_text)
-                tokens = _qn_token_spans(vi_text)
+                # Atomic, set-wide validation: one bad mapping rejects the
+                # whole set; nothing is applied partially.
+                try:
+                    items = [CharacterTokenMapping.from_dict(m) for m in mappings]
+                except (TypeError, ValueError):
+                    skipped_invalid_mapping += len(mappings)
+                    continue
+                errors = validate_mappings_against_text(items, ch_text, vi_text)
+                if errors:
+                    skipped_invalid_mapping += len(errors)
+                    continue
                 learned_here = 0
-                for mapping in mappings:
-                    if not self._learn_mapping(
-                        mapping,
-                        ch_text=ch_text,
-                        nom_positions=nom_positions,
-                        vi_text=vi_text,
-                        tokens=tokens,
+                for item, mapping in zip(items, mappings):
+                    token_text = _qn_token_spans(vi_text)[item.qn_token_position][2]
+                    record = {
+                        "source": "human_review_decision",
+                        "evidence": "explicit_mapping",
+                        "sentence_id": sentence_id,
+                        "image_name": image_name,
+                        "reviewer": reviewer,
+                        "decision_status": review_status,
+                        "nom_position": item.nom_position,
+                        "qn_token_position": item.qn_token_position,
+                    }
+                    if self._has_provenance(
+                        item.nom_char,
+                        token_text,
                         sentence_id=sentence_id,
-                        image_name=image_name,
-                        reviewer=reviewer,
-                        decision_status=review_status,
+                        nom_position=item.nom_position,
+                        qn_token_position=item.qn_token_position,
+                        evidence="explicit_mapping",
                     ):
-                        skipped_invalid_mapping += 1
+                        skipped_duplicate += 1
                         continue
+                    self.add(item.nom_char, token_text, provenance=record)
                     learned_here += 1
                 learned += learned_here
                 continue
@@ -375,6 +412,16 @@ class BookLexicon:
                 continue
             _, char = chars[0]
             token_text = tokens[0][2]
+            if self._has_provenance(
+                char,
+                token_text,
+                sentence_id=sentence_id,
+                nom_position=0,
+                qn_token_position=0,
+                evidence="single_token_accepted",
+            ):
+                skipped_duplicate += 1
+                continue
             self.add(
                 char,
                 token_text,
@@ -400,51 +447,29 @@ class BookLexicon:
             "skipped_empty": skipped_empty,
             "skipped_no_positional_evidence": skipped_no_positional_evidence,
             "skipped_invalid_mapping": skipped_invalid_mapping,
+            "skipped_conflicted": skipped_conflicted,
+            "skipped_duplicate_evidence": skipped_duplicate,
             "quarantine": self.quarantine_summary(),
         }
 
-    def _learn_mapping(
+    def _has_provenance(
         self,
-        mapping: dict[str, Any],
+        char: str,
+        syllable: str,
         *,
-        ch_text: str,
-        nom_positions: list[int],
-        vi_text: str,
-        tokens: list[tuple[int, int, str]],
         sentence_id: str,
-        image_name: str,
-        reviewer: str,
-        decision_status: str,
+        nom_position: int,
+        qn_token_position: int,
+        evidence: str,
     ) -> bool:
-        char = str(mapping.get("nom_char", ""))
-        try:
-            nom_position = int(mapping.get("nom_position", -1))
-            qn_position = int(mapping.get("qn_token_position", -1))
-        except (TypeError, ValueError):
-            return False
-        qn_token = str(mapping.get("qn_token", ""))
-        if len(char) != 1 or not is_nom_char(char):
-            return False
-        if nom_position < 0 or nom_position >= len(nom_positions):
-            return False
-        if ch_text[nom_positions[nom_position]] != char:
-            return False
-        if qn_position < 0 or qn_position >= len(tokens):
-            return False
-        token_text = tokens[qn_position][2]
-        if not qn_token or _normalize_reading(token_text) != _normalize_reading(qn_token):
-            return False
-        return self.add(
-            char,
-            token_text,
-            provenance={
-                "source": "human_review_decision",
-                "evidence": "explicit_mapping",
-                "sentence_id": sentence_id,
-                "image_name": image_name,
-                "reviewer": reviewer,
-                "decision_status": decision_status,
-                "nom_position": nom_position,
-                "qn_token_position": qn_position,
-            },
-        )
+        """True if identical reviewer evidence is already recorded."""
+        normalized = syllable.strip().casefold()
+        for record in self.provenance.get(char, {}).get(normalized, []):
+            if (
+                record.get("evidence") == evidence
+                and record.get("sentence_id") == sentence_id
+                and record.get("nom_position") == nom_position
+                and record.get("qn_token_position") == qn_token_position
+            ):
+                return True
+        return False

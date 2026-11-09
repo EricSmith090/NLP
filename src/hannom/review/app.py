@@ -36,7 +36,7 @@ from hannom.review_decisions import (  # noqa: E402
     append_decision,
     decision_path,
     make_decision,
-    read_decisions,
+    parse_decisions,
 )
 from hannom.review_metadata import load_rows_with_metadata  # noqa: E402
 from hannom.state import State  # noqa: E402
@@ -107,10 +107,12 @@ def main() -> None:
     patch_path = project.data_dir / "review" / f"{book.book_id}.patches.jsonl"
     rows = apply_patches(rows, read_patches(patch_path))
     decisions_file = decision_path(project.data_dir, book.book_id)
-    decisions, decision_issues = read_decisions(decisions_file)
     from hannom.review_decisions import apply_decisions  # noqa: E402
 
-    rows, decision_issues = apply_decisions(rows, decisions, decision_issues)
+    decisions, failures, decision_issues = parse_decisions(decisions_file)
+    rows, decision_issues = apply_decisions(
+        rows, decisions, decision_issues, failures=failures
+    )
     if decision_issues:
         st.warning(
             "Quyết định review không hợp lệ/đã cũ: "
@@ -250,29 +252,44 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Span không hợp lệ: {exc}")
 
-    def _parse_mappings():
+    def _parse_mappings(ch_content, vi_content):
+        """Validate the complete mapping set against the current row.
+
+        Returns (mappings, errors). The entire set is validated before any
+        decision is recorded; one invalid mapping invalidates the set.
+        """
         if not mappings_json.strip():
-            return []
+            return [], []
         try:
             raw_items = json.loads(mappings_json)
         except json.JSONDecodeError as exc:
-            st.error(f"Positional mappings JSON sai: {exc}")
-            return None
-        from hannom.review_decisions import CharacterTokenMapping
+            return None, [f"Positional mappings JSON sai: {exc}"]
+        if not isinstance(raw_items, list):
+            return None, ["Positional mappings phải là một danh sách JSON."]
+        from hannom.review_decisions import (
+            CharacterTokenMapping,
+            validate_mappings_against_text,
+        )
 
         try:
-            return [CharacterTokenMapping.from_dict(item) for item in raw_items]
+            items = [CharacterTokenMapping.from_dict(item) for item in raw_items]
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Positional mappings không hợp lệ: {exc}")
-            return None
+            return None, [f"Positional mappings không hợp lệ: {exc}"]
+        errors = validate_mappings_against_text(items, ch_content, vi_content)
+        if errors:
+            return None, errors
+        return items, []
 
     def _record_decision(status, decision_ch, decision_vi, decision_diff):
         from hannom.review_decisions import make_decision as _make
 
+        mappings, mapping_errors = _parse_mappings(decision_ch, decision_vi)
+        if mapping_errors:
+            for error in mapping_errors:
+                st.error(error)
+            st.warning("Quyết định KHÔNG được ghi: tập mapping không hợp lệ.")
+            return
         try:
-            mappings = _parse_mappings()
-            if mappings is None:
-                return
             decision = _make(
                 book_id=book.book_id,
                 sentence_id=row.sentence_id,

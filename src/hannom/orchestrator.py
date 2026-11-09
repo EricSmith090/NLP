@@ -42,7 +42,7 @@ from .report import (
     validate_report_data,
 )
 from .review.patches import apply_patches, read_patches
-from .review_decisions import apply_decisions, decision_path, read_decisions
+from .review_decisions import apply_decisions, decision_path, parse_decisions
 from .review_metadata import load_rows_with_metadata
 from .state import State, iso, utc_now
 from .t1_map import Pair, build_image_map, load_image_map
@@ -289,6 +289,24 @@ def _load_pairs(project: ProjectConfig, book: BookConfig, state: State) -> list[
     return load_image_map(path)
 
 
+def learn_for_book(lexicon, rows, dictionary, failures):
+    """Fail-closed learning gate shared by ``stage_align`` and tests.
+
+    Log-wide failures (unattributable to any sentence) disable learning
+    for the book. Row-specific failures are handled inside
+    ``learn_from_rows`` via ``decision_integrity``.
+    """
+    if any(failure.sentence_id is None for failure in failures or []):
+        return {
+            "learned_pairs": 0,
+            "characters": len(lexicon.data),
+            "skipped_log_wide_failure": True,
+            "detail": "decision log integrity failure; learning disabled for this run",
+            "quarantine": lexicon.quarantine_summary(),
+        }
+    return lexicon.learn_from_rows(rows, dictionary)
+
+
 def recompute_text_diff(
     rows: Iterable[AlignmentRow],
     *,
@@ -359,19 +377,20 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     )
     # Human patches are applied BEFORE learning and BEFORE recomputation so
     # that active learning never consumes unreviewed machine output. Lexicon
-    # learning itself is restricted to explicitly reviewed, positional
-    # evidence; decision application gives rows their explicit review status.
+    # learning itself is restricted to rows whose decision history is sound
+    # (see review_decisions.apply_decisions); a log-wide integrity failure
+    # fails the learning step closed for the whole book.
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows = apply_patches(rows, patches)
-    decisions, decision_issues = read_decisions(decision_path(project.data_dir, book.book_id))
-    rows, review_issues = apply_decisions(rows, decisions, decision_issues)
-    learned = lexicon.learn_from_rows(rows, dictionary)
+    decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+    rows, review_issues = apply_decisions(rows, decisions, decision_issues, failures=failures)
+    learned = learn_for_book(lexicon, rows, dictionary, failures)
     lexicon.save()
     rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
     # Apply patches and decisions again so human content and review
     # decisions always win over the automatic recomputation.
     rows = apply_patches(rows, patches)
-    rows, _ = apply_decisions(rows, decisions, decision_issues)
+    rows, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
     summary = {
@@ -405,8 +424,8 @@ def load_rows_for_evaluation(
     rows, issues = load_rows_with_metadata(csv_path)
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows = apply_patches(rows, patches)
-    decisions, decision_issues = read_decisions(decision_path(project.data_dir, book.book_id))
-    rows, decision_issues = apply_decisions(rows, decisions, decision_issues)
+    decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+    rows, decision_issues = apply_decisions(rows, decisions, decision_issues, failures=failures)
     return rows, issues + decision_issues
 
 

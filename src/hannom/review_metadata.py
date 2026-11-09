@@ -15,6 +15,7 @@ next to the CSV. Each line is a JSON object with::
         "img_id": "<image name>",
         "flags": ["..."],
         "confidence": 0.83 | null,
+        "semantic_confidence": 1.0 | 0.0 | null,
         "content_sha256": "<sha256 of ch_txt, vi_txt and text_diff>"
     }
 
@@ -69,17 +70,17 @@ def _content_sha256(row: AlignmentRow) -> str:
     return content_sha256(row.ch_txt, row.vi_txt, row.text_diff_json())
 
 
-def _confidence_error(value: Any) -> str | None:
-    """Return an error string for invalid confidence values, else None."""
+def _confidence_error(value: Any, field: str = "confidence") -> str | None:
+    """Return an error string for invalid confidence-like values, else None."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return f"confidence has type {type(value).__name__}"
+        return f"{field} has type {type(value).__name__}"
     number = float(value)
     if not math.isfinite(number):
-        return "confidence is not finite"
+        return f"{field} is not finite"
     if number < 0.0 or number > 1.0:
-        return f"confidence {number} outside [0, 1]"
+        return f"{field} {number} outside [0, 1]"
     return None
 
 
@@ -90,6 +91,10 @@ def row_metadata_record(row: AlignmentRow) -> dict[str, Any]:
         "img_id": row.img_id,
         "flags": sorted(set(row.flags)),
         "confidence": row.confidence,
+        # Semantic evidence confidence is persisted separately from the
+        # structural ``confidence`` field; ``None`` means "no evidence"
+        # and stays distinguishable from a measured 0.0.
+        "semantic_confidence": getattr(row, "semantic_confidence", None),
         "content_sha256": _content_sha256(row),
     }
 
@@ -108,6 +113,9 @@ def write_review_metadata(csv_path: str | Path, rows: Iterable[AlignmentRow]) ->
         err = _confidence_error(row.confidence)
         if err is not None:
             raise ValueError(f"{row.sentence_id}: invalid confidence for sidecar: {err}")
+        sem_err = _confidence_error(getattr(row, "semantic_confidence", None), "semantic_confidence")
+        if sem_err is not None:
+            raise ValueError(f"{row.sentence_id}: invalid confidence for sidecar: {sem_err}")
     temp = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     try:
         with temp.open("w", encoding="utf-8", newline="\n") as fh:
@@ -156,6 +164,10 @@ def load_review_metadata(path: str | Path) -> tuple[dict[str, dict[str, Any]], l
         conf_err = _confidence_error(record.get("confidence"))
         if conf_err is not None:
             issues.append(f"METADATA_BAD_CONFIDENCE:{sidecar.name}:{lineno}:{conf_err}")
+            continue
+        sem_err = _confidence_error(record.get("semantic_confidence"), "semantic_confidence")
+        if sem_err is not None:
+            issues.append(f"METADATA_BAD_CONFIDENCE:{sidecar.name}:{lineno}:{sem_err}")
             continue
         if sentence_id in records:
             issues.append(f"METADATA_DUPLICATE:{sentence_id}")
@@ -218,6 +230,18 @@ def restore_review_metadata(
             except (TypeError, ValueError):
                 issues.append(f"METADATA_BAD_CONFIDENCE:{row.sentence_id}")
                 flags.append(UNRESOLVED_FLAG)
+        # Semantic confidence: absent legacy key → untouched (None), never invented.
+        if "semantic_confidence" in record:
+            sem = record.get("semantic_confidence")
+            if sem is None:
+                row.semantic_confidence = None
+            else:
+                sem_err = _confidence_error(sem, "semantic_confidence")
+                if sem_err is None:
+                    row.semantic_confidence = float(sem)
+                else:
+                    issues.append(f"METADATA_BAD_CONFIDENCE:{row.sentence_id}:{sem_err}")
+                    flags.append(UNRESOLVED_FLAG)
         row.flags = sorted(set(flags))
     for sentence_id in sorted(set(records) - known_ids):
         issues.append(f"METADATA_STALE:{sentence_id}")

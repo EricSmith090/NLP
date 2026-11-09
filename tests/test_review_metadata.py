@@ -264,6 +264,116 @@ def test_hash_mismatch_blocks_evaluation(tmp_path):
     assert not metrics.passed
 
 
+def test_semantic_confidence_one_survives_round_trip(tmp_path):
+    csv_path = tmp_path / "Book.csv"
+    rows = _rows()
+    rows[0].semantic_confidence = 1.0
+    rows[1].semantic_confidence = None
+    write_alignment_csv(csv_path, rows)
+
+    restored, issues = load_rows_with_metadata(csv_path)
+    assert issues == []
+    assert restored[0].semantic_confidence == 1.0
+    assert restored[1].semantic_confidence is None
+
+
+def test_semantic_confidence_zero_is_not_missing(tmp_path):
+    csv_path = tmp_path / "Book.csv"
+    rows = _rows()
+    rows[0].semantic_confidence = 0.0
+    write_alignment_csv(csv_path, rows)
+
+    restored, issues = load_rows_with_metadata(csv_path)
+    assert issues == []
+    assert restored[0].semantic_confidence == 0.0  # measured zero ≠ missing
+
+
+def test_null_semantic_confidence_is_written_as_json_null(tmp_path):
+    csv_path = tmp_path / "Book.csv"
+    rows = _rows()
+    rows[0].semantic_confidence = None
+    write_alignment_csv(csv_path, rows)
+    sidecar = sidecar_path(csv_path)
+    record = json.loads(sidecar.read_text(encoding="utf-8").splitlines()[0])
+    assert record["semantic_confidence"] is None
+
+
+def test_invalid_semantic_confidence_is_rejected(tmp_path):
+    csv_path = tmp_path / "Book.csv"
+    write_alignment_csv(csv_path, _rows())
+    sidecar = sidecar_path(csv_path)
+    records = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+    for bad in (True, "high", 1.5, -0.1, float("inf"), float("nan")):
+        for record in records:
+            record["semantic_confidence"] = bad
+        sidecar.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+        _, issues = load_rows_with_metadata(csv_path)
+        assert any("METADATA_BAD_CONFIDENCE" in issue for issue in issues), f"bad={bad!r} not rejected"
+
+
+def test_legacy_record_without_semantic_confidence_loads(tmp_path):
+    csv_path = tmp_path / "Book.csv"
+    write_alignment_csv(csv_path, _rows())
+    sidecar = sidecar_path(csv_path)
+    records = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record.pop("semantic_confidence", None)  # legacy shape
+    sidecar.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+
+    restored, issues = load_rows_with_metadata(csv_path)
+    assert issues == []
+    assert all(row.semantic_confidence is None for row in restored)  # never invented
+
+
+def test_structural_confidence_unchanged_by_semantic_persistence(tmp_path):
+    csv_path = tmp_path / "Book.csv"
+    rows = _rows()
+    rows[0].semantic_confidence = 0.75
+    write_alignment_csv(csv_path, rows)
+    restored, issues = load_rows_with_metadata(csv_path)
+    assert restored[0].confidence == 0.42
+    assert restored[0].semantic_confidence == 0.75
+
+
+def test_evaluator_counts_semantic_rows_after_reload(tmp_path):
+    from hannom.evaluate import evaluate_rows
+
+    rows = [
+        AlignmentRow(
+            img_id="Book.001.jpg", sentence_id="Book.001.1", ch_txt="字", vi_txt="then",
+            text_diff=[], confidence=0.9,
+            flags=["DIFF_NO_READING_MISMATCH"], semantic_confidence=1.0,
+        ),
+        AlignmentRow(
+            img_id="Book.001.jpg", sentence_id="Book.001.2", ch_txt="其", vi_txt="khac",
+            text_diff=[], confidence=0.8,
+            flags=["DIFF_NO_READING_MISMATCH"], semantic_confidence=None,
+        ),
+    ]
+    before = evaluate_rows("b", rows)
+    csv_path = tmp_path / "Book.csv"
+    write_alignment_csv(csv_path, rows)
+    restored, issues = load_rows_with_metadata(csv_path)
+    assert issues == []
+    after = evaluate_rows("b", restored)
+    assert after.similarity == before.similarity
+    assert after.semantic_evidence_rows == before.semantic_evidence_rows == 1
+    assert after.structural_confidence_mean == before.structural_confidence_mean
+
+
+def test_cannot_write_invalid_semantic_confidence(tmp_path):
+    from hannom.review_metadata import write_review_metadata
+
+    csv_path = tmp_path / "Book.csv"
+    rows = _rows()
+    rows[0].semantic_confidence = float("nan")
+    try:
+        write_review_metadata(csv_path, rows)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
 def test_loader_integrity_issues_block_even_with_perfect_rows():
     from hannom.evaluate import evaluate_rows
 

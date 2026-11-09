@@ -80,6 +80,7 @@ UNVERIFIED_FLAGS = frozenset(
         "REVIEW_DECISION_STALE",
         "REVIEW_DECISION_MISMATCH",
         "REVIEW_DECISION_INVALID",
+        "REVIEW_DECISION_CONFLICT",
     }
 )
 
@@ -106,6 +107,7 @@ def _classify_row(
     elements: list[DiffElement] | None,
     review_status: str | None,
     elements_valid: bool,
+    decision_integrity: str | None = None,
 ) -> tuple[str, str | None]:
     """Classify a row; returns (classification, contradiction_issue or None).
 
@@ -113,12 +115,18 @@ def _classify_row(
     resolve an unmatched row), then automatic, flag-based evidence.
     """
     if review_status == STATUS_UNMATCHED:
+        if decision_integrity != "valid":
+            return "unverified", None
         return "unmatched", None
     if review_status in (
         STATUS_ALIGNMENT_REVIEWED,
         STATUS_ACCEPTED_MATCH,
         STATUS_ACCEPTED_DIFFERENCE,
     ):
+        # The decision must come from the sound part of the log (Issue B);
+        # a verifying status alone is never enough.
+        if decision_integrity != "valid":
+            return "unverified", None
         if elements is None:
             return "unverified", "REVIEW_DECISION_MISMATCH"
         if not elements_valid:
@@ -235,7 +243,11 @@ def evaluate_rows(
                 invalid += 1
                 elements_valid = False
                 metrics.issues.extend(f"TEXT_DIFF:{sentence_id}:{issue}" for issue in issues[:3])
-        classification, contradiction = _classify_row(flags, elements, review_status, elements_valid)
+        decision_integrity = _row_value(row, "decision_integrity", None)
+        decision_integrity = str(decision_integrity) if decision_integrity else None
+        classification, contradiction = _classify_row(
+            flags, elements, review_status, elements_valid, decision_integrity
+        )
         if contradiction:
             metrics.issues.append(f"{contradiction}:{sentence_id}")
         if classification == "unmatched":

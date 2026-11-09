@@ -164,7 +164,8 @@ def test_content_edited_row_with_machine_evidence_may_verify():
 
 def test_null_row_with_accepted_match_does_not_verify():
     rows = [_row("Book.001.1", "之", "cái", None, ())]
-    rows[0].review_status = "accepted_match"  # contradictory: no evidence
+    rows[0].review_status = "accepted_match"
+    rows[0].decision_integrity = "valid"  # contradictory: no evidence
     metrics = evaluate_rows("b", rows)
     assert metrics.unverified_rows == 1
     assert metrics.verified_match_rows == 0
@@ -190,13 +191,15 @@ def test_unmatched_qn_row_with_content_edit_remains_unmatched():
 def test_explicit_unmatched_decision_is_unmatched():
     rows = [_row("Book.001.3", "其其", "khác hẳn", None, ())]
     rows[0].review_status = "unmatched"
+    rows[0].decision_integrity = "valid"
     metrics = evaluate_rows("b", rows)
     assert metrics.unmatched_rows == 1
 
 
 def test_accepted_match_with_valid_evidence_is_verified():
     rows = [_row("Book.001.1", "之", "thì", [], ("DIFF_UNVERIFIED_NO_BOOK_READINGS",))]
-    rows[0].review_status = "accepted_match"  # consistent: no discrepancy
+    rows[0].review_status = "accepted_match"
+    rows[0].decision_integrity = "valid"  # consistent: no discrepancy
     metrics = evaluate_rows("b", rows)
     assert metrics.verified_match_rows == 1
     assert metrics.unverified_rows == 0
@@ -206,6 +209,7 @@ def test_accepted_difference_with_valid_spans_is_verified():
     error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
     rows = [_row("Book.001.1", "字字", "x", [error], ("DIFF_UNVERIFIED_DIFFERENT_TEXT",))]
     rows[0].review_status = "accepted_difference"
+    rows[0].decision_integrity = "valid"
     metrics = evaluate_rows("b", rows)
     assert metrics.verified_difference_rows == 1
     assert metrics.denominator == 2
@@ -213,7 +217,8 @@ def test_accepted_difference_with_valid_spans_is_verified():
 
 def test_accepted_difference_with_empty_diff_is_mismatch():
     rows = [_row("Book.001.1", "之", "thì", [], ())]
-    rows[0].review_status = "accepted_difference"  # says differences exist; there are none
+    rows[0].review_status = "accepted_difference"
+    rows[0].decision_integrity = "valid"  # says differences exist; there are none
     metrics = evaluate_rows("b", rows)
     assert metrics.unverified_rows == 1
     assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
@@ -222,7 +227,8 @@ def test_accepted_difference_with_empty_diff_is_mismatch():
 def test_accepted_match_with_nonempty_diff_is_mismatch():
     error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
     rows = [_row("Book.001.1", "字字", "x", [error], ())]
-    rows[0].review_status = "accepted_match"  # says no discrepancy; there is one
+    rows[0].review_status = "accepted_match"
+    rows[0].decision_integrity = "valid"  # says no discrepancy; there is one
     metrics = evaluate_rows("b", rows)
     assert metrics.unverified_rows == 1
     assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
@@ -311,6 +317,7 @@ def test_edit_only_qn_transcription_does_not_accept_alignment(tmp_path):
 def test_alignment_reviewed_with_valid_evidence_is_verified():
     rows = [_row("Book.001.1", "之", "thì", [], ("DIFF_UNVERIFIED_NO_BOOK_READINGS",))]
     rows[0].review_status = "alignment_reviewed"
+    rows[0].decision_integrity = "valid"
     metrics = evaluate_rows("b", rows)
     assert metrics.verified_match_rows == 1
 
@@ -319,6 +326,7 @@ def test_alignment_reviewed_with_differences_is_verified_difference():
     error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
     rows = [_row("Book.001.1", "字字", "x", [error], ())]
     rows[0].review_status = "alignment_reviewed"
+    rows[0].decision_integrity = "valid"
     metrics = evaluate_rows("b", rows)
     assert metrics.verified_difference_rows == 1
 
@@ -326,6 +334,7 @@ def test_alignment_reviewed_with_differences_is_verified_difference():
 def test_alignment_reviewed_without_comparison_evidence_stays_unverified():
     rows = [_row("Book.001.1", "之", "thì", None, ())]
     rows[0].review_status = "alignment_reviewed"
+    rows[0].decision_integrity = "valid"
     metrics = evaluate_rows("b", rows)
     assert metrics.unverified_rows == 1
     assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
