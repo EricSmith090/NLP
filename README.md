@@ -225,14 +225,24 @@ are missing.
 ## Quality gate
 
 ```text
-similarity (%) = (1 - mismatched_red_characters / scored_nom_characters) × 100
+accuracy (similarity %, verified rows only) =
+  (1 - mismatched_red_characters / scored_nom_characters) × 100
+
+coverage = (verified_match_rows + verified_difference_rows) / total_rows
 ```
 
-- Denominator: Nôm characters in rows with `text_diff != null`; excludes
-  QN text, punctuation, `[MASK]`, and yellow characters.
+- Denominator: Nôm characters in rows with comparison evidence and a
+  valid `text_diff`; excludes QN text, punctuation, `[MASK]`, yellow
+  characters. Accuracy is never computed over unverified rows.
 - Numerator: for each `error` element, `max(Nôm characters, QN syllables)`.
-- Gate: ≥95% for each of the three books.
-- The report also records yellow-character ratio and null-row ratio.
+- Coverage/unverified/null gates (configurable in `configs/project.yaml`
+  `quality`): `minimum_coverage: 0.9`, `max_unverified_ratio: 0.05`, and
+  `null_ratio_warn: 0.05` now blocks under `EXCESSIVE_NULL_ROWS`.
+- Gate: accuracy ≥95% plus coverage ≥0.9, unverified ≤0.05 and null ≤0.05
+  for each of the three books. Insufficient evidence yields a failing,
+  inconclusive evaluation, never a pass.
+- The report records yellow-character ratio, null-row ratio, coverage, and
+  per-class row counts (verified/unverified/unmatched).
 
 No final similarity is claimed yet. It will be measured after OCR and
 review; drafts are never used as evidence.

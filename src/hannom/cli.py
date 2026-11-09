@@ -33,8 +33,9 @@ from .orchestrator import (
     recompute_text_diff,
     build_source_zip,
 )
-from .align import read_alignment_csv, write_alignment_csv
+from .align import write_alignment_csv
 from .dictionary.book_lexicon import BookLexicon
+from .review_metadata import load_rows_with_metadata
 from .dictionary.index import build_dictionary_index
 from .package import split_submission_zip, validate_book_package, validate_source_zip
 from .report import build_report_pdf, load_report_config, validate_report_data
@@ -152,7 +153,9 @@ def textdiff(
     with open_state(project) as state:
         for item in _books(project, book):
             csv_path = project.data_dir / "align" / item.book_id / f"{item.book_name}.csv"
-            rows = read_alignment_csv(csv_path)
+            rows, metadata_issues = load_rows_with_metadata(csv_path)
+            if metadata_issues:
+                console.print(f"[yellow]metadata issues: {len(metadata_issues)}[/] {metadata_issues[:3]}")
             dictionary = build_dictionary_index(project.root, project.dictionary_config, book_id=item.book_id)
             lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{item.book_id}.json")
             rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary, force_recompute=force_recompute)

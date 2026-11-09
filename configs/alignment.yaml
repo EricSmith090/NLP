@@ -7,6 +7,10 @@ alignment:
   many_to_one_penalty: 0.35
   many_to_many_penalty: 0.90
   low_confidence_threshold: 0.55
+  # Explicit unmatched-segment costs: prefer a truthful UNMATCHED_* row over
+  # a forced correspondence. Same scale as the text_diff gap penalty.
+  unmatched_nom_penalty: 1.2
+  unmatched_qn_penalty: 1.2
   # If a sentence is predicted rather than read, mark text_diff warn only
   # for the guideline-approved cases; never use yellow to inflate scores.
   mark_cross_page_joins: true
@@ -20,6 +24,13 @@ text_diff:
   proper_name_max_syllables: 12
 
 evaluation:
+  # NOTE: the authoritative gate config lives in configs/project.yaml
+  # `quality` (minimum_similarity, minimum_coverage, max_unverified_ratio,
+  # null_ratio_warn, yellow_ratio_warn); it is enforced by
+  # hannom.evaluate.evaluate_rows. This block is documentation parity.
   minimum_similarity: 95.0
+  minimum_coverage: 0.9
+  max_unverified_ratio: 0.05
+  max_null_ratio: 0.05
   exclude_mask_from_denominator: true
   exclude_yellow_from_denominator: true

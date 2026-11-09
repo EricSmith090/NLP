@@ -281,6 +281,10 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                         "Null-row ratio",
                         "N/A" if metrics.null_ratio is None else f"{metrics.null_ratio:.2%}",
                     ),
+                    (
+                        "Coverage",
+                        "N/A" if metrics.coverage_ratio is None else f"{metrics.coverage_ratio:.2%}",
+                    ),
                     ("Gate ≥95%", "PASS" if metrics.passed else "FAIL"),
                 ]
             )
@@ -303,6 +307,11 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                 ("Ký tự yellow", f"{metrics.yellow_chars} ({metrics.yellow_ratio:.2%})" if metrics.yellow_ratio is not None else str(metrics.yellow_chars)),
                 ("Ký tự red (penalty)", str(metrics.red_mismatch_chars)),
                 ("Mẫu số scored", str(metrics.denominator)),
+                ("Dòng verified match", str(metrics.verified_match_rows)),
+                ("Dòng verified difference", str(metrics.verified_difference_rows)),
+                ("Dòng chưa xác minh", str(metrics.unverified_rows)),
+                ("Dòng unmatched", str(metrics.unmatched_rows)),
+                ("Coverage", "N/A" if metrics.coverage_ratio is None else f"{metrics.coverage_ratio:.2%}"),
                 ("Similarity", "N/A" if metrics.similarity is None else f"{metrics.similarity:.4f}%"),
                 ("Kết luận", "PASS" if metrics.passed else "FAIL"),
             ]

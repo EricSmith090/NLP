@@ -39,3 +39,9 @@ quality:
   yellow_ratio_warn: 0.05
   null_ratio_warn: 0.05
   max_poor_nom_page_ratio: 0.20
+  # Accuracy vs coverage gates (enforced by hannom.evaluate.evaluate_rows).
+  # Defaults are project policy: at least 90% of rows must be verified, and
+  # at most 5% of rows may be unverified, for a book to pass. They are
+  # configurable per book and may be tightened by the instructor.
+  minimum_coverage: 0.9
+  max_unverified_ratio: 0.05

@@ -123,3 +123,17 @@ python tools/build_updated_pdf.py --all
 ## 10. Colab (if used)
 
 Pin the same versions as `pyproject.toml`, use a GPU runtime (T4/A100), set `KIMHANNOM_TOKEN` as a Colab secret, and do not upload confidential PDFs. The pipeline’s state (`data/state.sqlite3`) and quota ledger are local to the session; download `source.zip` rather than the full `data/` directory.
+
+## 11. Review metadata sidecar and verified evaluation (repair 2026-11-09)
+
+- The alignment CSV keeps the five stable columns `img_id, sentence_id, ch_txt, vi_txt, text_diff`. Flags and confidence are persisted next to it in `<Name>.review_metadata.jsonl`, rewritten atomically by `hannom align`/`hannom textdiff` together with the CSV.
+- If the sidecar is missing or inconsistent, rows are flagged `REVIEW_METADATA_MISSING` / `REVIEW_METADATA_MISMATCH` and are never treated as clean: the review app shows a warning banner and the flag-only queue includes them.
+- Evaluation now separates accuracy from coverage (`hannom.evaluate.evaluate_rows`):
+  - `verified_match` = compared with positive comparison evidence (identity, `MASK_ONLY_DIFFERENCE`, or `DIFF_NO_READING_MISMATCH` anchors);
+  - `verified_difference` = rows with `text_diff` elements that pass validation;
+  - `unverified` = rows without adequate evidence (`DIFF_UNVERIFIED_NO_BOOK_READINGS`, `DIFF_UNVERIFIED_DIFFERENT_TEXT`, `DIFF_AMBIGUOUS_READINGS`, `COSEGMENTED_UNANCHORED`, metadata failures);
+  - `unmatched` = `UNMATCHED_NOM` / `UNMATCHED_QN` rows (no trustworthy counterpart; never force-aligned);
+  - `coverage_ratio` = (`verified_match_rows` + `verified_difference_rows`) / `total_rows`; `similarity` is computed over verified rows only.
+- Gate policy is configurable in `configs/project.yaml` `quality`: `minimum_coverage: 0.9`, `max_unverified_ratio: 0.05`, plus `null_ratio_warn: 0.05` now blocking under `EXCESSIVE_NULL_ROWS`. Below-gate rows prevent `package` from building and make the report show FAIL with explicit issues.
+- Active lexicon learning requires `HUMAN_REVIEWED` rows with an unambiguous correspondence (exactly one Nôm character and either exactly one QN syllable or a single dictionary reading present in the row). Legacy entries without provenance are quarantined, never silently trusted; restore them explicitly with `BookLexicon.restore_quarantine()` after human verification.
+- Image-map pairs carry `confidence` (fraction of reading-carrying Nôm chars with a reliable anchor in the paired Quốc ngữ text), `source` (`heuristic_mass` / `manual`) and `status` (`candidate` / `verified` / `unresolved` / `manual`). Manual corrections live in `data/layout/<book_id>/image_map.manual.json` and, when present, fully replace the heuristic mapping.

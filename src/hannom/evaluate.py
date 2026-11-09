@@ -1,11 +1,14 @@
 """Stage 8: per-book evaluation and quality gates.
 
-Similarity is computed exactly as specified:
+Accuracy is computed only over rows with explicit comparison evidence:
 
     (1 - mismatched_red_characters / scored_nom_characters) * 100
 
-The denominator only includes Nôm characters in rows with ``text_diff``
-non-null, and excludes yellow-covered characters and ``[MASK]`` tokens.
+where the denominator only includes Nôm characters in verified rows and
+excludes yellow-covered characters and ``[MASK]`` tokens. Coverage is the
+fraction of rows that were verified; unverified, unmatched or null rows
+never inflate accuracy and are reported separately. Insufficient
+coverage, too many unverified rows or too many null rows block the gate.
 """
 
 from __future__ import annotations
@@ -49,6 +52,43 @@ def _elements(row: Any) -> list[DiffElement] | None:
     raise ValueError(f"text_diff must be a list or null, got {type(value).__name__}")
 
 
+UNVERIFIED_FLAGS = frozenset(
+    {
+        "DIFF_UNVERIFIED_NO_BOOK_READINGS",
+        "DIFF_UNVERIFIED_DIFFERENT_TEXT",
+        "DIFF_AMBIGUOUS_READINGS",
+        "COSEGMENTED_UNANCHORED",
+        "REVIEW_METADATA_MISSING",
+        "REVIEW_METADATA_MISMATCH",
+        "TEXT_DIFF_INVALID",
+    }
+)
+
+BLOCKING_PREFIXES = (
+    "DUPLICATE_SENTENCE_ID",
+    "EMPTY_IMG_ID",
+    "TEXT_DIFF",
+    "INSUFFICIENT_COVERAGE",
+    "UNVERIFIED_RATIO_HIGH",
+    "EXCESSIVE_NULL_ROWS",
+)
+
+
+def _classify_row(flags: set[str], elements: list[DiffElement] | None) -> str:
+    if "HUMAN_REVIEWED" in flags:
+        # Human sign-off is trusted evidence; it verifies either state.
+        return "verified_match" if not elements else "verified_difference"
+    if "UNMATCHED_NOM" in flags or "UNMATCHED_QN" in flags:
+        return "unmatched"
+    if elements is None:
+        return "null"
+    if flags & UNVERIFIED_FLAGS:
+        return "unverified"
+    if elements:
+        return "verified_difference"
+    return "verified_match"
+
+
 def evaluate_rows(
     book_id: str,
     rows: Iterable[Any],
@@ -56,7 +96,20 @@ def evaluate_rows(
     minimum_similarity: float = 95.0,
     null_ratio_warn: float = 0.05,
     yellow_ratio_warn: float = 0.05,
+    minimum_coverage: float = 0.9,
+    max_unverified_ratio: float = 0.05,
 ) -> BookMetrics:
+    """Score verified comparisons and report accuracy vs coverage separately.
+
+    Accuracy (``similarity``) is computed only over rows with explicit
+    comparison evidence. Coverage is the fraction of rows that were
+    verified. Missing evidence never improves the score: unverified rows
+    reduce coverage, and insufficient coverage, too many unverified rows
+    or too many null rows block the gate. Threshold defaults are project
+    policy, configurable via ``configs/project.yaml`` ``quality:``; they
+    are deliberately conservative (0.9 coverage, 0.05 unverified/null)
+    and may be tuned per book by the instructor.
+    """
     rows = list(rows)
     metrics = BookMetrics(book_id=book_id, total_rows=len(rows))
     if not rows:
@@ -65,7 +118,7 @@ def evaluate_rows(
         return metrics
 
     seen_sentence_ids: set[str] = set()
-    unverified = 0
+    unverified_different = 0
     invalid = 0
     for row in rows:
         img_id = str(_row_value(row, "img_id", ""))
@@ -73,6 +126,7 @@ def evaluate_rows(
         ch_txt = nfc(str(_row_value(row, "ch_txt", "")))
         vi_txt = nfc(str(_row_value(row, "vi_txt", "")))
         elements = _elements(row)
+        flags = {str(flag) for flag in (_row_value(row, "flags", []) or [])}
         metrics.total_nom_chars += count_nom_chars(ch_txt)
         if sentence_id:
             if sentence_id in seen_sentence_ids:
@@ -80,17 +134,29 @@ def evaluate_rows(
             seen_sentence_ids.add(sentence_id)
         if not img_id:
             metrics.issues.append(f"EMPTY_IMG_ID:{sentence_id}")
-        if elements is None:
+        if elements is not None:
+            issues = validate_text_diff(ch_txt, vi_txt, elements)
+            if issues:
+                invalid += 1
+                metrics.issues.extend(f"TEXT_DIFF:{sentence_id}:{issue}" for issue in issues[:3])
+        classification = _classify_row(flags, elements)
+        if classification == "unmatched":
+            metrics.unmatched_rows += 1
+            continue
+        if classification == "null":
             metrics.null_rows += 1
             continue
+        if classification == "unverified":
+            metrics.unverified_rows += 1
+            continue
         metrics.scored_rows += 1
-        issues = validate_text_diff(ch_txt, vi_txt, elements)
-        if issues:
-            invalid += 1
-            metrics.issues.extend(f"TEXT_DIFF:{sentence_id}:{issue}" for issue in issues[:3])
+        if classification == "verified_match":
+            metrics.verified_match_rows += 1
+        else:
+            metrics.verified_difference_rows += 1
         yellow = sum(
             1
-            for element in elements
+            for element in elements or []
             if element.type == "warn"
             for ch in element.nom_sub_text
             if ch not in MASK and count_nom_chars(ch)
@@ -98,10 +164,17 @@ def evaluate_rows(
         metrics.yellow_chars += yellow
         metrics.red_mismatch_chars += red_penalty(elements)
         metrics.denominator += scoreable_nom_chars(ch_txt, elements)
-        if not elements and ch_txt != vi_txt:
-            unverified += 1
+        if (
+            classification == "verified_match"
+            and ch_txt != vi_txt
+            and elements is not None
+            and not elements
+        ):
+            unverified_different += 1
 
+    verified = metrics.verified_match_rows + metrics.verified_difference_rows
     if metrics.total_rows:
+        metrics.coverage_ratio = verified / metrics.total_rows
         metrics.null_ratio = metrics.null_rows / metrics.total_rows
     if metrics.total_nom_chars:
         metrics.yellow_ratio = metrics.yellow_chars / metrics.total_nom_chars
@@ -113,12 +186,19 @@ def evaluate_rows(
         metrics.similarity = None
         metrics.issues.append("EMPTY_DENOMINATOR")
 
-    if unverified:
-        metrics.warnings.append(f"UNVERIFIED_DIFFERENT_ROWS:{unverified}")
+    unverified_ratio = metrics.unverified_rows / metrics.total_rows if metrics.total_rows else 0.0
+    coverage = metrics.coverage_ratio if metrics.coverage_ratio is not None else 0.0
+    if coverage < minimum_coverage:
+        metrics.issues.append(f"INSUFFICIENT_COVERAGE:{coverage:.4f}<{minimum_coverage}")
+    if unverified_ratio > max_unverified_ratio:
+        metrics.issues.append(f"UNVERIFIED_RATIO_HIGH:{unverified_ratio:.4f}>{max_unverified_ratio}")
+    if metrics.null_ratio is not None and metrics.null_ratio > null_ratio_warn:
+        metrics.issues.append(f"EXCESSIVE_NULL_ROWS:{metrics.null_ratio:.4f}>{null_ratio_warn}")
+        metrics.warnings.append(f"NULL_ROW_RATIO_HIGH:{metrics.null_ratio:.4f}")
+    if unverified_different:
+        metrics.warnings.append(f"UNVERIFIED_DIFFERENT_ROWS:{unverified_different}")
     if invalid:
         metrics.warnings.append(f"INVALID_TEXT_DIFF_ROWS:{invalid}")
-    if metrics.null_ratio is not None and metrics.null_ratio > null_ratio_warn:
-        metrics.warnings.append(f"NULL_ROW_RATIO_HIGH:{metrics.null_ratio:.4f}")
     if metrics.yellow_ratio is not None and metrics.yellow_ratio > yellow_ratio_warn:
         metrics.warnings.append(f"YELLOW_RATIO_HIGH:{metrics.yellow_ratio:.4f}")
 
@@ -127,7 +207,12 @@ def evaluate_rows(
         and metrics.similarity >= minimum_similarity
         and metrics.total_nom_chars > 0
         and metrics.scored_rows > 0
-        and not any(issue.startswith(("DUPLICATE_SENTENCE_ID", "EMPTY_IMG_ID", "TEXT_DIFF")) for issue in metrics.issues)
+        and coverage >= minimum_coverage
+        and unverified_ratio <= max_unverified_ratio
+        and (metrics.null_ratio is None or metrics.null_ratio <= null_ratio_warn)
+        and not any(
+            issue.startswith(BLOCKING_PREFIXES) for issue in metrics.issues
+        )
     )
     if metrics.similarity is not None and metrics.similarity < minimum_similarity:
         metrics.issues.append(

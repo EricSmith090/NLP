@@ -25,10 +25,10 @@ if str(SRC) not in sys.path:
 import streamlit as st  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from hannom.align import read_alignment_csv  # noqa: E402
 from hannom.config import load_config  # noqa: E402
 from hannom.labels import read_label_txt  # noqa: E402
 from hannom.review.patches import ReviewPatch, append_patch, apply_patches, read_patches  # noqa: E402
+from hannom.review_metadata import load_rows_with_metadata  # noqa: E402
 from hannom.state import State  # noqa: E402
 from hannom.textdiff import diff_summary, make_element  # noqa: E402
 
@@ -86,7 +86,14 @@ def main() -> None:
     if not csv_path.exists():
         st.warning(f"Chưa có CSV nháp: {csv_path}")
         return
-    rows = read_alignment_csv(csv_path)
+    rows, metadata_issues = load_rows_with_metadata(csv_path)
+    if metadata_issues:
+        st.warning(
+            "Metadata review không đầy đủ hoặc không khớp: "
+            + ", ".join(metadata_issues[:5])
+            + (" …" if len(metadata_issues) > 5 else "")
+            + ". Các dòng thiếu metadata không được coi là sạch."
+        )
     patch_path = project.data_dir / "review" / f"{book.book_id}.patches.jsonl"
     rows = apply_patches(rows, read_patches(patch_path))
 
@@ -98,7 +105,7 @@ def main() -> None:
             (i, row)
             for i, row in indexed
             if any(
-                flag.startswith(("ALIGN_LOW_CONF", "DIFF_", "REVIEW:", "OCR_", "BBOX_"))
+                flag.startswith(("ALIGN_LOW_CONF", "DIFF_", "REVIEW:", "OCR_", "BBOX_", "REVIEW_METADATA_", "UNMATCHED_"))
                 for flag in row.flags
             )
         ]

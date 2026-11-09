@@ -13,7 +13,6 @@ from typing import Any, Iterable, Sequence
 
 from .align import (
     align_book,
-    read_alignment_csv,
     write_alignment_csv,
 )
 from .clean import CleanedPage, clean_page_lines, detect_running_lines
@@ -43,6 +42,7 @@ from .report import (
     validate_report_data,
 )
 from .review.patches import apply_patches, read_patches
+from .review_metadata import load_rows_with_metadata
 from .state import State, iso, utc_now
 from .t1_map import Pair, build_image_map, load_image_map
 
@@ -299,6 +299,11 @@ def recompute_text_diff(
 
     out: list[AlignmentRow] = []
     for row in rows:
+        if "HUMAN_REVIEWED" in row.flags:
+            # Human-reviewed rows are authoritative evidence; the automatic
+            # recomputation must never overwrite them.
+            out.append(row)
+            continue
         if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
             row.text_diff = None
             out.append(row)
@@ -350,12 +355,16 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         lexicon=lexicon,
         dictionary=dictionary,
     )
-    # Learn from this book's rows, save, then recompute diffs with the new
-    # evidence. This is the only pass that changes automatic colours.
+    # Human patches are applied BEFORE learning and BEFORE recomputation so
+    # that active learning never consumes unreviewed machine output. Lexicon
+    # learning itself is restricted to explicitly human-reviewed rows.
+    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
+    rows = apply_patches(rows, patches)
     learned = lexicon.learn_from_rows(rows, dictionary)
     lexicon.save()
     rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
-    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
+    # Apply patches again so human decisions always win over the automatic
+    # recomputation.
     rows = apply_patches(rows, patches)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
@@ -364,6 +373,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         "rows": len(rows),
         "warnings": warnings,
         "lexicon": learned,
+        "lexicon_quarantine": lexicon.quarantine_summary(),
         "flags": {
             flag: sum(1 for row in rows if flag in row.flags)
             for flag in sorted({flag for row in rows for flag in row.flags})
@@ -374,20 +384,30 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     return rows, summary
 
 
+def _load_rows_patched(project, book) -> tuple[list[AlignmentRow], list[str]]:
+    """Read the CSV, restore its review-metadata sidecar, then apply patches."""
+    csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+    rows, issues = load_rows_with_metadata(csv_path)
+    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
+    return apply_patches(rows, patches), issues
+
+
 def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> BookMetrics:
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
         raise PipelineError(f"{book.book_id}: missing CSV {csv_path}")
-    rows = read_alignment_csv(csv_path)
-    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    rows = apply_patches(rows, patches)
+    rows, metadata_issues = _load_rows_patched(project, book)
     metrics = evaluate_rows(
         book.book_id,
         rows,
         minimum_similarity=float(project.quality.get("minimum_similarity", 95.0)),
         null_ratio_warn=float(project.quality.get("null_ratio_warn", 0.05)),
         yellow_ratio_warn=float(project.quality.get("yellow_ratio_warn", 0.05)),
+        minimum_coverage=float(project.quality.get("minimum_coverage", 0.9)),
+        max_unverified_ratio=float(project.quality.get("max_unverified_ratio", 0.05)),
     )
+    if metadata_issues:
+        metrics.warnings.append(f"METADATA_ISSUES:{len(metadata_issues)}")
     dest = _book_stage(project, book, state, "evaluation") / "metrics.json"
     if dest.exists():
         stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
@@ -407,9 +427,7 @@ def stage_package(
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
         raise PipelineError(f"{book.book_id}: missing CSV {csv_path}")
-    rows = read_alignment_csv(csv_path)
-    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    rows = apply_patches(rows, patches)
+    rows, _ = _load_rows_patched(project, book)
     metrics = stage_evaluate(project, book, state)
     if strict_gate and not metrics.passed:
         raise PipelineError(

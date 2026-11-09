@@ -18,6 +18,29 @@ from .mock import MockOCREngine
 from .quota import QuotaExceeded
 
 
+# Warnings the router promotes into page-level review metadata. The
+# specific BAND_RETRY_AFTER_FULLPAGE_FAILURE must survive: it means the
+# page may be incomplete and must not become trusted evidence.
+PROPAGATED_WARNING_CODES = {
+    "OCR_ENGINE_DISAGREE",
+    "BBOX_MISSING",
+    "OCR_EMPTY",
+    "BBOX_INVALID",
+    "OCR_TEXT_BBOX_COUNT_MISMATCH",
+    "BAND_RETRY_AFTER_FULLPAGE_FAILURE",
+}
+
+
+def promote_review_flags(warnings: Iterable[str], flags: Iterable[str] | None = None) -> list[str]:
+    """Append warning codes from ``warnings`` onto ``flags`` (order-stable)."""
+    promoted = list(flags or [])
+    for warning in warnings or []:
+        code = str(warning).split(":", 1)[0]
+        if code in PROPAGATED_WARNING_CODES and code not in promoted:
+            promoted.append(code)
+    return promoted
+
+
 def sample_page_numbers(page_numbers: Iterable[int], count: int) -> set[int]:
     """Choose an evenly spaced, deterministic sample including both ends."""
     numbers = sorted(set(int(n) for n in page_numbers))
@@ -341,12 +364,7 @@ class OCRRouter:
         self.save_result(result, local_fallback=local_fallback)
 
         confidence = page_confidence(results)
-        flags = list(page.review_flags)
-        for warning in result.warnings:
-            code = warning.split(":", 1)[0]
-            if code in {"OCR_ENGINE_DISAGREE", "BBOX_MISSING", "OCR_EMPTY", "BBOX_INVALID", "OCR_TEXT_BBOX_COUNT_MISMATCH"}:
-                if code not in flags:
-                    flags.append(code)
+        flags = promote_review_flags(result.warnings, page.review_flags)
         self.state.update_page(
             page.book_id,
             page.page_no,

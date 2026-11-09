@@ -18,6 +18,7 @@ from typing import Any, Iterable, Sequence
 from .clean import MASK, TERMINAL_NOM, count_nom_chars, nfc
 from .dictionary.book_lexicon import qn_syllables, strip_diacritics
 from .models import AlignmentRow, DiffElement
+from .review_metadata import write_review_metadata
 from .t1_map import Pair
 from .textdiff import auto_text_diff, validate_text_diff
 
@@ -59,6 +60,11 @@ class AlignConfig:
     max_qn_chars: int = 350
     max_nom_chars: int = 80
     join_cross_page: bool = True
+    # Cost per explicitly unmatched segment. Chosen on the same scale as the
+    # Needleman-Wunsch gap penalty (1.2) so that two unmatched segments lose
+    # to a decent 1-1 group but beat a badly-forced correspondence.
+    unmatched_nom_penalty: float = 1.2
+    unmatched_qn_penalty: float = 1.2
 
 
 def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
@@ -77,6 +83,8 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
         max_qn_chars=int(raw.get("max_qn_chars", defaults.max_qn_chars)),
         max_nom_chars=int(raw.get("max_nom_chars", defaults.max_nom_chars)),
         join_cross_page=bool(raw.get("join_cross_page", defaults.join_cross_page)),
+        unmatched_nom_penalty=float(raw.get("unmatched_nom_penalty", defaults.unmatched_nom_penalty)),
+        unmatched_qn_penalty=float(raw.get("unmatched_qn_penalty", defaults.unmatched_qn_penalty)),
     )
 
 
@@ -156,6 +164,9 @@ def _stream_segments(
     pairs: Sequence[Pair],
     cleaned_by_name: dict[str, Any],
     script: str,
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
 ) -> list[TextSegment] | None:
     """Global reading-stream co-segmentation (both scripts get the same cuts)."""
     from .cosegment import PageUnit, stream_cosegment
@@ -173,7 +184,7 @@ def _stream_segments(
             if page is None:
                 continue
             qn_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
-    stream = stream_cosegment(nom_units, qn_units)
+    stream = stream_cosegment(nom_units, qn_units, lexicon=lexicon, dictionary=dictionary)
     if stream is None:
         return None
     nom_segs, qn_segs = stream
@@ -200,6 +211,9 @@ def build_segments(
     cleaned_by_name: dict[str, Any],
     script: str,
     config: AlignConfig,
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
 ) -> tuple[list[TextSegment], list[str]]:
     """Build reading-order segments from image-map pairs.
 
@@ -208,7 +222,7 @@ def build_segments(
     """
     warnings: list[str] = []
     if script in ("nom", "qn"):
-        stream = _stream_segments(pairs, cleaned_by_name, script)
+        stream = _stream_segments(pairs, cleaned_by_name, script, lexicon=lexicon, dictionary=dictionary)
         if stream is not None:
             return stream, warnings
 
@@ -330,16 +344,27 @@ def align_segments(
 ) -> list[AlignmentRow]:
     config = config or AlignConfig()
     n, m = len(nom_segments), len(qn_segments)
-    if n == 0 or m == 0:
-        return []
     inf = float("inf")
     dp = [[inf] * (m + 1) for _ in range(n + 1)]
-    back: list[list[tuple[int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    # back entries: ("group", a, b) | ("skip_nom", 1, 0) | ("skip_qn", 0, 1)
+    back: list[list[tuple[str, int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
     dp[0][0] = 0.0
     for i in range(n + 1):
         for j in range(m + 1):
             if dp[i][j] == inf:
                 continue
+            # Explicit unmatched transitions: a segment may remain
+            # unmatched instead of being forced into a weak correspondence.
+            if i + 1 <= n:
+                cost = dp[i][j] + config.unmatched_nom_penalty
+                if cost < dp[i + 1][j] - 1e-12:
+                    dp[i + 1][j] = cost
+                    back[i + 1][j] = ("skip_nom", 1, 0)
+            if j + 1 <= m:
+                cost = dp[i][j] + config.unmatched_qn_penalty
+                if cost < dp[i][j + 1] - 1e-12:
+                    dp[i][j + 1] = cost
+                    back[i][j + 1] = ("skip_qn", 0, 1)
             for a in range(1, config.max_group + 1):
                 if i + a > n:
                     break
@@ -353,18 +378,18 @@ def align_segments(
                     cost = dp[i][j] + _group_cost(nom_text, vi_text, a, b, config, lexicon)
                     if cost < dp[i + a][j + b] - 1e-12:
                         dp[i + a][j + b] = cost
-                        back[i + a][j + b] = (a, b)
-    if dp[n][m] == inf:
-        return []
+                        back[i + a][j + b] = ("group", a, b)
 
-    groups: list[tuple[int, int, int, int, float]] = []
+    groups: list[tuple[int, int, int, int, float, str, int, int]] = []
     i, j = n, m
-    while i > 0 and j > 0:
+    while i > 0 or j > 0:
         step = back[i][j]
         if step is None:
-            break
-        a, b = step
-        groups.append((i - a, i, j - b, j, dp[i][j] - dp[i - a][j - b]))
+            # With unmatched transitions this cannot happen; refuse to
+            # invent groups rather than emit garbage if it did.
+            return []
+        kind, a, b = step
+        groups.append((i - a, i, j - b, j, dp[i][j] - dp[i - a][j - b], kind, a, b))
         i -= a
         j -= b
     groups.reverse()
@@ -372,16 +397,16 @@ def align_segments(
     rows: list[AlignmentRow] = []
     counters: dict[str, int] = {}
     threshold = minimum_confidence if minimum_confidence is not None else config.low_confidence_threshold
-    for (i0, i1, j0, j1, cost) in groups:
+    for (i0, i1, j0, j1, cost, kind, a, b) in groups:
         nom_group = list(nom_segments[i0:i1])
         qn_group = list(qn_segments[j0:j1])
-        if not nom_group or not qn_group:
+        if not nom_group and not qn_group:
             continue
         ch_txt = nfc("".join(s.text for s in nom_group))
-        vi_txt = nfc(" ".join(s.text for s in qn_group).strip())
+        vi_txt = nfc(" ".join(s.text for s in qn_group).strip()) if qn_group else ""
         if not ch_txt and not vi_txt:
             continue
-        img_id = nom_group[0].image_name
+        img_id = nom_group[0].image_name if nom_group else qn_group[0].image_name
         base = img_id[:-4] if img_id.lower().endswith(".jpg") else img_id
         counters[base] = counters.get(base, 0) + 1
         sentence_id = f"{base}.{counters[base]}"
@@ -389,8 +414,18 @@ def align_segments(
         flags: list[str] = []
         for segment in nom_group + qn_group:
             flags.extend(segment.flags)
-        if len(nom_group) != 1 or len(qn_group) != 1:
-            flags.append("NON_ONE_TO_ONE")
+        if kind == "skip_nom":
+            flags.extend(["UNMATCHED_NOM", "NON_ONE_TO_ONE"])
+        elif kind == "skip_qn":
+            flags.extend(["UNMATCHED_QN", "NON_ONE_TO_ONE"])
+        elif len(nom_group) > 1 and len(qn_group) == 1:
+            flags.extend(["ALIGNED_MANY_TO_ONE", "NON_ONE_TO_ONE"])
+        elif len(nom_group) == 1 and len(qn_group) > 1:
+            flags.extend(["ALIGNED_ONE_TO_MANY", "NON_ONE_TO_ONE"])
+        elif len(nom_group) > 1 and len(qn_group) > 1:
+            flags.extend(["ALIGNED_MANY_TO_MANY", "NON_ONE_TO_ONE"])
+        else:
+            flags.append("ALIGNED")
         if confidence < threshold:
             flags.append("ALIGN_LOW_CONF")
         if any(len(s.page_numbers) > 1 for s in nom_group + qn_group):
@@ -441,8 +476,8 @@ def align_book(
     dictionary: Any | None = None,
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
-    nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg)
-    qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg)
+    nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary)
+    qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary)
     if not nom_segments or not qn_segments:
         return [], nom_warnings + qn_warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
     rows = align_segments(
@@ -497,8 +532,17 @@ def row_from_dict(data: dict[str, Any]) -> AlignmentRow:
 
 
 def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
+    """Write the five-column CSV and its review-metadata sidecar.
+
+    The CSV keeps the stable ``img_id, sentence_id, ch_txt, vi_txt,
+    text_diff`` schema. Flags and confidence are persisted alongside it in
+    ``<Name>.review_metadata.jsonl`` (see ``hannom.review_metadata``);
+    loading the CSV without restoring the sidecar yields rows that carry
+    ``REVIEW_METADATA_MISSING`` flags, never silently "clean" rows.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows)
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh, lineterminator="\n")
         writer.writerow(CSV_COLUMNS)
@@ -512,6 +556,7 @@ def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
                     row.text_diff_json(),
                 ]
             )
+    write_review_metadata(path, rows)
     return path
 
 

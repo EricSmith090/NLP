@@ -124,6 +124,11 @@ class BookMetrics:
     passed: bool = False
     issues: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    verified_match_rows: int = 0
+    verified_difference_rows: int = 0
+    unverified_rows: int = 0
+    unmatched_rows: int = 0
+    coverage_ratio: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         from dataclasses import asdict

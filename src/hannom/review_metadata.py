@@ -1,0 +1,184 @@
+"""Sidecar review metadata for alignment CSV rows.
+
+The alignment CSV keeps the stable five-column schema
+``img_id, sentence_id, ch_txt, vi_txt, text_diff`` for downstream
+compatibility. Flags, confidence and other review-relevant information
+therefore live in a sibling JSON Lines file
+
+    <Name>.review_metadata.jsonl
+
+next to the CSV. Each line is a JSON object with::
+
+    {
+        "schema": 1,
+        "sentence_id": "<stable row id>",
+        "img_id": "<image name>",
+        "flags": ["..."],
+        "confidence": 0.83 | null,
+        "content_sha256": "<sha256 of ch_txt, vi_txt and text_diff>"
+    }
+
+Rules enforced here:
+
+- Missing sidecar files are reported, and every row lacking metadata is
+  flagged ``REVIEW_METADATA_MISSING``. Absent metadata is never silently
+  read as "clean row".
+- Duplicated, stale or mismatched entries are reported as ``METADATA_*``
+  issues and the affected rows are flagged ``REVIEW_METADATA_MISMATCH``.
+- Restored rows keep any flags set in memory; the sidecar contributes the
+  authoritative persisted flags and confidence.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import unicodedata
+from pathlib import Path
+from typing import Any, Iterable
+
+from .models import AlignmentRow
+
+SIDECAR_SUFFIX = ".review_metadata.jsonl"
+SCHEMA = 1
+
+MISSING_FLAG = "REVIEW_METADATA_MISSING"
+MISMATCH_FLAG = "REVIEW_METADATA_MISMATCH"
+UNRESOLVED_FLAG = "REVIEW_METADATA_UNRESOLVED"
+
+
+def sidecar_path(csv_path: str | Path) -> Path:
+    path = Path(csv_path)
+    if path.suffix.lower() == ".csv":
+        return path.with_suffix(SIDECAR_SUFFIX)
+    return path.parent / (path.name + SIDECAR_SUFFIX)
+
+
+def _content_sha256(row: AlignmentRow) -> str:
+    payload = "\x1f".join(
+        [
+            unicodedata.normalize("NFC", row.ch_txt),
+            unicodedata.normalize("NFC", row.vi_txt),
+            row.text_diff_json(),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def row_metadata_record(row: AlignmentRow) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "sentence_id": row.sentence_id,
+        "img_id": row.img_id,
+        "flags": sorted(set(row.flags)),
+        "confidence": row.confidence,
+        "content_sha256": _content_sha256(row),
+    }
+
+
+def write_review_metadata(csv_path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
+    path = sidecar_path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        for row in rows:
+            fh.write(json.dumps(row_metadata_record(row), ensure_ascii=False) + "\n")
+    return path
+
+
+def load_review_metadata(path: str | Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Parse the sidecar; duplicates keep the first record and are reported."""
+    records: dict[str, dict[str, Any]] = {}
+    issues: list[str] = []
+    sidecar = Path(path)
+    if not sidecar.exists():
+        issues.append(f"METADATA_SIDECAR_MISSING:{sidecar.name}")
+        return records, issues
+    for lineno, raw in enumerate(sidecar.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            issues.append(f"METADATA_JSON_ERROR:{lineno}:{exc.msg}")
+            continue
+        if not isinstance(record, dict):
+            issues.append(f"METADATA_NOT_OBJECT:{lineno}")
+            continue
+        sentence_id = str(record.get("sentence_id", "")).strip()
+        if not sentence_id:
+            issues.append(f"METADATA_MISSING_SENTENCE_ID:{lineno}")
+            continue
+        if sentence_id in records:
+            issues.append(f"METADATA_DUPLICATE:{sentence_id}")
+            continue
+        records[sentence_id] = record
+    return records, issues
+
+
+def restore_review_metadata(
+    csv_path: str | Path,
+    rows: list[AlignmentRow],
+) -> tuple[list[AlignmentRow], list[str]]:
+    """Merge sidecar flags/confidence into CSV-loaded rows.
+
+    Returns the rows (modified in place) and a list of ``METADATA_*``
+    issues. Every row missing usable metadata is flagged
+    ``REVIEW_METADATA_MISSING`` and therefore can never silently read as
+    a clean row.
+    """
+    path = sidecar_path(csv_path)
+    records, issues = load_review_metadata(path)
+    known_ids = set()
+    for row in rows:
+        known_ids.add(row.sentence_id)
+        record = records.get(row.sentence_id)
+        flags = list(row.flags)
+        if record is None:
+            issues.append(f"METADATA_MISSING:{row.sentence_id}")
+            if MISSING_FLAG not in flags:
+                flags.append(MISSING_FLAG)
+            row.flags = sorted(set(flags))
+            continue
+        rec_img = str(record.get("img_id", ""))
+        if rec_img != row.img_id:
+            issues.append(f"METADATA_MISMATCH_IMG:{row.sentence_id}")
+            flags.append(MISMATCH_FLAG)
+        rec_sha = str(record.get("content_sha256", ""))
+        if not rec_sha and record.get("text_diff_sha256"):
+            # Legacy single-field hash (diff only); still validate what we can.
+            rec_sha = str(record.get("text_diff_sha256"))
+            legacy = True
+        else:
+            legacy = False
+        if rec_sha:
+            if legacy:
+                expected = hashlib.sha256(row.text_diff_json().encode("utf-8")).hexdigest()
+            else:
+                expected = _content_sha256(row)
+            if rec_sha != expected:
+                issues.append(f"METADATA_MISMATCH_DIFF:{row.sentence_id}")
+                flags.append(MISMATCH_FLAG)
+        rec_flags = record.get("flags")
+        if isinstance(rec_flags, list):
+            flags.extend(str(flag) for flag in rec_flags)
+        confidence = record.get("confidence")
+        if confidence is not None:
+            try:
+                row.confidence = float(confidence)
+            except (TypeError, ValueError):
+                issues.append(f"METADATA_BAD_CONFIDENCE:{row.sentence_id}")
+                flags.append(UNRESOLVED_FLAG)
+        row.flags = sorted(set(flags))
+    for sentence_id in sorted(set(records) - known_ids):
+        issues.append(f"METADATA_STALE:{sentence_id}")
+    return rows, issues
+
+
+def load_rows_with_metadata(
+    csv_path: str | Path,
+) -> tuple[list[AlignmentRow], list[str]]:
+    from .align import read_alignment_csv
+
+    rows = read_alignment_csv(csv_path)
+    return restore_review_metadata(csv_path, rows)

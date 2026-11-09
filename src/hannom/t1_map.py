@@ -13,9 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .anchors import find_reading_anchors, gather_readings, token_items
+from .clean import is_nom_char, nfc
 from .config import BookConfig, ProjectConfig
 from .models import PageRecord
 from .state import State
+
+PAIR_STATUSES = frozenset({"candidate", "verified", "unresolved", "manual"})
 
 
 class ImageMapError(RuntimeError):
@@ -27,11 +31,19 @@ class Pair:
     ch: tuple[str, ...]
     vi: tuple[str, ...]
     note: str | None = None
+    confidence: float | None = None
+    source: str | None = None
+    status: str = "candidate"
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"ch": list(self.ch), "vi": list(self.vi)}
         if self.note:
             d["note"] = self.note
+        if self.confidence is not None:
+            d["confidence"] = float(self.confidence)
+        if self.source:
+            d["source"] = self.source
+        d["status"] = self.status
         return d
 
 
@@ -80,6 +92,109 @@ def _group_cost(
     # normalise book length, so do not let it dominate.
     ratio_guard = abs(expected - 1.0) * 0.05
     return ratio + penalty + ratio_guard
+
+
+def score_pairs_with_anchors(
+    pairs: list[Pair],
+    cleaned_by_name: dict[str, str],
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    verified_min_coverage: float = 0.5,
+) -> list[Pair]:
+    """Attach anchor-evidence confidence/status to heuristic pairs.
+
+    ``confidence`` is the fraction of reading-carrying Nôm characters in a
+    pair with a reliable reading anchor in the paired Quốc ngữ text.
+    ``status`` is ``verified`` when at least ``verified_min_coverage`` of
+    those characters anchor, else ``unresolved``. Pairs with no reading
+    evidence at all stay ``candidate`` (insufficient evidence, not evidence
+    of failure). Never throws on odd inputs; unreadable pairs stay explicit.
+    """
+    scored: list[Pair] = []
+    for pair in pairs:
+        nom_items: list[list[str]] = []
+        toks: list[tuple[int, int, str]] = []
+        for name in pair.ch:
+            ch_text = str(cleaned_by_name.get(name, "") or "")
+            for char in ch_text:
+                if is_nom_char(char):
+                    readings, _source = gather_readings(char, lexicon=lexicon, dictionary=dictionary)
+                    nom_items.append(readings)
+        for name in pair.vi:
+            toks.extend(token_items(str(cleaned_by_name.get(name, "") or "")))
+        known = sum(1 for readings in nom_items if readings)
+        source = "heuristic_mass"
+        if known == 0:
+            scored.append(
+                Pair(ch=pair.ch, vi=pair.vi, note=pair.note,
+                     confidence=None, source=source, status="candidate")
+            )
+            continue
+        anchors = find_reading_anchors(nom_items, toks)
+        confidence = len(anchors) / known
+        status = "verified" if confidence >= verified_min_coverage else "unresolved"
+        scored.append(
+            Pair(ch=pair.ch, vi=pair.vi, note=pair.note,
+                 confidence=round(confidence, 4), source=source + "+anchors", status=status)
+        )
+    return scored
+
+
+def parse_manual_pairs(data: Any) -> list[Pair]:
+    """Parse ``image_map.manual.json`` into explicit Pair objects."""
+    items = data if isinstance(data, list) else data.get("pairs", [])
+    if not isinstance(items, list) or not items:
+        raise ImageMapError("image_map.manual.json: expected a non-empty list of pairs")
+    out: list[Pair] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ImageMapError(f"manual pair {index}: expected an object")
+        ch = tuple(str(name) for name in item.get("ch", []))
+        vi = tuple(str(name) for name in item.get("vi", []))
+        if not ch and not vi:
+            raise ImageMapError(f"manual pair {index}: both sides empty")
+        note = str(item.get("note") or "manual correction")
+        out.append(Pair(ch=ch, vi=vi, note=note, confidence=1.0, source="manual", status="manual"))
+    return out
+
+
+def mapping_summary(pairs: list[Pair]) -> dict[str, int]:
+    summary: dict[str, int] = {"pairs": len(pairs), "verified": 0, "candidate": 0,
+                               "unresolved": 0, "manual": 0}
+    for pair in pairs:
+        summary[pair.status] = summary.get(pair.status, 0) + 1
+    return summary
+
+
+def _load_cleaned_texts(project: ProjectConfig, book: BookConfig) -> dict[str, str]:
+    folder = project.data_dir / "clean" / book.book_id
+    if not folder.exists():
+        return {}
+    texts: dict[str, str] = {}
+    for path in folder.glob("*.json"):
+        if path.name == "summary.json":
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        name = data.get("image_name")
+        if name:
+            texts[str(name)] = str(data.get("text", "") or "")
+    return texts
+
+
+def _load_book_lexicon(project: ProjectConfig, book: BookConfig):
+    path = project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"
+    if not path.exists():
+        return None
+    try:
+        from .dictionary.book_lexicon import BookLexicon
+
+        return BookLexicon(path)
+    except Exception:
+        return None
 
 
 def align_page_groups(
@@ -144,7 +259,8 @@ def align_page_groups(
         a, b = step
         ch_group = tuple(p.image_name for p in ch_pages[i - a : i])
         vi_group = tuple(p.image_name for p in vi_pages[j - b : j])
-        pairs.append(Pair(ch=ch_group, vi=vi_group, note="heuristic mass mapping"))
+        pairs.append(Pair(ch=ch_group, vi=vi_group, note="heuristic mass mapping",
+                          source="heuristic_mass", status="candidate"))
         i -= a
         j -= b
     pairs.reverse()
@@ -200,6 +316,22 @@ def build_image_map(
         vi_pages,
         config=(project.alignment_config or {}).get("alignment", {}),
     )
+    layout_dir = project.data_dir / "layout" / book.book_id
+    dest = layout_dir / "image_map.json"
+    manual_path = layout_dir / "image_map.manual.json"
+    manual_source = manual_path.exists()
+    anchor_source = False
+    if manual_source:
+        # A manual correction file fully replaces the heuristic mapping;
+        # unmatched entries or bad names fail loudly, never silently revert.
+        manual_items = json.loads(manual_path.read_text(encoding="utf-8"))
+        pairs = parse_manual_pairs(manual_items)
+    else:
+        texts = _load_cleaned_texts(project, book)
+        lexicon = _load_book_lexicon(project, book) if texts else None
+        anchor_source = bool(texts) and lexicon is not None
+        if anchor_source:
+            pairs = score_pairs_with_anchors(pairs, texts, lexicon=lexicon)
     # Scan-missing pages (guideline §Quy định chung về file ánh xạ hình ảnh):
     # missing_ch ⇔ vi empty, missing_vi ⇒ ch empty. These may not already
     # appear in the partitioned ch/vi lists (layout marks them separately).
@@ -250,18 +382,29 @@ def build_image_map(
     if issues:
         raise ImageMapError(f"{book.book_id}: invalid image map: {issues[:5]}")
 
+    mapping_source = (
+        "manual"
+        if manual_source
+        else ("heuristic_mass+anchor_evidence" if anchor_source else "heuristic_mass")
+    )
+    summary = mapping_summary(pairs)
     data = {
         "pairs": [p.to_dict() for p in pairs],
         "meta": {
             "book_id": book.book_id,
             "layout": book.layout,
             "reading_order": {"ch": "decreasing page number", "vi": "increasing page number"},
-            "mapping_source": "heuristic text-mass partition; verify after OCR",
+            "mapping_source": mapping_source,
+            "verified_pairs": summary.get("verified", 0),
+            "candidate_pairs": summary.get("candidate", 0),
+            "unresolved_pairs": summary.get("unresolved", 0),
+            "manual_pairs": summary.get("manual", 0),
             "ch_page_count": len(ch_pages),
             "vi_page_count": len(vi_pages),
         },
     }
-    dest = project.data_dir / "layout" / book.book_id / "image_map.json"
+    if manual_source:
+        data["meta"]["note"] = "image_map.manual.json applied; manual pairs carry status=manual"
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("w", encoding="utf-8", newline="\n") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
@@ -281,5 +424,19 @@ def load_image_map(path: str | Path) -> list[Pair]:
         data = json.load(fh)
     pairs: list[Pair] = []
     for item in data.get("pairs", []):
-        pairs.append(Pair(ch=tuple(item.get("ch", [])), vi=tuple(item.get("vi", [])), note=item.get("note")))
+        note = item.get("note")
+        confidence = item.get("confidence")
+        status = str(item.get("status") or "candidate")
+        if status not in PAIR_STATUSES:
+            status = "unresolved"  # unknown status: explicit, never silently verified
+        pairs.append(
+            Pair(
+                ch=tuple(item.get("ch", [])),
+                vi=tuple(item.get("vi", [])),
+                note=note,
+                confidence=float(confidence) if confidence is not None else None,
+                source=item.get("source"),
+                status=status,
+            )
+        )
     return pairs

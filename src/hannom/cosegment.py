@@ -9,8 +9,13 @@ Two modes:
   global stream mode cannot be applied.
 - ``stream_cosegment`` — the primary mode: build one reading stream per
   script, split the QN stream at sentence punctuation and assign the same
-  cut points to the Nôm stream proportionally. Chunks spanning a page
-  boundary are attributed to every page they cover and carry SPANS_PAGES.
+  cut points to the Nôm stream. Cuts are derived from reliable local
+  reading anchors (see ``hannom.anchors``) when anchor evidence exists,
+  interpolated between sufficiently close anchors, and fall back to
+  proportional shares only when no anchor evidence brackets a boundary;
+  fallback segments carry ``COSEGMENTED_UNANCHORED`` and are never trusted
+  as verified evidence. Chunks spanning a page boundary are attributed to
+  every page they cover and carry SPANS_PAGES.
   The result is a list of ``Segment`` covering every page exactly once, in
   reading order, with the same boundaries on both scripts.
 """
@@ -18,7 +23,9 @@ Two modes:
 from __future__ import annotations
 
 import re
+from typing import Any
 
+from .anchors import MAX_ANCHOR_GAP_TOKENS, find_reading_anchors, gather_readings, token_items
 from .clean import is_nom_char, nfc
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -157,15 +164,88 @@ def _concat_with_offsets(units: Sequence[PageUnit], separator: str = " ") -> tup
     return "".join(parts), spans
 
 
+def _anchor_cuts(
+    *,
+    nom_items: list[list[str]],
+    qn_tokens: list[tuple[int, int, str]],
+    qn_text: str,
+    sentences: list[tuple[int, int, int]],
+    sentence_token_ranges: list[tuple[int, int]],
+    total_nom: int,
+    total_tok: int,
+    window: int,
+    max_gap_tokens: int,
+) -> tuple[list[tuple[int, int]], set[int]]:
+    """Return (per-sentence CJK cuts, boundary indices without anchor evidence).
+
+    Each boundary is estimated from the bracketing reliable anchors inside a
+    ±``window`` neighborhood of the proportional estimate. When a boundary is
+    not bracketed by at least one anchor on each side, it falls back to the
+    proportional cut and its index is added to the unanchored set.
+    """
+    toks_at = [token[0] for token in qn_tokens]
+    boundaries: list[int | None] = [0]  # one cut per sentence boundary (0..len(sentences))
+    unanchored: set[int] = set()
+    for boundary in range(1, len(sentences)):
+        est = round(sentence_token_ranges[boundary][0] * total_nom / total_tok)
+        lo = max(0, est - window)
+        hi = min(total_nom, est + window)
+        tok_mid = sentence_token_ranges[boundary][0]
+        k_lo = max(0, tok_mid - window)
+        k_hi = min(len(qn_tokens), tok_mid + window)
+        sub_anchors = find_reading_anchors(nom_items[lo:hi], qn_tokens[k_lo:k_hi])
+        anchors = [(i + lo, k + k_lo) for i, k in sub_anchors]
+        boundary_char = sentences[boundary][0]
+        left = [a for a in anchors if a[1] < tok_mid]
+        right = [a for a in anchors if a[1] >= tok_mid]
+        cut: int | None = None
+        if left and right:
+            left_anchor, right_anchor = left[-1], right[0]
+            gap = right_anchor[1] - left_anchor[1]
+            if right_anchor[0] > left_anchor[0] and gap <= max_gap_tokens:
+                left_char = toks_at[left_anchor[1]]
+                right_char = toks_at[right_anchor[1]]
+                span = max(1, right_char - left_char)
+                fraction = (boundary_char - left_char) / span
+                cut = int(round(left_anchor[0] + fraction * (right_anchor[0] - left_anchor[0])))
+                cut = max(0, min(total_nom, cut))
+        if cut is None:
+            cut = est
+            unanchored.add(boundary)
+        boundaries.append(cut)
+    boundaries.append(total_nom)
+    # Keep cuts monotone, clamped to the Nôm stream.
+    cuts: list[tuple[int, int]] = []
+    prev_end = 0
+    for index in range(len(sentences)):
+        start_cut = boundaries[index]
+        end_cut = boundaries[index + 1]
+        start_cut = max(prev_end, min(total_nom, start_cut))
+        end_cut = max(start_cut, min(total_nom, end_cut))
+        cuts.append((start_cut, end_cut))
+        prev_end = end_cut
+    # Boundary indices are sentence boundaries (1..len(sentences) - 1); the
+    # trivially free stream edges never count as unanchored.
+    return cuts, unanchored
+
+
 def stream_cosegment(
     nom_units: Sequence[PageUnit],
     qn_units: Sequence[PageUnit],
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    max_anchor_gap_tokens: int = MAX_ANCHOR_GAP_TOKENS,
+    anchor_window: int = 20,
 ) -> tuple[list[StreamSegment], list[StreamSegment]] | None:
     """Segment the reading stream of both scripts at QN sentence boundaries.
 
     Returns two lists (nom_segments, qn_segments) of the same length and
-    order. Each segment carries page attribution. Returns None when the
-    stream is too small to split.
+    order. Each segment carries page attribution and one of
+    ``COSEGMENTED_ANCHORED`` (both boundary cuts were derived from reliable
+    reading anchors) or ``COSEGMENTED_UNANCHORED`` (proportional-fallback
+    segmentation; never trusted as verified evidence or scoring). Returns
+    None when the stream is too small to split.
     """
     qn_text, qn_spans = _concat_with_offsets(qn_units, separator=" ")
     if not qn_text.strip():
@@ -183,18 +263,34 @@ def stream_cosegment(
     if total_nom < 20 or len(sentences) < 2:
         return None
 
-    # Cut positions in cumulative token-count units, then scaled to Nôm index units.
-    cum_tok = 0
-    cuts: list[tuple[int, int]] = []  # per sentence: (start_tok_cum, end_tok_cum)
-    for a, b, tcount in sentences:
-        cuts.append((cum_tok, cum_tok + tcount))
-        cum_tok += tcount
+    # ------------------------------------------------------------------
+    # Cut positions: windowed anchor interpolation, proportional fallback
+    # otherwise. Fallback cuts are flagged COSEGMENTED_UNANCHORED.
+    # ------------------------------------------------------------------
+    nom_items: list[list[str]] = []
+    for pos, index in enumerate(nom_idx):
+        readings, _source = gather_readings(nom_text[index], lexicon=lexicon, dictionary=dictionary)
+        nom_items.append(readings)
+    qn_tokens = token_items(qn_text)
 
-    nom_cuts: list[tuple[int, int]] = []
-    for tok_start, tok_end in cuts:
-        i0 = round(tok_start * total_nom / total_tok)
-        i1 = round(tok_end * total_nom / total_tok)
-        nom_cuts.append((i0, i1))
+    # Sentence j occupies tokens [tok_start_j, tok_end_j).
+    sentence_token_ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for _a, _b, tcount in sentences:
+        sentence_token_ranges.append((cursor, cursor + tcount))
+        cursor += tcount
+
+    nom_cuts, unanchored_cuts = _anchor_cuts(
+        nom_items=nom_items,
+        qn_tokens=qn_tokens,
+        qn_text=qn_text,
+        sentences=sentences,
+        sentence_token_ranges=sentence_token_ranges,
+        total_nom=total_nom,
+        total_tok=total_tok,
+        window=anchor_window,
+        max_gap_tokens=max_anchor_gap_tokens,
+    )
 
     # For the QN side, ranges are character-index ranges; for the Nôm side,
     # character ranges directly. Build per-chunk attribution for each script.
@@ -238,8 +334,10 @@ def stream_cosegment(
             continue
         p_nom, pns_nom, pimgs_nom = nom_chunk_pages(n_start_cum, n_end_cum)
         p_qn, pns_qn, pimgs_qn = chunk_pages(qn_spans, a, b)
-        flags_nom = ["COSEGMENTED"]
-        flags_qn = ["COSEGMENTED"]
+        anchored = (idx not in unanchored_cuts) and ((idx + 1) not in unanchored_cuts)
+        anchor_flag = "COSEGMENTED_ANCHORED" if anchored else "COSEGMENTED_UNANCHORED"
+        flags_nom = ["COSEGMENTED", anchor_flag]
+        flags_qn = ["COSEGMENTED", anchor_flag]
         if len(pimgs_nom) > 1:
             flags_nom.append("SPANS_PAGES")
         if len(pimgs_qn) > 1:

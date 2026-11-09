@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from .clean import MASK, count_nom_chars, is_nom_char, nfc
+from .anchors import gather_readings
 from .models import DiffElement
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -37,6 +38,10 @@ class DiffResult:
     matched_readings: int = 0
     known_nom_chars: int = 0
     unknown_nom_chars: int = 0
+    lexicon_matched_readings: int = 0
+    dictionary_matched_readings: int = 0
+    dictionary_known_nom_chars: int = 0
+    ambiguous_nom_chars: int = 0
 
     @property
     def text_diff(self) -> list[DiffElement] | None:
@@ -346,14 +351,24 @@ def auto_text_diff(
         )
 
     readings_by_index: dict[int, list[str]] = {}
-    known = 0
+    sources: dict[int, str] = {}
     for index, char in chars:
-        readings: list[str] = []
-        if lexicon is not None and hasattr(lexicon, "readings"):
-            readings = list(lexicon.readings(char))
+        readings, source = gather_readings(char, lexicon=lexicon, dictionary=dictionary)
         if readings:
             readings_by_index[index] = readings
-            known += 1
+            sources[index] = source
+    known = len(readings_by_index)
+    dictionary_known = sum(1 for source in sources.values() if "dictionary" in source)
+    if known:
+        token_set = {t[2] for t in tokens}
+        ambiguous = sum(
+            1 for readings in readings_by_index.values()
+            if sum(1 for reading in readings if reading in token_set) >= 2
+        )
+    else:
+        ambiguous = 0
+    if ambiguous:
+        flags.append("DIFF_AMBIGUOUS_READINGS")
 
     if not known:
         # No positive evidence. Do not invent red spans and do not claim the
@@ -425,6 +440,8 @@ def auto_text_diff(
 
     matched: set[int] = set()
     char_matches: dict[int, int] = {}
+    lexicon_matched = 0
+    dictionary_matched = 0
     i, j = n, m_
     while i > 0 or j > 0:
         step = back[i][j]
@@ -432,6 +449,11 @@ def auto_text_diff(
             if _score(i - 1, j - 1) > 0:
                 matched.add(i - 1)
                 char_matches[i - 1] = j - 1
+                source = sources.get(i - 1, "")
+                if "lexicon" in source:
+                    lexicon_matched += 1
+                if "dictionary" in source:
+                    dictionary_matched += 1
             i -= 1
             j -= 1
         elif step == 'up':
@@ -514,6 +536,8 @@ def auto_text_diff(
         if nom != vi:
             review.append("DIFF_UNVERIFIED_DIFFERENT_TEXT")
 
+    if dictionary_matched:
+        flags.append("DIFF_READINGS_FROM_DICTIONARY")
     if proper_name:
         flags.append("PROPER_NAME_CANDIDATE")
     if not strict_reading_mismatch and elements:
@@ -529,6 +553,10 @@ def auto_text_diff(
         matched_readings=len(matched),
         known_nom_chars=known,
         unknown_nom_chars=unknown,
+        lexicon_matched_readings=lexicon_matched,
+        dictionary_matched_readings=dictionary_matched,
+        dictionary_known_nom_chars=dictionary_known,
+        ambiguous_nom_chars=ambiguous,
     )
 
 
