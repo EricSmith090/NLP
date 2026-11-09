@@ -63,7 +63,7 @@ def test_unknown_status_becomes_unresolved_not_verified(tmp_path):
     assert loaded.status == "unresolved"
 
 
-def test_score_pairs_with_mixed_evidence():
+def test_score_pairs_repeated_tokens_stay_unresolved():
     ch = [_page(n, "ch", 0.05) for n in range(4, 0, -1)]
     vi = [_page(n, "vi", 0.05) for n in range(1, 5)]
     for i, page in enumerate(ch):
@@ -78,10 +78,10 @@ def test_score_pairs_with_mixed_evidence():
     texts.update({pair.vi[0]: "thì thì" for pair in pairs})
     pairs = score_pairs_with_anchors(pairs, texts, lexicon=lexicon,
                                      verified_min_coverage=0.5)
-    assert all(p.confidence == pytest.approx(1.0) for p in pairs)
-    assert all(p.status == "verified" for p in pairs)
-    summary = mapping_summary(pairs)
-    assert summary["verified"] == len(pairs)
+    # Every Nôm char and every QN token is ambiguous: evidence exists but
+    # cannot confirm the pairing → never verified.
+    assert all(p.status == "unresolved" for p in pairs)
+    assert all(p.confidence == pytest.approx(0.0) for p in pairs)
 
 
 def test_score_pairs_without_lexicon_keeps_candidate():
@@ -91,14 +91,35 @@ def test_score_pairs_without_lexicon_keeps_candidate():
     assert out[0].confidence is None
 
 
-def test_score_pairs_with_lexicon_scores_coverage():
+def test_score_pairs_with_unique_evidence_is_verified():
+    pair = Pair(ch=("a.jpg",), vi=("b.jpg",), note="x", source="heuristic_mass", status="candidate")
+    lexicon = StubLexicon({"之": ["thì"], "其": ["thế"]})
+    out = score_pairs_with_anchors(
+        [pair], {"a.jpg": "之其", "b.jpg": "thì thế"}, lexicon=lexicon
+    )
+    assert out[0].status == "verified"
+    assert out[0].confidence == pytest.approx(1.0)
+
+
+def test_score_pairs_repeated_tokens_are_unresolved():
     pair = Pair(ch=("a.jpg",), vi=("b.jpg",), note="x", source="heuristic_mass", status="candidate")
     lexicon = StubLexicon({"字": ["thì"], "其": ["thế"]})
     out = score_pairs_with_anchors(
         [pair], {"a.jpg": "字其字其", "b.jpg": "thì thế thì thế"}, lexicon=lexicon
     )
-    assert out[0].status == "verified"
-    assert out[0].confidence == pytest.approx(1.0)
+    # Each reading occurs twice on both sides: no unique evidence.
+    assert out[0].status == "unresolved"
+    assert out[0].confidence == pytest.approx(0.0)
+
+
+def test_score_pairs_requires_minimum_anchor_count():
+    pair = Pair(ch=("a.jpg",), vi=("b.jpg",), note="x", source="heuristic_mass", status="candidate")
+    lexicon = StubLexicon({"之": ["thì"]})
+    # One unique anchor but below the minimum-anchor bar of 2 → unresolved.
+    out = score_pairs_with_anchors(
+        [pair], {"a.jpg": "之沛", "b.jpg": "thì bóng khác"}, lexicon=lexicon
+    )
+    assert out[0].status == "unresolved"
 
 
 def test_score_pairs_marks_unresolved_when_no_token_matches():

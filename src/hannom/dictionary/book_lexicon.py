@@ -13,18 +13,26 @@ JSON file, but ``readings()`` never returns them: they are not trusted
 alignment, colouring or learning evidence until a human explicitly
 restores them.
 
-Learning policy (both properties are required):
+Learning policy — a reading is learned only when the reviewer explicitly
+confirmed the *position* of the character:
 
-1. The row must carry the ``HUMAN_REVIEWED`` flag (i.e. a reviewer
-   signed off on it) — see ``hannom.review.patches``.
-2. The character↔syllable correspondence must be unambiguous: exactly
-   one Nôm character in the row and either exactly one QN syllable, or a
-   dictionary reading present in the row's syllables.
+1. The row must carry an explicit, non-stale verifying review decision
+   (``alignment_reviewed`` / ``accepted_match`` / ``accepted_difference``)
+   recorded by a human; see ``hannom.review_decisions``.
+2. Positional evidence, one of:
+   a. an explicit ``character_token_mappings`` entry recorded on the
+      decision (the strongest evidence — usable even for multi-character
+      rows), or
+   b. a single Nôm character paired with a single QN token that the
+      reviewer explicitly accepted (1↔1 with no positional ambiguity).
+3. Dictionary membership in the sentence is **never** positional
+   evidence; neither are repeated or multiple candidate readings.
 
 Rows flagged ``NON_ONE_TO_ONE``, ``UNMATCHED_*``, ``ALIGN_LOW_CONF``,
-``COSEGMENTED_UNANCHORED``, ``TEXT_DIFF_INVALID`` or review-metadata
-failures are never used for active learning. Automated learning can
-never consume its own unverified outputs.
+``COSEGMENTED_UNANCHORED``, ``TEXT_DIFF_INVALID``, evidence- or
+metadata- or decision-integrity failures are never used for the
+no-mapping single-token path. Automated learning can never consume its
+own unverified outputs.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..clean import is_nom_char
+from ..review_decisions import VERIFYING_STATUSES
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -53,6 +62,11 @@ BLOCKING_FLAGS = frozenset(
         "COSEGMENTED_UNANCHORED",
         "REVIEW_METADATA_MISSING",
         "REVIEW_METADATA_MISMATCH",
+        "REVIEW_METADATA_UNRESOLVED",
+        "ALIGN_EVIDENCE_INSUFFICIENT",
+        "REVIEW_DECISION_STALE",
+        "REVIEW_DECISION_MISMATCH",
+        "REVIEW_DECISION_INVALID",
     }
 )
 
@@ -67,12 +81,16 @@ def qn_syllables(text: str) -> list[str]:
     return [m.group(0) for m in QN_TOKEN_RE.finditer(text)]
 
 
-def _reading_forms(reading: str) -> set[str]:
-    value = reading.strip().casefold()
-    forms = {value, strip_diacritics(value)}
-    forms.update(x for x in re.split(r"[\s,;/]+", value) if x)
-    forms.update(strip_diacritics(x) for x in list(forms))
-    return {x for x in forms if x}
+def _normalize_reading(reading: str) -> str:
+    return unicodedata.normalize("NFC", reading.strip()).casefold()
+
+
+def _qn_token_spans(text: str) -> list[tuple[int, int, str]]:
+    return [(m.start(), m.end(), m.group(0)) for m in QN_TOKEN_RE.finditer(unicodedata.normalize("NFC", text).casefold())]
+
+
+def _nom_char_positions(text: str) -> list[int]:
+    return [i for i, ch in enumerate(text) if is_nom_char(ch)]
 
 
 def _now() -> str:
@@ -95,6 +113,11 @@ def _row_tuple(row: Any) -> tuple[str, str, str, str, list[str]]:
         str(_row_field(row, "img_id", "") or ""),
         [str(f) for f in (_row_field(row, "flags", []) or [])],
     )
+
+
+def _mapping_items(row: Any) -> list[dict[str, Any]]:
+    mappings = _row_field(row, "character_token_mappings", []) or []
+    return [item for item in mappings if isinstance(item, dict)]
 
 
 class BookLexicon:
@@ -282,73 +305,88 @@ class BookLexicon:
         rows: Iterable[Any],
         dictionary: Any | None = None,
     ) -> dict[str, Any]:
-        """Learn conservative reading evidence from human-reviewed rows.
+        """Learn reading evidence from explicitly reviewed, positional rows.
 
-        Only rows flagged ``HUMAN_REVIEWED`` qualify, and only rows with an
-        unambiguous correspondence: exactly one Nôm character, and either
-        exactly one QN syllable or a dictionary reading present in the
-        row's syllables. Everything else is reported as skipped, never
-        silently learned.
+        A row qualifies only when it carries an explicit, non-stale
+        verifying review decision (see ``hannom.review_decisions``) AND one
+        of the following holds:
+
+        a. its decision recorded explicit ``character_token_mappings``
+           (each mapping is validated against the row content; invalid
+           ones are skipped, valid ones are learned), or
+        b. the row has exactly one Nôm character and exactly one QN
+           token (a 1↔1 correspondence with no positional ambiguity) and
+           carries no blocking flags.
+
+        Sentence-level dictionary membership never establishes positional
+        correspondence; nothing is inferred from sets of readings.
         """
         learned = 0
         skipped_unreviewed = 0
         skipped_blocked = 0
         skipped_ambiguous = 0
         skipped_empty = 0
+        skipped_no_positional_evidence = 0
+        skipped_invalid_mapping = 0
         for row in rows:
             ch_text, vi_text, sentence_id, image_name, flags = _row_tuple(row)
             flag_set = set(flags)
-            if "HUMAN_REVIEWED" not in flag_set:
+            review_status = _row_field(row, "review_status", None)
+            reviewer = str(_row_field(row, "review_reviewer", "") or "")
+            if review_status not in VERIFYING_STATUSES:
                 skipped_unreviewed += 1
                 continue
+            mappings = _mapping_items(row)
+
+            # -- Path A: explicit reviewer character↔token mappings ------
+            if mappings:
+                nom_positions = _nom_char_positions(ch_text)
+                tokens = _qn_token_spans(vi_text)
+                learned_here = 0
+                for mapping in mappings:
+                    if not self._learn_mapping(
+                        mapping,
+                        ch_text=ch_text,
+                        nom_positions=nom_positions,
+                        vi_text=vi_text,
+                        tokens=tokens,
+                        sentence_id=sentence_id,
+                        image_name=image_name,
+                        reviewer=reviewer,
+                        decision_status=review_status,
+                    ):
+                        skipped_invalid_mapping += 1
+                        continue
+                    learned_here += 1
+                learned += learned_here
+                continue
+
+            # -- Path B: single Nôm character, single accepted token ------
             if flag_set & BLOCKING_FLAGS:
                 skipped_blocked += 1
                 continue
-            chars = [ch for ch in ch_text if is_nom_char(ch)]
-            syllables = qn_syllables(vi_text)
-            if not chars or not syllables:
+            chars = [(i, ch) for i, ch in enumerate(ch_text) if is_nom_char(ch)]
+            tokens = _qn_token_spans(vi_text)
+            if not chars or not tokens:
                 skipped_empty += 1
                 continue
-            if len(chars) != 1:
-                skipped_ambiguous += 1
+            if len(chars) != 1 or len(tokens) != 1:
+                skipped_no_positional_evidence += 1
                 continue
-            char = chars[0]
-            syllable_set = set(syllables)
-            if len(syllables) == 1:
-                self.add(
-                    char,
-                    syllables[0],
-                    provenance={
-                        "source": "human_reviewed_row",
-                        "evidence": "single_token",
-                        "sentence_id": sentence_id,
-                        "image_name": image_name,
-                    },
-                )
-                learned += 1
-                continue
-            if dictionary is None:
-                skipped_ambiguous += 1
-                continue
-            lookup = dictionary.lookup(char)
-            matched = []
-            for reading in getattr(lookup, "readings", []) or []:
-                for form in _reading_forms(str(reading)):
-                    if form in syllable_set and form not in matched:
-                        matched.append(form)
-            if len(matched) != 1:
-                # Zero or multiple candidate readings: not unambiguous.
-                skipped_ambiguous += 1
-                continue
+            _, char = chars[0]
+            token_text = tokens[0][2]
             self.add(
                 char,
-                matched[0],
+                token_text,
                 provenance={
-                    "source": "human_reviewed_row",
-                    "evidence": "dictionary_reading",
+                    "source": "human_review_decision",
+                    "evidence": "single_token_accepted",
                     "sentence_id": sentence_id,
                     "image_name": image_name,
-                    "reading": matched[0],
+                    "reviewer": reviewer,
+                    "decision_status": review_status,
+                    "nom_position": 0,
+                    "qn_token_position": 0,
                 },
             )
             learned += 1
@@ -360,5 +398,53 @@ class BookLexicon:
             "skipped_blocked": skipped_blocked,
             "skipped_ambiguous": skipped_ambiguous,
             "skipped_empty": skipped_empty,
+            "skipped_no_positional_evidence": skipped_no_positional_evidence,
+            "skipped_invalid_mapping": skipped_invalid_mapping,
             "quarantine": self.quarantine_summary(),
         }
+
+    def _learn_mapping(
+        self,
+        mapping: dict[str, Any],
+        *,
+        ch_text: str,
+        nom_positions: list[int],
+        vi_text: str,
+        tokens: list[tuple[int, int, str]],
+        sentence_id: str,
+        image_name: str,
+        reviewer: str,
+        decision_status: str,
+    ) -> bool:
+        char = str(mapping.get("nom_char", ""))
+        try:
+            nom_position = int(mapping.get("nom_position", -1))
+            qn_position = int(mapping.get("qn_token_position", -1))
+        except (TypeError, ValueError):
+            return False
+        qn_token = str(mapping.get("qn_token", ""))
+        if len(char) != 1 or not is_nom_char(char):
+            return False
+        if nom_position < 0 or nom_position >= len(nom_positions):
+            return False
+        if ch_text[nom_positions[nom_position]] != char:
+            return False
+        if qn_position < 0 or qn_position >= len(tokens):
+            return False
+        token_text = tokens[qn_position][2]
+        if not qn_token or _normalize_reading(token_text) != _normalize_reading(qn_token):
+            return False
+        return self.add(
+            char,
+            token_text,
+            provenance={
+                "source": "human_review_decision",
+                "evidence": "explicit_mapping",
+                "sentence_id": sentence_id,
+                "image_name": image_name,
+                "reviewer": reviewer,
+                "decision_status": decision_status,
+                "nom_position": nom_position,
+                "qn_token_position": qn_position,
+            },
+        )

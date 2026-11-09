@@ -285,6 +285,12 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                         "Coverage",
                         "N/A" if metrics.coverage_ratio is None else f"{metrics.coverage_ratio:.2%}",
                     ),
+                    (
+                        "Structural confidence (grouping)",
+                        "N/A" if metrics.structural_confidence_mean is None else f"{metrics.structural_confidence_mean:.2f}",
+                    ),
+                    ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
+                    ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
                     ("Gate ≥95%", "PASS" if metrics.passed else "FAIL"),
                 ]
             )
@@ -312,6 +318,9 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                 ("Dòng chưa xác minh", str(metrics.unverified_rows)),
                 ("Dòng unmatched", str(metrics.unmatched_rows)),
                 ("Coverage", "N/A" if metrics.coverage_ratio is None else f"{metrics.coverage_ratio:.2%}"),
+                ("Structural confidence (grouping)", "N/A" if metrics.structural_confidence_mean is None else f"{metrics.structural_confidence_mean:.4f}"),
+                ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
+                ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
                 ("Similarity", "N/A" if metrics.similarity is None else f"{metrics.similarity:.4f}%"),
                 ("Kết luận", "PASS" if metrics.passed else "FAIL"),
             ]

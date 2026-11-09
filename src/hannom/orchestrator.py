@@ -42,6 +42,7 @@ from .report import (
     validate_report_data,
 )
 from .review.patches import apply_patches, read_patches
+from .review_decisions import apply_decisions, decision_path, read_decisions
 from .review_metadata import load_rows_with_metadata
 from .state import State, iso, utc_now
 from .t1_map import Pair, build_image_map, load_image_map
@@ -299,8 +300,9 @@ def recompute_text_diff(
 
     out: list[AlignmentRow] = []
     for row in rows:
-        if "HUMAN_REVIEWED" in row.flags:
-            # Human-reviewed rows are authoritative evidence; the automatic
+        if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
+            # Rows carrying an explicit review decision (any status) or a
+            # human content edit are authoritative; the automatic
             # recomputation must never overwrite them.
             out.append(row)
             continue
@@ -357,15 +359,19 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     )
     # Human patches are applied BEFORE learning and BEFORE recomputation so
     # that active learning never consumes unreviewed machine output. Lexicon
-    # learning itself is restricted to explicitly human-reviewed rows.
+    # learning itself is restricted to explicitly reviewed, positional
+    # evidence; decision application gives rows their explicit review status.
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows = apply_patches(rows, patches)
+    decisions, decision_issues = read_decisions(decision_path(project.data_dir, book.book_id))
+    rows, review_issues = apply_decisions(rows, decisions, decision_issues)
     learned = lexicon.learn_from_rows(rows, dictionary)
     lexicon.save()
     rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
-    # Apply patches again so human decisions always win over the automatic
-    # recomputation.
+    # Apply patches and decisions again so human content and review
+    # decisions always win over the automatic recomputation.
     rows = apply_patches(rows, patches)
+    rows, _ = apply_decisions(rows, decisions, decision_issues)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
     summary = {
@@ -374,6 +380,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         "warnings": warnings,
         "lexicon": learned,
         "lexicon_quarantine": lexicon.quarantine_summary(),
+        "review_decision_issues": review_issues,
         "flags": {
             flag: sum(1 for row in rows if flag in row.flags)
             for flag in sorted({flag for row in rows for flag in row.flags})
@@ -384,12 +391,28 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     return rows, summary
 
 
-def _load_rows_patched(project, book) -> tuple[list[AlignmentRow], list[str]]:
-    """Read the CSV, restore its review-metadata sidecar, then apply patches."""
+def load_rows_for_evaluation(
+    project: ProjectConfig, book: BookConfig
+) -> tuple[list[AlignmentRow], list[str]]:
+    """Load the CSV, restore its metadata sidecar, apply content patches
+    and overlay review decisions.
+
+    Returns the rows plus every integrity issue found (sidecar and
+    decision-log issues are merged). Callers must treat issues as
+    blocking evaluation failures, never as warnings.
+    """
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     rows, issues = load_rows_with_metadata(csv_path)
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    return apply_patches(rows, patches), issues
+    rows = apply_patches(rows, patches)
+    decisions, decision_issues = read_decisions(decision_path(project.data_dir, book.book_id))
+    rows, decision_issues = apply_decisions(rows, decisions, decision_issues)
+    return rows, issues + decision_issues
+
+
+def _load_rows_patched(project, book) -> tuple[list[AlignmentRow], list[str]]:
+    """Backward-compatible alias for ``load_rows_for_evaluation``."""
+    return load_rows_for_evaluation(project, book)
 
 
 def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> BookMetrics:
@@ -405,9 +428,8 @@ def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> Bo
         yellow_ratio_warn=float(project.quality.get("yellow_ratio_warn", 0.05)),
         minimum_coverage=float(project.quality.get("minimum_coverage", 0.9)),
         max_unverified_ratio=float(project.quality.get("max_unverified_ratio", 0.05)),
+        integrity_issues=metadata_issues,
     )
-    if metadata_issues:
-        metrics.warnings.append(f"METADATA_ISSUES:{len(metadata_issues)}")
     dest = _book_stage(project, book, state, "evaluation") / "metrics.json"
     if dest.exists():
         stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")

@@ -128,8 +128,211 @@ def test_verified_difference_counts_in_accuracy():
     assert metrics.similarity == 50.0
 
 
-def test_human_reviewed_rows_verify_even_with_ambiguity():
-    rows = [_row("Book.001.1", "之", "thì thế", [], ("HUMAN_REVIEWED", "DIFF_AMBIGUOUS_READINGS"))]
+def test_content_edited_row_without_evidence_does_not_verify():
+    # A human edited the row's content but did not verify the alignment:
+    # machine evidence decides, and there is none here.
+    rows = [
+        _row(
+            "Book.001.1",
+            "之",
+            "cái khác hẳn",
+            [],
+            ("CONTENT_EDITED", "DIFF_UNVERIFIED_NO_BOOK_READINGS"),
+        )
+    ]
+    rows[0].review_status = "content_edited"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+    assert metrics.verified_match_rows == 0
+    assert not metrics.passed
+
+
+def test_content_edited_row_with_machine_evidence_may_verify():
+    rows = [
+        _row(
+            "Book.001.1",
+            "之",
+            "cái khác",
+            [],
+            ("CONTENT_EDITED", "DIFF_NO_READING_MISMATCH"),
+        )
+    ]
+    rows[0].review_status = "content_edited"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.verified_match_rows == 1
+
+
+def test_null_row_with_accepted_match_does_not_verify():
+    rows = [_row("Book.001.1", "之", "cái", None, ())]
+    rows[0].review_status = "accepted_match"  # contradictory: no evidence
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+    assert metrics.verified_match_rows == 0
+    assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
+    assert not metrics.passed
+
+
+def test_unmatched_nom_row_with_content_edit_remains_unmatched():
+    rows = [_row("Book.001.1", "其其其", "", None, ("UNMATCHED_NOM", "NON_ONE_TO_ONE", "CONTENT_EDITED"))]
+    rows[0].review_status = "content_edited"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unmatched_rows == 1
+    assert metrics.verified_match_rows == 0
+
+
+def test_unmatched_qn_row_with_content_edit_remains_unmatched():
+    rows = [_row("Book.001.2", "", "một câu hoàn toàn khác", None, ("UNMATCHED_QN", "NON_ONE_TO_ONE", "CONTENT_EDITED"))]
+    rows[0].review_status = "content_edited"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unmatched_rows == 1
+
+
+def test_explicit_unmatched_decision_is_unmatched():
+    rows = [_row("Book.001.3", "其其", "khác hẳn", None, ())]
+    rows[0].review_status = "unmatched"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unmatched_rows == 1
+
+
+def test_accepted_match_with_valid_evidence_is_verified():
+    rows = [_row("Book.001.1", "之", "thì", [], ("DIFF_UNVERIFIED_NO_BOOK_READINGS",))]
+    rows[0].review_status = "accepted_match"  # consistent: no discrepancy
     metrics = evaluate_rows("b", rows)
     assert metrics.verified_match_rows == 1
     assert metrics.unverified_rows == 0
+
+
+def test_accepted_difference_with_valid_spans_is_verified():
+    error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
+    rows = [_row("Book.001.1", "字字", "x", [error], ("DIFF_UNVERIFIED_DIFFERENT_TEXT",))]
+    rows[0].review_status = "accepted_difference"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.verified_difference_rows == 1
+    assert metrics.denominator == 2
+
+
+def test_accepted_difference_with_empty_diff_is_mismatch():
+    rows = [_row("Book.001.1", "之", "thì", [], ())]
+    rows[0].review_status = "accepted_difference"  # says differences exist; there are none
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+    assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
+
+
+def test_accepted_match_with_nonempty_diff_is_mismatch():
+    error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
+    rows = [_row("Book.001.1", "字字", "x", [error], ())]
+    rows[0].review_status = "accepted_match"  # says no discrepancy; there is one
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+    assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
+    assert not metrics.passed
+
+
+def test_review_decision_stale_flag_prevents_verification():
+    rows = [_row("Book.001.1", "之", "thì", [], ("REVIEW_DECISION_STALE",))]
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+
+
+def test_unresolved_decision_is_unverified():
+    rows = [_row("Book.001.1", "之", "thì", [], ())]
+    rows[0].review_status = "unresolved"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+
+
+def test_evidence_insufficient_flag_is_unverified():
+    rows = [
+        _row("Book.001.1", "之", "về vấn đề này khác hẳn", [], ("ALIGN_EVIDENCE_INSUFFICIENT",))
+    ]
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+
+
+def _reload_with_patches(tmp_path, name: str, rows, patches):
+    from hannom.align import write_alignment_csv
+    from hannom.review_metadata import load_rows_with_metadata
+    from hannom.review.patches import apply_patches
+
+    csv_path = tmp_path / f"{name}.csv"
+    write_alignment_csv(csv_path, rows)
+    restored, _ = load_rows_with_metadata(csv_path)
+    return apply_patches(restored, patches)
+
+
+def test_edit_only_nom_transcription_does_not_accept_alignment(tmp_path):
+    from hannom.review.patches import ReviewPatch
+
+    rows = [_row("Book.001.1", "之其", "thì thế", None, ("NON_ONE_TO_ONE",))]
+    patches = [
+        ReviewPatch(
+            book_id="Book",
+            sentence_id="Book.001.1",
+            field="ch_txt",
+            before="之其",
+            after="其之",
+            reviewer="tester",
+            reason="fix scan order",
+        )
+    ]
+    applied = _reload_with_patches(tmp_path, "book_nom_edit", rows, patches)
+    (row,) = applied
+    assert "CONTENT_EDITED" in row.flags
+    assert row.review_status is None  # never auto-accepted
+    metrics = evaluate_rows("b", applied)
+    assert metrics.verified_match_rows == 0
+    assert metrics.verified_difference_rows == 0
+
+
+def test_edit_only_qn_transcription_does_not_accept_alignment(tmp_path):
+    from hannom.review.patches import ReviewPatch
+
+    rows = [_row("Book.001.2", "之其", "thì thế", None, ("NON_ONE_TO_ONE",))]
+    patches = [
+        ReviewPatch(
+            book_id="Book",
+            sentence_id="Book.001.2",
+            field="vi_txt",
+            before="thì thế",
+            after="thì thế đó",
+            reviewer="tester",
+            reason="add missing word",
+        )
+    ]
+    applied = _reload_with_patches(tmp_path, "book_vi_edit", rows, patches)
+    (row,) = applied
+    assert "CONTENT_EDITED" in row.flags
+    assert row.review_status is None
+    metrics = evaluate_rows("b", applied)
+    assert metrics.verified_match_rows == 0
+
+
+def test_alignment_reviewed_with_valid_evidence_is_verified():
+    rows = [_row("Book.001.1", "之", "thì", [], ("DIFF_UNVERIFIED_NO_BOOK_READINGS",))]
+    rows[0].review_status = "alignment_reviewed"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.verified_match_rows == 1
+
+
+def test_alignment_reviewed_with_differences_is_verified_difference():
+    error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
+    rows = [_row("Book.001.1", "字字", "x", [error], ())]
+    rows[0].review_status = "alignment_reviewed"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.verified_difference_rows == 1
+
+
+def test_alignment_reviewed_without_comparison_evidence_stays_unverified():
+    rows = [_row("Book.001.1", "之", "thì", None, ())]
+    rows[0].review_status = "alignment_reviewed"
+    metrics = evaluate_rows("b", rows)
+    assert metrics.unverified_rows == 1
+    assert any("REVIEW_DECISION_MISMATCH" in issue for issue in metrics.issues)
+
+
+def test_existing_automatic_verification_still_works():
+    rows = [_row("Book.001.1", "字字", "hai chữ", [], ("DIFF_NO_READING_MISMATCH",))]
+    metrics = evaluate_rows("b", rows)
+    assert metrics.verified_match_rows == 1
+    assert metrics.passed

@@ -25,6 +25,12 @@ Rules enforced here:
   read as "clean row".
 - Duplicated, stale or mismatched entries are reported as ``METADATA_*``
   issues and the affected rows are flagged ``REVIEW_METADATA_MISMATCH``.
+- Sidecar writes are atomic (temp file in the destination directory,
+  flush+fsync, ``os.replace``); a failed write preserves the previous
+  sidecar.
+- The sidecar ``schema`` must equal ``1``; confidence values must be
+  real numbers (not booleans), finite, and inside ``[0, 1]``. Records
+  failing validation are dropped and reported as ``METADATA_*`` issues.
 - Restored rows keep any flags set in memory; the sidecar contributes the
   authoritative persisted flags and confidence.
 """
@@ -33,11 +39,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import unicodedata
+import math
+import os
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 from .models import AlignmentRow
+from .review_decisions import content_sha256
 
 SIDECAR_SUFFIX = ".review_metadata.jsonl"
 SCHEMA = 1
@@ -55,14 +64,23 @@ def sidecar_path(csv_path: str | Path) -> Path:
 
 
 def _content_sha256(row: AlignmentRow) -> str:
-    payload = "\x1f".join(
-        [
-            unicodedata.normalize("NFC", row.ch_txt),
-            unicodedata.normalize("NFC", row.vi_txt),
-            row.text_diff_json(),
-        ]
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # Single implementation lives in hannom.review_decisions; keep this
+    # wrapper for backwards compatibility with callers that used it.
+    return content_sha256(row.ch_txt, row.vi_txt, row.text_diff_json())
+
+
+def _confidence_error(value: Any) -> str | None:
+    """Return an error string for invalid confidence values, else None."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"confidence has type {type(value).__name__}"
+    number = float(value)
+    if not math.isfinite(number):
+        return "confidence is not finite"
+    if number < 0.0 or number > 1.0:
+        return f"confidence {number} outside [0, 1]"
+    return None
 
 
 def row_metadata_record(row: AlignmentRow) -> dict[str, Any]:
@@ -77,11 +95,33 @@ def row_metadata_record(row: AlignmentRow) -> dict[str, Any]:
 
 
 def write_review_metadata(csv_path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
+    """Serialize the sidecar atomically.
+
+    A temporary file in the destination directory is flushed and closed,
+    then moved onto the destination with ``os.replace``; on any failure
+    the temporary file is removed and the previous sidecar is preserved.
+    """
     path = sidecar_path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as fh:
-        for row in rows:
-            fh.write(json.dumps(row_metadata_record(row), ensure_ascii=False) + "\n")
+    rows = list(rows)
+    for row in rows:
+        err = _confidence_error(row.confidence)
+        if err is not None:
+            raise ValueError(f"{row.sentence_id}: invalid confidence for sidecar: {err}")
+    temp = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        with temp.open("w", encoding="utf-8", newline="\n") as fh:
+            for row in rows:
+                fh.write(json.dumps(row_metadata_record(row), ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -100,14 +140,22 @@ def load_review_metadata(path: str | Path) -> tuple[dict[str, dict[str, Any]], l
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
-            issues.append(f"METADATA_JSON_ERROR:{lineno}:{exc.msg}")
+            issues.append(f"METADATA_JSON_ERROR:{sidecar.name}:{lineno}:{exc.msg}")
             continue
         if not isinstance(record, dict):
-            issues.append(f"METADATA_NOT_OBJECT:{lineno}")
+            issues.append(f"METADATA_NOT_OBJECT:{sidecar.name}:{lineno}")
+            continue
+        schema = record.get("schema")
+        if schema != SCHEMA:
+            issues.append(f"METADATA_SCHEMA_UNSUPPORTED:{sidecar.name}:{lineno}:schema={schema!r}")
             continue
         sentence_id = str(record.get("sentence_id", "")).strip()
         if not sentence_id:
-            issues.append(f"METADATA_MISSING_SENTENCE_ID:{lineno}")
+            issues.append(f"METADATA_MISSING_SENTENCE_ID:{sidecar.name}:{lineno}")
+            continue
+        conf_err = _confidence_error(record.get("confidence"))
+        if conf_err is not None:
+            issues.append(f"METADATA_BAD_CONFIDENCE:{sidecar.name}:{lineno}:{conf_err}")
             continue
         if sentence_id in records:
             issues.append(f"METADATA_DUPLICATE:{sentence_id}")
@@ -153,6 +201,7 @@ def restore_review_metadata(
             legacy = False
         if rec_sha:
             if legacy:
+                # Legacy records hashed the diff JSON alone.
                 expected = hashlib.sha256(row.text_diff_json().encode("utf-8")).hexdigest()
             else:
                 expected = _content_sha256(row)

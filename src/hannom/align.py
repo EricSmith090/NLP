@@ -3,6 +3,12 @@
 The aligner produces draft CSV rows. It deliberately does not pretend that
 length similarity is semantic understanding: low-confidence rows are flagged
 for review, and ``text_diff`` is null for every non-1-1 group.
+
+``AlignmentRow.confidence`` is a *structural* grouping confidence. Reading
+evidence is reported separately as ``semantic_confidence`` (fraction of
+reading-carrying Nôm characters anchored to the paired Quốc ngữ text by a
+unique local reading match). Rows without adequate reading evidence carry
+``ALIGN_EVIDENCE_INSUFFICIENT`` and are never verified on structure alone.
 """
 
 from __future__ import annotations
@@ -15,8 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .clean import MASK, TERMINAL_NOM, count_nom_chars, nfc
-from .dictionary.book_lexicon import qn_syllables, strip_diacritics
+from .clean import MASK, TERMINAL_NOM, count_nom_chars, is_nom_char, nfc
+from .dictionary.book_lexicon import qn_syllables
 from .models import AlignmentRow, DiffElement
 from .review_metadata import write_review_metadata
 from .t1_map import Pair
@@ -283,26 +289,55 @@ def build_segments(
     return merged, warnings
 
 
-def _reading_matches(nom_text: str, vi_text: str, lexicon: Any | None) -> tuple[int, int]:
-    """Return (matched known characters, known characters) for a group.
+def _reading_matches(
+    nom_text: str,
+    vi_text: str,
+    lexicon: Any | None,
+    dictionary: Any | None = None,
+) -> tuple[int, int]:
+    """Return (anchored known characters, known characters) for a group.
 
-    Exact NFC/casefolded syllable match only; diacritic-stripped matching is
-    opt-in and would merge distinct readings, so it is not used for costing.
+    Uses the union of lexicon and dictionary readings. Anchoring requires
+    the same strict local-uniqueness policy as ``hannom.anchors``, so the
+    DP bonus cannot reward repeated, ununique readings.
     """
-    if lexicon is None:
+    from .anchors import find_reading_anchors, gather_readings
+
+    nom_chars = [c for c in nom_text if is_nom_char(c)]
+    if not nom_chars or (lexicon is None and dictionary is None):
         return 0, 0
-    tokens = {s.casefold() for s in qn_syllables(vi_text)}
-    known = matched = 0
-    for char in nom_text:
-        if not char.strip():
-            continue
-        readings = lexicon.readings(char) if hasattr(lexicon, "readings") else []
-        if not readings:
-            continue
-        known += 1
-        if any(r.casefold() in tokens for r in readings):
-            matched += 1
-    return matched, known
+    vi_folded = nfc(vi_text).casefold()
+    token_items_ = [
+        (m.start(), m.end(), m.group(0)) for m in QN_TOKEN_RE.finditer(vi_folded)
+    ]
+    if not token_items_:
+        return 0, 0
+    items = [
+        gather_readings(char, lexicon=lexicon, dictionary=dictionary)[0]
+        for char in nom_chars
+    ]
+    known = sum(1 for readings in items if readings)
+    if known == 0:
+        return 0, 0
+    anchors = find_reading_anchors(items, token_items_)
+    return len(anchors), known
+
+
+def semantic_evidence(
+    ch_txt: str,
+    vi_txt: str,
+    lexicon: Any | None,
+    dictionary: Any | None = None,
+) -> tuple[float | None, int, int]:
+    """Return (semantic_confidence, anchored_count, known_count).
+
+    ``semantic_confidence`` is ``anchored / known`` when reading evidence
+    exists, else ``None`` (no evidence either way).
+    """
+    matched, known = _reading_matches(ch_txt, vi_txt, lexicon, dictionary)
+    if known == 0:
+        return None, 0, 0
+    return (matched / known), matched, known
 
 
 def _group_cost(
@@ -312,6 +347,9 @@ def _group_cost(
     b: int,
     config: AlignConfig,
     lexicon: Any | None,
+    dictionary: Any | None = None,
+    *,
+    apply_reading_bonus: bool = True,
 ) -> float:
     nom_count = max(1, count_nom_chars(nom_text))
     vi_count = max(1, len(QN_TOKEN_RE.findall(vi_text)))
@@ -326,7 +364,9 @@ def _group_cost(
         group_cost = config.one_to_many_penalty * (b - 1)
     elif a > 1 and b > 1:
         group_cost = config.many_to_many_penalty * (a + b - 2)
-    matched, known = _reading_matches(nom_text, vi_text, lexicon)
+    if not apply_reading_bonus:
+        return ratio_cost + group_cost
+    matched, known = _reading_matches(nom_text, vi_text, lexicon, dictionary)
     reading_bonus = 0.0
     if known:
         reading_bonus = 1.2 * (matched / known)
@@ -375,7 +415,7 @@ def align_segments(
                         continue
                     nom_text = "".join(s.text for s in nom_segments[i : i + a])
                     vi_text = " ".join(s.text for s in qn_segments[j : j + b])
-                    cost = dp[i][j] + _group_cost(nom_text, vi_text, a, b, config, lexicon)
+                    cost = dp[i][j] + _group_cost(nom_text, vi_text, a, b, config, lexicon, dictionary)
                     if cost < dp[i + a][j + b] - 1e-12:
                         dp[i + a][j + b] = cost
                         back[i + a][j + b] = ("group", a, b)
@@ -410,10 +450,31 @@ def align_segments(
         base = img_id[:-4] if img_id.lower().endswith(".jpg") else img_id
         counters[base] = counters.get(base, 0) + 1
         sentence_id = f"{base}.{counters[base]}"
-        confidence = 1.0 / (1.0 + max(0.0, cost))
+        # ``confidence`` is the STRUCTURAL grouping confidence: how plausible
+        # the segmentation/grouping is. It is intentionally free of reading
+        # bonuses and is never semantic correspondence evidence; semantic
+        # support is reported separately as ``semantic_confidence``.
+        if kind == "group":
+            structural_cost = _group_cost(
+                ch_txt, vi_txt, a, b, config, lexicon, dictionary, apply_reading_bonus=False
+            )
+        else:
+            structural_cost = cost
+        confidence = 1.0 / (1.0 + max(0.0, structural_cost))
+        semantic_confidence, _anchored, _known = semantic_evidence(ch_txt, vi_txt, lexicon, dictionary)
+        if kind in ("skip_nom", "skip_qn"):
+            semantic_confidence = 0.0
+        if kind == "group" and (semantic_confidence is None or semantic_confidence < 0.5):
+            evidence_flag = "ALIGN_EVIDENCE_INSUFFICIENT"
+        elif kind != "group":
+            evidence_flag = "ALIGN_EVIDENCE_INSUFFICIENT"
+        else:
+            evidence_flag = None
         flags: list[str] = []
         for segment in nom_group + qn_group:
             flags.extend(segment.flags)
+        if evidence_flag:
+            flags.append(evidence_flag)
         if kind == "skip_nom":
             flags.extend(["UNMATCHED_NOM", "NON_ONE_TO_ONE"])
         elif kind == "skip_qn":
@@ -461,6 +522,7 @@ def align_segments(
                 text_diff=text_diff,
                 confidence=confidence,
                 flags=sorted(set(flags)),
+                semantic_confidence=semantic_confidence,
             )
         )
     return rows

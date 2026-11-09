@@ -5,13 +5,16 @@ least one shared reading (dictionary or human-reviewed book lexicon).
 This module exists so segmentation, page mapping and evaluation can use
 the same, conservative notion of evidence:
 
-- Assignment is a monotone Needleman-Wunsch optimum over exact reading
-  matches. Each QN token anchors at most one Nôm character, so a popular
-  token such as ``thì`` can never pin two characters.
-- Characters with too many candidate tokens are dropped as ambiguous
-  (``MAX_CANDIDATES_PER_CHAR``) and can never anchor.
-- Interpolation/migration across a stream is local: callers work on
-  small windows, so assignment quality is global only within the window.
+- **Local uniqueness is mandatory in both directions.** A Nôm character
+  anchors only to a QN token when (a) exactly one token position matches
+  one of its readings AND (b) no other Nôm position in the window matches
+  that token. Repeated occurrences of the same reading and several Nôm
+  characters competing for one token are *not* anchors.
+- Anchors are monotone: crossed pairs are resolved to a longest
+  increasing subsequence, so order is never violated and a token is used
+  at most once.
+- Ambiguity is exposed, not hidden: ``anchor_diagnostics`` reports how
+  many candidates were dropped and why.
 
 No readings are ever invented; everything comes from the lexicon and the
 dictionary as load-bearing evidence.
@@ -21,13 +24,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from bisect import bisect_left
 from typing import Any, Sequence
 
 from .clean import is_nom_char
 from .dictionary.book_lexicon import strip_diacritics
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
-MAX_CANDIDATES_PER_CHAR = 3
 MAX_ANCHOR_GAP_TOKENS = 120
 
 
@@ -54,7 +57,11 @@ def gather_readings(
     ``source`` is ``"lexicon+dictionary"``, ``"lexicon"``, ``"dictionary"``
     or ``"none"``. Readings are NFC/casefold-normalised and de-duplicated.
     """
-    lexicon_readings = list(lexicon.readings(char)) if lexicon is not None and hasattr(lexicon, "readings") else []
+    lexicon_readings = (
+        list(lexicon.readings(char))
+        if lexicon is not None and hasattr(lexicon, "readings")
+        else []
+    )
     dictionary_readings: list[str] = []
     if dictionary is not None and hasattr(dictionary, "lookup"):
         try:
@@ -78,74 +85,54 @@ def gather_readings(
     return merged, source
 
 
-def _nw_anchors(
+def _candidate_tables(
     readings_by_position: Sequence[Sequence[str]],
     token_forms: Sequence[str],
-    *,
-    gap_penalty: float = 0.2,
-    mismatch_penalty: float = 0.5,
-    match_score: float = 1.0,
-) -> list[tuple[int, int]]:
-    """Monotone optimum over exact reading matches (Needleman-Wunsch)."""
-    normalized_items: list[frozenset[str]] = []
+) -> tuple[list[frozenset[int]], list[set[int]]]:
+    """(item → candidate token indices), (token → candidate item indices)."""
+    cand: list[frozenset[int]] = []
     for readings in readings_by_position:
         forms = {normalize_reading(reading) for reading in readings if reading}
-        if forms:
-            candidates = sum(1 for tf in token_forms if tf in forms)
-            if candidates > MAX_CANDIDATES_PER_CHAR:
-                forms = set()  # ambiguous character: do not anchor on it
-        normalized_items.append(frozenset(forms))
+        if not forms:
+            cand.append(frozenset())
+            continue
+        cands = {j for j, tf in enumerate(token_forms) if tf in forms}
+        cand.append(frozenset(cands))
+    token_cand: list[set[int]] = [set() for _ in token_forms]
+    for i, cands in enumerate(cand):
+        for j in cands:
+            token_cand[j].add(i)
+    return cand, token_cand
 
-    n, m = len(normalized_items), len(token_forms)
-    if n == 0 or m == 0:
-        return []
-    NEG = -1e9
-    dp = [[NEG] * (m + 1) for _ in range(n + 1)]
-    back = [[None] * (m + 1) for _ in range(n + 1)]
-    dp[0][0] = 0.0
-    for i in range(1, n + 1):
-        dp[i][0] = dp[i - 1][0] - gap_penalty
-        back[i][0] = "up"
-    for j in range(1, m + 1):
-        dp[0][j] = dp[0][j - 1] - gap_penalty
-        back[0][j] = "left"
-    for i in range(1, n + 1):
-        forms = normalized_items[i - 1]
-        row, prev_row = dp[i], dp[i - 1]
-        for j in range(1, m + 1):
-            if not forms:
-                score = 0.0
-            elif token_forms[j - 1] in forms:
-                score = match_score
-            else:
-                score = -mismatch_penalty
-            diag = prev_row[j - 1] + score
-            up = prev_row[j] - gap_penalty
-            left = row[j - 1] - gap_penalty
-            best = max(diag, up, left)
-            row[j] = best
-            if best == diag:
-                back[i][j] = "diag"
-            elif best == up:
-                back[i][j] = "up"
-            else:
-                back[i][j] = "left"
-    anchors: list[tuple[int, int]] = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        step = back[i][j]
-        if step == "diag":
-            forms = normalized_items[i - 1]
-            if forms and token_forms[j - 1] in forms:
-                anchors.append((i - 1, j - 1))
-            i -= 1
-            j -= 1
-        elif step == "up":
-            i -= 1
-        else:
-            j -= 1
-    anchors.reverse()
-    return anchors
+
+def anchor_diagnostics(
+    readings_by_position: Sequence[Sequence[str]],
+    tokens: Sequence[tuple[int, int, str]],
+) -> dict[str, int]:
+    """Expose ambiguity and dropped-anchor statistics."""
+    token_forms = [normalize_reading(t[2]) for t in tokens]
+    cand, token_cand = _candidate_tables(readings_by_position, token_forms)
+    unique_items = sum(1 for cands in cand if len(cands) == 1)
+    unique_pairs = 0
+    for i, cands in enumerate(cand):
+        if len(cands) == 1:
+            j = next(iter(cands))
+            if len(token_cand[j]) == 1:
+                unique_pairs += 1
+    anchors = find_reading_anchors(readings_by_position, tokens)
+    return {
+        "items_total": len(readings_by_position),
+        "items_known": sum(1 for readings in readings_by_position if readings),
+        "items_with_candidates": sum(1 for cands in cand if cands),
+        "unique_item_positions": unique_items,
+        "competing_token_positions": sum(1 for items in token_cand if len(items) > 1),
+        "unique_unique_pairs": unique_pairs,
+        "anchors": len(anchors),
+        "dropped_ambiguous_items": sum(1 for cands in cand if len(cands) > 1),
+        "dropped_competing_tokens": sum(
+            1 for items in token_cand if len(items) > 1
+        ),
+    }
 
 
 def find_reading_anchors(
@@ -154,10 +141,44 @@ def find_reading_anchors(
 ) -> list[tuple[int, int]]:
     """Return monotone (nom_index, token_index) anchors.
 
-    O(n*m) global optimum over exact matches; for stream-scale callers,
-    pass a small window of items/tokens instead of the whole book.
+    A pair is used only when the Nôm position has exactly one candidate
+    QN token and the QN token has exactly one candidate Nôm position, and
+    the pair survives a longest-increasing-subsequence filter so anchor
+    order is monotone in both streams.
     """
-    return _nw_anchors(readings_by_position, [normalize_reading(t[2]) for t in tokens])
+    token_forms = [normalize_reading(t[2]) for t in tokens]
+    cand, token_cand = _candidate_tables(readings_by_position, token_forms)
+    pairs: list[tuple[int, int]] = []
+    for i, cands in enumerate(cand):
+        if len(cands) != 1:
+            continue
+        j = next(iter(cands))
+        if len(token_cand[j]) != 1:
+            continue
+        pairs.append((i, j))
+    if not pairs:
+        return []
+    # Longest strictly increasing subsequence over token indices (pairs are
+    # ordered by Nôm position already and neither side repeats).
+    tails: list[int] = []
+    tail_positions: list[int] = []
+    parent = [-1] * len(pairs)
+    for pos, (_, j) in enumerate(pairs):
+        idx = bisect_left(tails, j)
+        if idx == len(tails):
+            tails.append(j)
+            tail_positions.append(pos)
+        else:
+            tails[idx] = j
+            tail_positions[idx] = pos
+        parent[pos] = tail_positions[idx - 1] if idx > 0 else -1
+    chain: list[int] = []
+    current = tail_positions[len(tails) - 1]
+    while current != -1:
+        chain.append(current)
+        current = parent[current]
+    chain.reverse()
+    return [pairs[k] for k in chain]
 
 
 def anchor_coverage(

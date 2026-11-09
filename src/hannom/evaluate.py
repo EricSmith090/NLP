@@ -8,7 +8,12 @@ where the denominator only includes Nôm characters in verified rows and
 excludes yellow-covered characters and ``[MASK]`` tokens. Coverage is the
 fraction of rows that were verified; unverified, unmatched or null rows
 never inflate accuracy and are reported separately. Insufficient
-coverage, too many unverified rows or too many null rows block the gate.
+coverage, too many unverified rows, too many null rows, or any metadata /
+review-decision integrity failure block the gate.
+
+Human review can resolve uncertainty, but only through an explicit,
+non-stale review decision recorded in the decision log; a content edit
+alone never verifies a row.
 """
 
 from __future__ import annotations
@@ -19,6 +24,15 @@ from typing import Any, Iterable
 from .clean import MASK, count_nom_chars, nfc
 from .models import AlignmentRow, BookMetrics, DiffElement
 from .textdiff import red_penalty, scoreable_nom_chars, validate_text_diff, yellow_spans
+from .review_decisions import (
+    STATUS_ACCEPTED_DIFFERENCE,
+    STATUS_ACCEPTED_MATCH,
+    STATUS_ALIGNMENT_REVIEWED,
+    STATUS_CONTENT_EDITED,
+    STATUS_REJECTED,
+    STATUS_UNMATCHED,
+    STATUS_UNRESOLVED,
+)
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -60,7 +74,12 @@ UNVERIFIED_FLAGS = frozenset(
         "COSEGMENTED_UNANCHORED",
         "REVIEW_METADATA_MISSING",
         "REVIEW_METADATA_MISMATCH",
+        "REVIEW_METADATA_UNRESOLVED",
         "TEXT_DIFF_INVALID",
+        "ALIGN_EVIDENCE_INSUFFICIENT",
+        "REVIEW_DECISION_STALE",
+        "REVIEW_DECISION_MISMATCH",
+        "REVIEW_DECISION_INVALID",
     }
 )
 
@@ -71,22 +90,67 @@ BLOCKING_PREFIXES = (
     "INSUFFICIENT_COVERAGE",
     "UNVERIFIED_RATIO_HIGH",
     "EXCESSIVE_NULL_ROWS",
+    "METADATA_",
+    "REVIEW_METADATA_",
+    "REVIEW_DECISION_",
+    "DECISION_",
+)
+
+_NON_REVIEWING_DECISION_STATUSES = frozenset(
+    {STATUS_UNRESOLVED, STATUS_REJECTED}
 )
 
 
-def _classify_row(flags: set[str], elements: list[DiffElement] | None) -> str:
-    if "HUMAN_REVIEWED" in flags:
-        # Human sign-off is trusted evidence; it verifies either state.
-        return "verified_match" if not elements else "verified_difference"
+def _classify_row(
+    flags: set[str],
+    elements: list[DiffElement] | None,
+    review_status: str | None,
+    elements_valid: bool,
+) -> tuple[str, str | None]:
+    """Classify a row; returns (classification, contradiction_issue or None).
+
+    Precedence: explicit, non-stale human decisions first (they may
+    resolve an unmatched row), then automatic, flag-based evidence.
+    """
+    if review_status == STATUS_UNMATCHED:
+        return "unmatched", None
+    if review_status in (
+        STATUS_ALIGNMENT_REVIEWED,
+        STATUS_ACCEPTED_MATCH,
+        STATUS_ACCEPTED_DIFFERENCE,
+    ):
+        if elements is None:
+            return "unverified", "REVIEW_DECISION_MISMATCH"
+        if not elements_valid:
+            return "unverified", "REVIEW_DECISION_MISMATCH"
+        if review_status == STATUS_ACCEPTED_MATCH:
+            if elements:
+                return "unverified", "REVIEW_DECISION_MISMATCH"
+            return "verified_match", None
+        if review_status == STATUS_ACCEPTED_DIFFERENCE:
+            if not elements:
+                return "unverified", "REVIEW_DECISION_MISMATCH"
+            return "verified_difference", None
+        # alignment_reviewed: correspondence verified explicitly; the
+        # validity of the recorded difference elements decides the side.
+        return ("verified_match" if not elements else "verified_difference"), None
+    if review_status in _NON_REVIEWING_DECISION_STATUSES:
+        return "unverified", None
+    if review_status == STATUS_CONTENT_EDITED:
+        # An edit grants nothing; fall through to automatic evidence.
+        pass
+    # Automatic classification.
     if "UNMATCHED_NOM" in flags or "UNMATCHED_QN" in flags:
-        return "unmatched"
+        return "unmatched", None
     if elements is None:
-        return "null"
+        return "null", None
+    if not elements_valid:
+        return "unverified", None
     if flags & UNVERIFIED_FLAGS:
-        return "unverified"
+        return "unverified", None
     if elements:
-        return "verified_difference"
-    return "verified_match"
+        return "verified_difference", None
+    return "verified_match", None
 
 
 def evaluate_rows(
@@ -98,6 +162,7 @@ def evaluate_rows(
     yellow_ratio_warn: float = 0.05,
     minimum_coverage: float = 0.9,
     max_unverified_ratio: float = 0.05,
+    integrity_issues: Iterable[str] | None = None,
 ) -> BookMetrics:
     """Score verified comparisons and report accuracy vs coverage separately.
 
@@ -109,9 +174,22 @@ def evaluate_rows(
     policy, configurable via ``configs/project.yaml`` ``quality:``; they
     are deliberately conservative (0.9 coverage, 0.05 unverified/null)
     and may be tuned per book by the instructor.
+
+    ``integrity_issues`` are loader-level integrity failures (metadata
+    sidecar or review-decision log) that must block the gate the same as
+    row-level issues, whether or not their affected rows can be
+    identified.
     """
     rows = list(rows)
     metrics = BookMetrics(book_id=book_id, total_rows=len(rows))
+    for issue in integrity_issues or []:
+        text = str(issue)
+        if not any(text.startswith(prefix) for prefix in BLOCKING_PREFIXES):
+            # Loader issues are defects by definition; normalise so they
+            # block the gate.
+            text = f"METADATA_{text}" if not text.startswith("REVIEW_") else text
+        if text not in metrics.issues:
+            metrics.issues.append(text)
     if not rows:
         metrics.issues.append("NO_ROWS")
         metrics.passed = False
@@ -120,6 +198,9 @@ def evaluate_rows(
     seen_sentence_ids: set[str] = set()
     unverified_different = 0
     invalid = 0
+    structural_values: list[float] = []
+    semantic_evidence_rows = 0
+    evidence_insufficient_rows = 0
     for row in rows:
         img_id = str(_row_value(row, "img_id", ""))
         sentence_id = str(_row_value(row, "sentence_id", ""))
@@ -127,19 +208,36 @@ def evaluate_rows(
         vi_txt = nfc(str(_row_value(row, "vi_txt", "")))
         elements = _elements(row)
         flags = {str(flag) for flag in (_row_value(row, "flags", []) or [])}
+        review_status = _row_value(row, "review_status", None)
+        review_status = str(review_status) if review_status else None
         metrics.total_nom_chars += count_nom_chars(ch_txt)
+        confidence = _row_value(row, "confidence", None)
+        if confidence is not None:
+            try:
+                structural_values.append(float(confidence))
+            except (TypeError, ValueError):
+                pass
+        semantic = _row_value(row, "semantic_confidence", None)
+        if semantic is not None:
+            semantic_evidence_rows += 1
+        if "ALIGN_EVIDENCE_INSUFFICIENT" in flags:
+            evidence_insufficient_rows += 1
         if sentence_id:
             if sentence_id in seen_sentence_ids:
                 metrics.issues.append(f"DUPLICATE_SENTENCE_ID:{sentence_id}")
             seen_sentence_ids.add(sentence_id)
         if not img_id:
             metrics.issues.append(f"EMPTY_IMG_ID:{sentence_id}")
+        elements_valid = True
         if elements is not None:
             issues = validate_text_diff(ch_txt, vi_txt, elements)
             if issues:
                 invalid += 1
+                elements_valid = False
                 metrics.issues.extend(f"TEXT_DIFF:{sentence_id}:{issue}" for issue in issues[:3])
-        classification = _classify_row(flags, elements)
+        classification, contradiction = _classify_row(flags, elements, review_status, elements_valid)
+        if contradiction:
+            metrics.issues.append(f"{contradiction}:{sentence_id}")
         if classification == "unmatched":
             metrics.unmatched_rows += 1
             continue
@@ -176,6 +274,15 @@ def evaluate_rows(
     if metrics.total_rows:
         metrics.coverage_ratio = verified / metrics.total_rows
         metrics.null_ratio = metrics.null_rows / metrics.total_rows
+    if semantic_evidence_rows:
+        metrics.semantic_evidence_rows = semantic_evidence_rows
+    else:
+        metrics.semantic_evidence_rows = 0
+    metrics.evidence_insufficient_rows = evidence_insufficient_rows
+    if structural_values:
+        metrics.structural_confidence_mean = sum(structural_values) / len(structural_values)
+    else:
+        metrics.structural_confidence_mean = None
     if metrics.total_nom_chars:
         metrics.yellow_ratio = metrics.yellow_chars / metrics.total_nom_chars
     if metrics.denominator > 0:

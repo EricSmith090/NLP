@@ -451,8 +451,18 @@ def validate_book_package(
                 issues.append(PackageIssue("CSV_TEXT_DIFF", f"{row.sentence_id}: {problem}", path=str(csv_path)))
         if minimum_similarity is not None:
             from .evaluate import evaluate_rows
+            from .orchestrator import load_rows_for_evaluation
 
-            metrics = evaluate_rows(book.book_id, rows, minimum_similarity=minimum_similarity)
+            try:
+                gate_rows, gate_issues = load_rows_for_evaluation(project, book)
+            except Exception as exc:  # noqa: BLE001
+                gate_rows, gate_issues = [], [f"METADATA_LOAD_ERROR:{exc}"]
+            metrics = evaluate_rows(
+                book.book_id,
+                gate_rows,
+                minimum_similarity=minimum_similarity,
+                integrity_issues=gate_issues,
+            )
             if not metrics.passed:
                 issues.append(
                     PackageIssue(

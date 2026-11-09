@@ -35,11 +35,10 @@ from .orchestrator import (
 )
 from .align import write_alignment_csv
 from .dictionary.book_lexicon import BookLexicon
-from .review_metadata import load_rows_with_metadata
+from .orchestrator import load_rows_for_evaluation
 from .dictionary.index import build_dictionary_index
 from .package import split_submission_zip, validate_book_package, validate_source_zip
 from .report import build_report_pdf, load_report_config, validate_report_data
-from .review.patches import apply_patches, read_patches
 
 app = typer.Typer(add_completion=False, help="Local-first Hán Nôm–Quốc ngữ pipeline")
 console = Console()
@@ -153,13 +152,12 @@ def textdiff(
     with open_state(project) as state:
         for item in _books(project, book):
             csv_path = project.data_dir / "align" / item.book_id / f"{item.book_name}.csv"
-            rows, metadata_issues = load_rows_with_metadata(csv_path)
-            if metadata_issues:
-                console.print(f"[yellow]metadata issues: {len(metadata_issues)}[/] {metadata_issues[:3]}")
+            rows, decision_issues = load_rows_for_evaluation(project, item)
+            if decision_issues:
+                console.print(f"[yellow]integrity issues: {len(decision_issues)}[/] {decision_issues[:3]}")
             dictionary = build_dictionary_index(project.root, project.dictionary_config, book_id=item.book_id)
             lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{item.book_id}.json")
             rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary, force_recompute=force_recompute)
-            rows = apply_patches(rows, read_patches(project.data_dir / "review" / f"{item.book_id}.patches.jsonl"))
             write_alignment_csv(csv_path, rows)
             console.print(f"[green]{item.book_id}[/]: {len(rows)} rows")
 

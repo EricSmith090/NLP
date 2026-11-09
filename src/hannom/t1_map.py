@@ -4,6 +4,13 @@ T1 books read QN front-to-back and Nôm back-to-front. The page map is a
 partition of both reading-order sequences into 1-1, 1-n, or n-1 groups,
 using text mass as a cheap alignment prior. OCR/alignment must refine it,
 but the map is valid JSON and every image occurs at most once per side.
+
+Honesty rule: a pair is only ``verified`` through *unique* reading
+anchors (see ``hannom.anchors``) — at least ``verified_min_anchors`` of
+them with ``verified_min_coverage`` coverage. Ink mass never verifies a
+mapping. Pairs without word-level evidence stay ``candidate``; pairs
+whose evidence does not confirm them stay ``unresolved``;
+``image_map.manual.json`` applies explicit corrections (``manual``).
 """
 
 from __future__ import annotations
@@ -101,15 +108,18 @@ def score_pairs_with_anchors(
     lexicon: Any | None = None,
     dictionary: Any | None = None,
     verified_min_coverage: float = 0.5,
+    verified_min_anchors: int = 2,
 ) -> list[Pair]:
     """Attach anchor-evidence confidence/status to heuristic pairs.
 
-    ``confidence`` is the fraction of reading-carrying Nôm characters in a
-    pair with a reliable reading anchor in the paired Quốc ngữ text.
-    ``status`` is ``verified`` when at least ``verified_min_coverage`` of
-    those characters anchor, else ``unresolved``. Pairs with no reading
-    evidence at all stay ``candidate`` (insufficient evidence, not evidence
-    of failure). Never throws on odd inputs; unreadable pairs stay explicit.
+    Verified strictly by *unique* local reading anchors: the fraction of
+    reading-carrying Nôm characters with a reliable unique anchor must
+    reach ``verified_min_coverage`` AND at least ``verified_min_anchors``
+    independent anchors must exist. Pairs with reading evidence whose
+    anchors do not meet both bars are ``unresolved`` (evidence was found
+    but does not confirm the pairing); pairs without reading evidence are
+    ``candidate``. Pairs never become ``verified`` via ink mass or dense
+    repeated readings.
     """
     scored: list[Pair] = []
     for pair in pairs:
@@ -133,7 +143,11 @@ def score_pairs_with_anchors(
             continue
         anchors = find_reading_anchors(nom_items, toks)
         confidence = len(anchors) / known
-        status = "verified" if confidence >= verified_min_coverage else "unresolved"
+        status = (
+            "verified"
+            if len(anchors) >= verified_min_anchors and confidence >= verified_min_coverage
+            else "unresolved"
+        )
         scored.append(
             Pair(ch=pair.ch, vi=pair.vi, note=pair.note,
                  confidence=round(confidence, 4), source=source + "+anchors", status=status)
