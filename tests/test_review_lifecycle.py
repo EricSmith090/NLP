@@ -120,7 +120,7 @@ def test_complete_review_lifecycle(tmp_path):
             reason="fix after OCR",
         ),
     )
-    rows_now, issues = load_rows_for_evaluation(project, book)
+    rows_now, issues, _audit = load_rows_for_evaluation(project, book)
     (current,) = rows_now
     assert current.ch_txt == "之其沛"
 
@@ -142,7 +142,7 @@ def test_complete_review_lifecycle(tmp_path):
     # 5. Reload rows and decisions: the latest approval must be effective,
     #    the stale unresolved decision stays in audit history but no longer
     #    blocks anything.
-    rows, issues = load_rows_for_evaluation(project, book)
+    rows, issues, _audit = load_rows_for_evaluation(project, book)
     assert issues == []
     (restored,) = rows
     assert restored.review_status == STATUS_ACCEPTED_MATCH
@@ -175,7 +175,7 @@ def test_complete_review_lifecycle(tmp_path):
     assert lexicon.quarantine_summary()["trusted_pairs"] == trusted_before
 
     # 10. Evaluation reproducibility: a second loader pass is identical.
-    rows2, issues2 = load_rows_for_evaluation(project, book)
+    rows2, issues2, _audit = load_rows_for_evaluation(project, book)
     (restored2,) = rows2
     assert issues2 == issues
     assert restored2.review_status == STATUS_ACCEPTED_MATCH

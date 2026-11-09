@@ -104,7 +104,7 @@ def test_explicit_reviewer_mapping_survives_reload(tmp_path):
         character_token_mappings=[CharacterTokenMapping("之", 0, "thì", 0)],
     )
     append_decision(path, decision)
-    rows, issues = apply_decisions([row], read_decisions(path)[0])
+    rows, issues, _audit = apply_decisions([row], read_decisions(path)[0])
     assert issues == []
     (applied,) = rows
     assert applied.review_status == STATUS_ACCEPTED_DIFFERENCE
@@ -127,7 +127,7 @@ def test_content_change_invalidates_stale_approval(tmp_path):
     append_decision(path, decision)
     # Someone edits the Nôm text afterwards (e.g. re-OCR).
     row.ch_txt = "其"
-    rows, issues = apply_decisions([row], read_decisions(path)[0])
+    rows, issues, _audit = apply_decisions([row], read_decisions(path)[0])
     (applied,) = rows
     assert applied.review_status is None
     assert "REVIEW_DECISION_STALE" in applied.flags
@@ -150,7 +150,7 @@ def test_editing_nom_only_does_not_accept_alignment():
             text_diff_json=row.text_diff_json(),
         )
     ]
-    rows, issues = apply_decisions([row], decisions)
+    rows, issues, _audit = apply_decisions([row], decisions)
     (applied,) = rows
     assert applied.review_status == STATUS_CONTENT_EDITED
 
@@ -168,7 +168,7 @@ def test_unmatched_decision_persists(tmp_path):
         text_diff_json=row.text_diff_json(),
     )
     append_decision(path, decision)
-    rows, issues = apply_decisions([row], read_decisions(path)[0])
+    rows, issues, _audit = apply_decisions([row], read_decisions(path)[0])
     assert issues == []
     assert rows[0].review_status == STATUS_UNMATCHED
 
@@ -195,7 +195,7 @@ def test_latest_decision_wins_and_supersession_is_legitimate():
         text_diff_json=row.text_diff_json(),
         timestamp="2026-11-09T01:00:00+00:00",
     )
-    rows, issues = apply_decisions([row], [first, second])
+    rows, issues, _audit = apply_decisions([row], [first, second])
     (applied,) = rows
     assert applied.review_status == STATUS_ACCEPTED_MATCH
     assert applied.decision_integrity == "valid"
@@ -224,7 +224,7 @@ def test_mutually_exclusive_same_revision_verdicts_conflict():
         text_diff_json=row.text_diff_json(),
         timestamp="2026-11-09T01:00:00+00:00",
     )
-    rows, issues = apply_decisions([row], [match, difference])
+    rows, issues, _audit = apply_decisions([row], [match, difference])
     (applied,) = rows
     assert applied.review_status is None  # no trust in contradictory verdicts
     assert applied.decision_integrity == "conflict"
@@ -260,7 +260,7 @@ def test_mapping_contradiction_same_revision_conflicts():
         ],
         timestamp="2026-11-09T01:00:00+00:00",
     )
-    rows, issues = apply_decisions([row], [first, second])
+    rows, issues, _audit = apply_decisions([row], [first, second])
     (applied,) = rows
     assert applied.decision_integrity == "conflict"
     assert applied.review_status is None
@@ -291,7 +291,7 @@ def test_stale_historical_decision_superseded_by_valid_approval():
         text_diff_json=row.text_diff_json(),
         timestamp="2026-11-09T02:00:00+00:00",
     )
-    rows, issues = apply_decisions([row], [stale, fresh])
+    rows, issues, _audit = apply_decisions([row], [stale, fresh])
     (applied,) = rows
     assert applied.review_status == STATUS_ACCEPTED_MATCH
     assert applied.decision_integrity == "valid"
@@ -321,7 +321,7 @@ def test_latest_stale_decision_is_not_overridden_by_older_valid():
         text_diff_json=row.text_diff_json().replace("其", "之"),
         timestamp="2026-11-09T01:00:00+00:00",
     )
-    rows, issues = apply_decisions([row], [fresh, stale])
+    rows, issues, _audit = apply_decisions([row], [fresh, stale])
     (applied,) = rows
     assert applied.review_status is None
     assert applied.decision_integrity == "stale"
@@ -352,7 +352,7 @@ def test_latest_invalid_decision_blocks_fallback_to_older_approval():
         reviewer="mallory",
         content_sha256=valid.content_sha256,
     )
-    rows, issues = apply_decisions([row], [valid, invalid], ["DECISION_INVALID:log:2:bad status"])
+    rows, issues, _audit = apply_decisions([row], [valid, invalid], ["DECISION_INVALID:log:2:bad status"])
     (applied,) = rows
     assert applied.review_status is None
     assert applied.decision_integrity == "invalid"
@@ -406,7 +406,7 @@ def test_multiple_legitimate_transitions_keep_latest_effective():
                 timestamp=f"2026-11-09T0{index}:00:00+00:00",
             )
         )
-    rows, issues = apply_decisions([row], chain)
+    rows, issues, _audit = apply_decisions([row], chain)
     (applied,) = rows
     assert applied.review_status == "alignment_reviewed"
     assert applied.decision_integrity == "valid"

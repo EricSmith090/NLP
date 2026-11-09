@@ -454,7 +454,7 @@ def validate_book_package(
             from .orchestrator import load_rows_for_evaluation
 
             try:
-                gate_rows, gate_issues = load_rows_for_evaluation(project, book)
+                gate_rows, gate_issues, _audit = load_rows_for_evaluation(project, book)
             except Exception as exc:  # noqa: BLE001
                 gate_rows, gate_issues = [], [f"METADATA_LOAD_ERROR:{exc}"]
             metrics = evaluate_rows(

@@ -110,7 +110,7 @@ def main() -> None:
     from hannom.review_decisions import apply_decisions  # noqa: E402
 
     decisions, failures, decision_issues = parse_decisions(decisions_file)
-    rows, decision_issues = apply_decisions(
+    rows, decision_issues, _audit = apply_decisions(
         rows, decisions, decision_issues, failures=failures
     )
     if decision_issues:

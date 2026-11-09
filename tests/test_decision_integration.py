@@ -102,7 +102,7 @@ def test_accepted_match_flow_through_full_loader(tmp_path):
         ),
     )
 
-    rows, issues = load_rows_for_evaluation(project, book)
+    rows, issues, _audit = load_rows_for_evaluation(project, book)
     assert issues == []
     (gated,) = rows
     assert gated.review_status == STATUS_ACCEPTED_MATCH
@@ -133,7 +133,7 @@ def test_stale_acceptance_flow_does_not_pass_gate(tmp_path):
     row.ch_txt = "其"
     _write_book(project, [row])
 
-    rows, issues = load_rows_for_evaluation(project, book)
+    rows, issues, _audit = load_rows_for_evaluation(project, book)
     (gated,) = rows
     assert gated.review_status is None
     assert any("REVIEW_DECISION_STALE" in issue for issue in issues)
@@ -157,7 +157,7 @@ def test_content_edit_is_not_an_acceptance(tmp_path):
             reviewer="tester",
         ),
     )
-    rows, issues = load_rows_for_evaluation(project, book)
+    rows, issues, _audit = load_rows_for_evaluation(project, book)
     (gated,) = rows
     assert "CONTENT_EDITED" in gated.flags
     assert gated.review_status is None
@@ -210,7 +210,7 @@ def test_valid_decision_and_mapping_learns(tmp_path):
         ],
         status="accepted_difference",
     )
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     assert issues == []
     lexicon = _lexicon(tmp_path)
     before = lexicon.quarantine_summary()["trusted_pairs"]
@@ -240,7 +240,7 @@ def test_conflicted_decisions_do_not_modify_lexicon(tmp_path):
         book_id="T1_Test", sentence_id=row.sentence_id, status="accepted_difference",
         reviewer="b", ch_txt=row.ch_txt, vi_txt=row.vi_txt, text_diff_json=row.text_diff_json(),
     ))
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     assert any("REVIEW_DECISION_CONFLICT" in issue for issue in issues)
     _, failures, _ = parse_decisions(decisions)
     lexicon = _lexicon(tmp_path)
@@ -265,7 +265,7 @@ def test_invalid_latest_decision_does_not_modify_lexicon(tmp_path):
     with decisions.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write('{"schema": 1, "sentence_id": "T1_Test.001.1", "status": "bogus_status", '
                  '"reviewer": "b", "timestamp": "t", "content_sha256": "' + "0" * 64 + '"}\n')
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     _, failures, _ = parse_decisions(decisions)
     lexicon = _lexicon(tmp_path)
     before = lexicon.quarantine_summary()["trusted_pairs"]
@@ -282,7 +282,7 @@ def test_stale_decision_does_not_modify_lexicon(tmp_path):
     project, row = _book_with_decision(tmp_path, ch="之", vi="thì")
     # Row content changes after the decision → stale.
     _write_book(project, [_row("T1_Test.001.1", "其", "thì", [], ())])
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     assert any("REVIEW_DECISION_STALE" in issue for issue in issues)
     _, failures, _ = parse_decisions(decision_path(project.data_dir, "T1_Test"))
     lexicon = _lexicon(tmp_path)
@@ -300,7 +300,7 @@ def test_malformed_decision_log_disables_learning_for_book(tmp_path):
     decisions = decision_path(project.data_dir, "T1_Test")
     with decisions.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write('{"not a decision": true}\n')
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     _, failures, _ = parse_decisions(decisions)
     lexicon = _lexicon(tmp_path)
     before = lexicon.quarantine_summary()["trusted_pairs"]
@@ -327,7 +327,7 @@ def test_valid_row_learns_when_separate_row_has_row_specific_problem(tmp_path):
     with decisions.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write('{"schema": 1, "sentence_id": "T1_Test.001.2", "status": "bogus_status", '
                  '"reviewer": "b", "timestamp": "t", "content_sha256": "ab"}\n')
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     _, failures, _ = parse_decisions(decisions)
     lexicon = _lexicon(tmp_path)
     learned = learn_for_book(lexicon, rows, None, failures)
@@ -351,7 +351,7 @@ def test_approval_cannot_resurrect_after_invalid_supersedes(tmp_path):
     with decisions.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write('{"schema": 1, "sentence_id": "T1_Test.001.1", "status": "bogus_status", '
                  '"reviewer": "b", "timestamp": "t", "content_sha256": "zz"}\n')
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     _, failures, _ = parse_decisions(decisions)
     lexicon = _lexicon(tmp_path)
     learned = learn_for_book(lexicon, rows, None, failures)
@@ -375,7 +375,7 @@ def test_quarantined_entries_stay_excluded(tmp_path):
     lexicon = BookLexicon(path)
     assert lexicon.readings("之") == []  # quarantine: never trusted
     _, failures, _ = parse_decisions(decision_path(project.data_dir, "T1_Test"))
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     learn_for_book(lexicon, rows, None, failures)
     assert lexicon.readings("之") == ["thì"]  # only the new reviewed entry is trusted
     assert lexicon.quarantine_summary()["legacy_without_provenance_pairs"] == 7
@@ -388,7 +388,7 @@ def test_later_valid_decision_restores_learning_eligibility(tmp_path):
     project, row = _book_with_decision(tmp_path, ch="之", vi="thì")
     # First, the decision goes stale (row edited by someone).
     _write_book(project, [_row("T1_Test.001.1", "其", "thì", [], ())])
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     _, failures, _ = parse_decisions(decision_path(project.data_dir, "T1_Test"))
     lexicon = _lexicon(tmp_path)
     learned = learn_for_book(lexicon, rows, None, failures)
@@ -400,7 +400,7 @@ def test_later_valid_decision_restores_learning_eligibility(tmp_path):
         reviewer="tester", ch_txt=current.ch_txt, vi_txt=current.vi_txt,
         text_diff_json=current.text_diff_json(),
     ))
-    rows, issues = load_rows_for_evaluation(project, project.books[0])
+    rows, issues, _audit = load_rows_for_evaluation(project, project.books[0])
     learned = learn_for_book(
         lexicon, rows, None, parse_decisions(decision_path(project.data_dir, "T1_Test"))[1]
     )

@@ -141,13 +141,50 @@ class CharacterTokenMapping:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @staticmethod
+    def _require_single_nchar(value: Any, field: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string, got {type(value).__name__}")
+        normalized = unicodedata.normalize("NFC", value)
+        if len(normalized) != 1:
+            raise ValueError(f"{field} must be exactly one code point, got {value!r}")
+        return normalized
+
+    @staticmethod
+    def _require_position(value: Any, field: str) -> int:
+        # Strict JSON-schema positions: genuine ints only. Booleans are
+        # ints in Python but are never positions; floats (including 0.8
+        # and 1.0) and numeric strings are rejected outright.
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be an integer, got a boolean")
+        if not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer, got {type(value).__name__} {value!r}")
+        return int(value)
+
+    @staticmethod
+    def _require_token(value: Any, field: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string, got {type(value).__name__}")
+        normalized = unicodedata.normalize("NFC", value.strip()).casefold()
+        if not normalized:
+            raise ValueError(f"{field} must be a non-empty token")
+        return unicodedata.normalize("NFC", value.strip())
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CharacterTokenMapping":
+        if not isinstance(data, dict):
+            raise ValueError(f"mapping must be an object, got {type(data).__name__}")
+        nom_char = cls._require_single_nchar(data.get("nom_char", ""), "nom_char")
+        qn_token = cls._require_token(data.get("qn_token", ""), "qn_token")
+        nom_position = cls._require_position(data.get("nom_position"), "nom_position")
+        qn_token_position = cls._require_position(
+            data.get("qn_token_position"), "qn_token_position"
+        )
         return cls(
-            nom_char=str(data.get("nom_char", "")),
-            nom_position=int(data.get("nom_position", -1)),
-            qn_token=str(data.get("qn_token", "")),
-            qn_token_position=int(data.get("qn_token_position", -1)),
+            nom_char=nom_char,
+            nom_position=nom_position,
+            qn_token=qn_token,
+            qn_token_position=qn_token_position,
         )
 
 
@@ -297,17 +334,38 @@ class ReviewDecision:
         data["character_token_mappings"] = [m.to_dict() for m in self.character_token_mappings]
         return data
 
+    def fingerprint(self) -> str:
+        """Stable identity for a decision revision, for lexicon provenance."""
+        payload = {
+            "book_id": self.book_id,
+            "sentence_id": self.sentence_id,
+            "status": self.status,
+            "reviewer": self.reviewer,
+            "content_sha256": self.content_sha256,
+            "character_token_mappings": [
+                [m.nom_char, m.nom_position, normalize_token(m.qn_token), m.qn_token_position]
+                for m in self.character_token_mappings
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReviewDecision":
         try:
             schema_value = int(data.get("schema", SCHEMA))
         except (TypeError, ValueError):
             schema_value = -1  # invalid schema: validate_decision will flag it
-        mappings = [
-            CharacterTokenMapping.from_dict(item)
-            for item in data.get("character_token_mappings", [])
-            if isinstance(item, dict)
-        ]
+        # Strict mapping-set deserialization (Issue B): the collection must
+        # be a list, and EVERY element must parse. Any malformed entry
+        # rejects the whole record — never a silently truncated subset.
+        raw_mappings = data.get("character_token_mappings", [])
+        if not isinstance(raw_mappings, list):
+            raise ValueError(
+                f"character_token_mappings must be a JSON array, got {type(raw_mappings).__name__}"
+            )
+        mappings = [CharacterTokenMapping.from_dict(item) for item in raw_mappings]
         return cls(
             book_id=str(data.get("book_id", "")),
             sentence_id=str(data.get("sentence_id", "")),
@@ -518,31 +576,47 @@ def apply_decisions(
     decision_issues: Iterable[str] | None = None,
     *,
     failures: Iterable[DecisionFailure] | None = None,
-) -> tuple[list[AlignmentRow], list[str]]:
+) -> tuple[list[AlignmentRow], list[str], list[str]]:
     """Overlay review decisions onto rows.
 
-    Returns the rows (modified in place) and a list of integrity issues.
+    Returns (rows, active_issues, audit_diagnostics).
+
+    Issues are split into two classes:
+
+    - **active** — the outcome of the replay for the *current* revision.
+      These are returned for evaluation gating. Only the latest event can
+      produce an active issue.
+    - **audit diagnostics** — parse/validation failures from any record,
+      kept in a separate list so they remain inspectable without ever
+      blocking the current revision.
 
     Selection: for each ``sentence_id`` every record (valid or not) is
     replayed in true append (file) order; the **state after the latest
     event** determines the row::
 
-        latest event valid + hash matches row → ``valid``   (row verified as decided)
-        latest event stale                  → ``stale``   (row not verified)
-        latest event invalid                → ``invalid`` (row not verified, NO fallback)
+        latest event valid + hash matches row + mapping set binds the
+                       row content            → ``valid``   (verified as decided)
+        latest event stale                   → ``stale``   (row not verified)
+        latest event invalid                 → ``invalid`` (row not verified, NO fallback)
         latest valid event conflicts with an earlier
         same-revision valid decision        → ``conflict`` (row not verified)
 
-    Superseded historical records never produce active issues — a newer
-    decision legitimately replaces them while the history is kept in the
-    log for audit. ``log_line`` injected by ``parse_decisions`` is used
-    to order events; records lacking provenance sort first.
+    Superseded historical records (including superseded malformed
+    records) never produce active issues. ``log_line`` injected by
+    ``parse_decisions`` orders events; records without provenance sort
+    first. Returns (rows, active_issues, audit_diagnostics).
     """
-    issues: list[str] = list(decision_issues or [])
+    active: list[str] = []
+    # Log-wide failures cannot be attributed to a row; they remain active
+    # regardless of what else is happening in the log.
+    for failure in failures or []:
+        if failure.sentence_id is None:
+            active.append(f"DECISION_LOG_INVALID:{failure.line}:{failure.error}")
     failure_by_sid: dict[str, list[DecisionFailure]] = {}
     for failure in failures or []:
         if failure.sentence_id:
             failure_by_sid.setdefault(failure.sentence_id, []).append(failure)
+    audit: list[str] = list(decision_issues or [])
     groups: dict[str, list[ReviewDecision]] = {}
     for decision in decisions:
         groups.setdefault(decision.sentence_id, []).append(decision)
@@ -554,6 +628,7 @@ def apply_decisions(
         row.review_reviewer = None
         row.character_token_mappings = []
         row.decision_integrity = None  # type: ignore[attr-defined]
+        row.decision_id = None  # type: ignore[attr-defined]
         # Drop flags previously produced by decision application; this run
         # recomputes them from the log.
         row.flags = sorted(
@@ -578,17 +653,27 @@ def apply_decisions(
         status: str | None = None
         reviewer: str | None = None
         mappings: list[dict[str, Any]] = []
+        event_id: str | None = None
         applied_valid: list[ReviewDecision] = []
         for _line, kind, event in events:
             if kind == "failure":
                 state, status, reviewer, mappings = "invalid", None, None, []
+                event_id = None
                 continue
             errs = validate_decision(event)
+            if not errs and event.character_token_mappings:
+                # Row-bound evidence must also be sound against the current
+                # content of THIS row, not just structurally valid.
+                errs = validate_mappings_against_text(
+                    event.character_token_mappings, row.ch_txt, row.vi_txt
+                )
             if errs:
                 state, status, reviewer, mappings = "invalid", None, None, []
+                event_id = None
                 continue
             if event.content_sha256 != row_hash:
                 state, status, reviewer, mappings = "stale", None, None, []
+                event_id = None
                 continue
             conflict = None
             for prev in reversed(applied_valid):
@@ -600,19 +685,26 @@ def apply_decisions(
             applied_valid.append(event)
             if conflict:
                 state, status, reviewer, mappings = "conflict", None, None, []
+                event_id = None
             else:
                 state = "valid"
                 status = event.status
                 reviewer = event.reviewer
+                event_id = event.fingerprint()
                 mappings = [m.to_dict() for m in event.character_token_mappings]
         if state is None:
             continue
         if state == "valid":
+            for failure in row_failures:
+                # Superseded historical failures stay inspectable but never
+                # block the current revision.
+                audit.append(f"DECISION_SUPERSEDED:{sid}:{failure.line}:{failure.error}")
             row.review_status = status
             row.review_reviewer = reviewer
             row.character_token_mappings = mappings
             row.flags = sorted(set(row.flags) | {f"REVIEW_STATUS_{(status or '').upper()}"})
             row.decision_integrity = "valid"  # type: ignore[attr-defined]
+            row.decision_id = event_id  # type: ignore[attr-defined]
             continue
         # Superseded history never raises an issue: only the latest state
         # is reported/active.
@@ -622,12 +714,13 @@ def apply_decisions(
             "conflict": "REVIEW_DECISION_CONFLICT",
         }[state]
         row.flags = sorted(set(row.flags) | {flag})
+        row.decision_id = None  # type: ignore[attr-defined]
         if state == "stale":
-            issues.append(f"REVIEW_DECISION_STALE:{sid}")
+            active.append(f"REVIEW_DECISION_STALE:{sid}")
         elif state == "invalid":
             detail = "; ".join(f.error for f in row_failures) or "invalid decision record"
-            issues.append(f"REVIEW_DECISION_INVALID:{sid}:{detail}")
+            active.append(f"REVIEW_DECISION_INVALID:{sid}:{detail}")
         else:
-            issues.append(f"REVIEW_DECISION_CONFLICT:{sid}:{conflict or 'same-revision contradiction'}")
+            active.append(f"REVIEW_DECISION_CONFLICT:{sid}:{conflict or 'same-revision contradiction'}")
         row.decision_integrity = state  # type: ignore[attr-defined]
-    return rows, issues
+    return rows, active, audit

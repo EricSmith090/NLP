@@ -171,6 +171,7 @@ def evaluate_rows(
     minimum_coverage: float = 0.9,
     max_unverified_ratio: float = 0.05,
     integrity_issues: Iterable[str] | None = None,
+    audit_diagnostics: Iterable[str] | None = None,
 ) -> BookMetrics:
     """Score verified comparisons and report accuracy vs coverage separately.
 
@@ -190,6 +191,7 @@ def evaluate_rows(
     """
     rows = list(rows)
     metrics = BookMetrics(book_id=book_id, total_rows=len(rows))
+    metrics.decision_audit_diagnostics = [str(item) for item in audit_diagnostics or []]
     for issue in integrity_issues or []:
         text = str(issue)
         if not any(text.startswith(prefix) for prefix in BLOCKING_PREFIXES):

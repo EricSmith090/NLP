@@ -291,6 +291,7 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                     ),
                     ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
                     ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
+                    ("Decision diagnostics (superseded)", str(len(metrics.decision_audit_diagnostics))),
                     ("Gate ≥95%", "PASS" if metrics.passed else "FAIL"),
                 ]
             )
@@ -321,6 +322,7 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                 ("Structural confidence (grouping)", "N/A" if metrics.structural_confidence_mean is None else f"{metrics.structural_confidence_mean:.4f}"),
                 ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
                 ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
+                ("Decision diagnostics (superseded)", str(len(metrics.decision_audit_diagnostics))),
                 ("Similarity", "N/A" if metrics.similarity is None else f"{metrics.similarity:.4f}%"),
                 ("Kết luận", "PASS" if metrics.passed else "FAIL"),
             ]

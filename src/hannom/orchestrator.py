@@ -358,6 +358,34 @@ def recompute_text_diff(
     return out
 
 
+def reconcile_for_book(
+    project: ProjectConfig,
+    book: BookConfig,
+    lexicon: BookLexicon,
+    *,
+    governance_rows: list[AlignmentRow] | None = None,
+    governance_failures: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Fail-closed lexicon reconciliation shared by ``stage_align`` and tests.
+
+    Uses the current governing row state (post patches and decisions) to
+    withdraw automated evidence no longer authorized by review. Log-wide
+    failure: no revocation, no mutation (documented fail-closed).
+    """
+    if governance_rows is None or governance_failures is None:
+        gov_rows, _blocking, _audit = load_rows_for_evaluation(project, book)
+        _d, gov_failures, _issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+        governance_rows = gov_rows
+        governance_failures = gov_failures
+    if any(getattr(f, "sentence_id", "x") is None for f in governance_failures):
+        return {"skipped_log_wide_failure": True, "changed": False}
+    summary = lexicon.reconcile(governance_rows, dry_run=False)
+    if summary.get("changed"):
+        lexicon.backup()
+        lexicon.save()
+    return summary
+
+
 def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple[list[AlignmentRow], dict[str, Any]]:
     pairs = _load_pairs(project, book, state)
     cleaned = load_cleaned_pages(project, book)
@@ -367,6 +395,15 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     dictionary = build_dictionary_index(project.root, dictionary_cfg, book_id=book.book_id)
     lexicon_path = project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"
     lexicon = BookLexicon(lexicon_path)
+    csv_path_prev = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+    if csv_path_prev.exists():
+        # Automated evidence that is no longer authorized (superseded,
+        # invalidated, conflicted, log-wide failure) must not influence
+        # this alignment. Reconcile against the *previous* CSV + current
+        # decisions before alignment consumes the lexicon.
+        revocation = reconcile_for_book(project, book, lexicon)
+    else:
+        revocation = {"skipped_no_previous_csv": True, "changed": False}
     rows, warnings = align_book(
         book.book_id,
         pairs,
@@ -383,14 +420,14 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows = apply_patches(rows, patches)
     decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
-    rows, review_issues = apply_decisions(rows, decisions, decision_issues, failures=failures)
+    rows, review_issues, review_audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
     learned = learn_for_book(lexicon, rows, dictionary, failures)
     lexicon.save()
     rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
     # Apply patches and decisions again so human content and review
     # decisions always win over the automatic recomputation.
     rows = apply_patches(rows, patches)
-    rows, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
+    rows, _, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
     summary = {
@@ -399,7 +436,9 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         "warnings": warnings,
         "lexicon": learned,
         "lexicon_quarantine": lexicon.quarantine_summary(),
+        "lexicon_revocation": revocation,
         "review_decision_issues": review_issues,
+        "review_decision_audit": review_audit,
         "flags": {
             flag: sum(1 for row in rows if flag in row.flags)
             for flag in sorted({flag for row in rows for flag in row.flags})
@@ -412,24 +451,28 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
 
 def load_rows_for_evaluation(
     project: ProjectConfig, book: BookConfig
-) -> tuple[list[AlignmentRow], list[str]]:
+) -> tuple[list[AlignmentRow], list[str], list[str]]:
     """Load the CSV, restore its metadata sidecar, apply content patches
     and overlay review decisions.
 
-    Returns the rows plus every integrity issue found (sidecar and
-    decision-log issues are merged). Callers must treat issues as
-    blocking evaluation failures, never as warnings.
+    Returns (rows, blocking_issues, audit_diagnostics):
+
+    - ``blocking_issues`` are current-revision failures that must block the
+      evaluation gate (sidecar metadata problems, active decision-integrity
+      failures).
+    - ``audit_diagnostics`` are historical diagnostics that remain
+      inspectable without blocking the current revision.
     """
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     rows, issues = load_rows_with_metadata(csv_path)
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows = apply_patches(rows, patches)
     decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
-    rows, decision_issues = apply_decisions(rows, decisions, decision_issues, failures=failures)
-    return rows, issues + decision_issues
+    rows, active, audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
+    return rows, issues + active, audit
 
 
-def _load_rows_patched(project, book) -> tuple[list[AlignmentRow], list[str]]:
+def _load_rows_patched(project, book) -> tuple[list[AlignmentRow], list[str], list[str]]:
     """Backward-compatible alias for ``load_rows_for_evaluation``."""
     return load_rows_for_evaluation(project, book)
 
@@ -438,7 +481,7 @@ def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> Bo
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
         raise PipelineError(f"{book.book_id}: missing CSV {csv_path}")
-    rows, metadata_issues = _load_rows_patched(project, book)
+    rows, blocking_issues, audit = load_rows_for_evaluation(project, book)
     metrics = evaluate_rows(
         book.book_id,
         rows,
@@ -447,7 +490,8 @@ def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> Bo
         yellow_ratio_warn=float(project.quality.get("yellow_ratio_warn", 0.05)),
         minimum_coverage=float(project.quality.get("minimum_coverage", 0.9)),
         max_unverified_ratio=float(project.quality.get("max_unverified_ratio", 0.05)),
-        integrity_issues=metadata_issues,
+        integrity_issues=blocking_issues,
+        audit_diagnostics=audit,
     )
     dest = _book_stage(project, book, state, "evaluation") / "metrics.json"
     if dest.exists():
@@ -468,7 +512,7 @@ def stage_package(
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
         raise PipelineError(f"{book.book_id}: missing CSV {csv_path}")
-    rows, _ = _load_rows_patched(project, book)
+    rows, _, _ = _load_rows_patched(project, book)
     metrics = stage_evaluate(project, book, state)
     if strict_gate and not metrics.passed:
         raise PipelineError(

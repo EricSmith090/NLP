@@ -120,6 +120,9 @@ class AlignmentRow:
     # "conflict" | None (no review events, or attributable history). Only a
     # non-stale, conflict-free, valid decision authorizes learning.
     decision_integrity: str | None = None
+    # Stable fingerprint of the effective decision (``ReviewDecision.
+    # fingerprint()``); recorded in lexicon provenance for revocation.
+    decision_id: str | None = None
     # Reviewer-confirmed character-to-token mappings attached to the
     # effective decision (empty when absent). Used by lexicon learning;
     # never inferred from sentence-level dictionary membership.
@@ -160,6 +163,9 @@ class BookMetrics:
     semantic_evidence_rows: int = 0
     # Rows explicitly flagged as lacking reading evidence.
     evidence_insufficient_rows: int = 0
+    # Historical decision diagnostics that are NOT active blockers (all
+    # superseded or otherwise non-attributable events from the log).
+    decision_audit_diagnostics: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         from dataclasses import asdict
