@@ -29,6 +29,24 @@ def result_text(result: OCRResult) -> str:
     return "\n".join(line.text for line in result.lines if line.text)
 
 
+def _mean_confidence(result: OCRResult) -> float:
+    """Mean line confidence; the spec calls for 'highest-confidence result'.
+
+    A single high-confidence line (e.g. a folio page number like '- 65 -')
+    must not outvote a body of real text lines.
+    """
+    confidences = [
+        float(line.confidence)
+        for line in result.lines
+        if line.confidence is not None
+    ]
+    if not confidences:
+        # No calibrated confidence (Vintern). Rank by text coverage so a
+        # substantive transcription is not silently outvoted by a stub.
+        return len(result_text(result)) / 10000.0
+    return sum(confidences) / len(confidences)
+
+
 def choose_consensus(
     results: list[OCRResult],
     script: str,
@@ -43,7 +61,7 @@ def choose_consensus(
         raise ValueError("no OCR results to compare")
     with_boxes = [r for r in results if r.lines and all(len(line.points) == 4 for line in r.lines)]
     pool = with_boxes or results
-    best = max(pool, key=lambda r: (r.lines[0].confidence if r.lines and r.lines[0].confidence is not None else 0.0))
+    best = max(pool, key=_mean_confidence)
     warnings: list[str] = []
     texts = [result_text(r) for r in results]
     for i in range(len(texts)):

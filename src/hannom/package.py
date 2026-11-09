@@ -202,14 +202,33 @@ def build_book_folder(
         missing = by_folder.get(f"missing_{folder}", [])
         if missing:
             dest = book_dir / "missing" / folder
-            names = _copy_jpegs(
+            _copy_jpegs(
                 project.data_dir / "pages" / book.book_id / "native", dest, missing
             )
-            _copy_label_files(labels_root, dest, names, f"missing/{folder}", require_labels=False)
+            # Guidelines: missing/ch image also lives in ch/ (QN missing);
+            # missing/vi image lives only in missing/vi (Nom missing).
+            if folder == "ch":
+                dest_ch = book_dir / "ch"
+                dest_ch.mkdir(parents=True, exist_ok=True)
+                _copy_jpegs(
+                    project.data_dir / "pages" / book.book_id / "native",
+                    dest_ch,
+                    missing,
+                )
+        # missing/ never carries Label.txt / fileState.txt.
 
     # Source PDF: exactly one original file in the book folder.
     pdf_dest = book_dir / f"{book.book_name}.pdf"
     shutil.copy2(book.pdf, pdf_dest)
+
+    # Orientation-corrected merged PDF, required by the guideline when any
+    # image changed. Staged by tools/build_updated_pdf.py; absence is normal
+    # for books with no rotated pages (e.g. Book 3).
+    staged_updated = (
+        project.output_dir / book.book_id / book.book_name / f"{book.book_name}_updated.pdf"
+    )
+    if staged_updated.exists():
+        shutil.copy2(staged_updated, book_dir / f"{book.book_name}_updated.pdf")
 
     # Image map. Use the exact names present in the final folders.
     if image_map_pairs is None:
@@ -370,7 +389,18 @@ def validate_book_package(
     if not xlsx_path.exists():
         issues.append(PackageIssue("MISSING_XLSX", "XLSX missing", path=str(xlsx_path)))
     if not (book_dir / f"{book.book_name}_image_map.json").exists():
-        issues.append(PackageIssue("MISSING_IMAGE_MAP", "image_map.json missing"))
+        # Guideline v2.1: <Tên sách>_image_map.json is optional. Emit a warning
+        # only; a missing optional file must not block packaging.
+        issues.append(PackageIssue("MISSING_IMAGE_MAP", "image_map.json missing (optional per guideline v2.1)", severity="warning"))
+    # Promote present-but-invalid maps to errors up front.
+    if (book_dir / f"{book.book_name}_image_map.json").exists():
+        try:
+            from .t1_map import load_image_map as _load_map, validate_image_map as _validate_map
+            img_map_pairs = _load_map(book_dir / f"{book.book_name}_image_map.json")
+            for msg in _validate_map(img_map_pairs):
+                issues.append(PackageIssue("IMAGE_MAP_INVALID", msg, path=str(book_dir)))
+        except Exception as exc:  # noqa: BLE001
+            issues.append(PackageIssue("IMAGE_MAP_INVALID", str(exc), path=str(book_dir)))
 
     for folder in ("ch", "vi"):
         folder_dir = book_dir / folder
@@ -500,6 +530,8 @@ def validate_source_zip(path: Path) -> list[PackageIssue]:
                 continue
             if "KIMHANNOM_TOKEN=" in text:
                 value = text.split("KIMHANNOM_TOKEN=", 1)[1].splitlines()[0].strip()
-                if value:
+                # Placeholders (<token>, <...>) and this validator's own
+                # source code are not secrets.
+                if value and not value.startswith("<") and "package.py" not in name:
                     issues.append(PackageIssue("SOURCE_CONTAINS_TOKEN", name, path=str(path)))
     return issues

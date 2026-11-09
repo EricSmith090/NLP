@@ -340,7 +340,7 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
         "Quy_định_đồ_án_v2.1.pdf — quy định đồ án (nguồn chuẩn).",
         "Hướng dẫn sử dụng API Kim Hán Nôm.",
         "Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ.",
-        "PyMuPDF, PaddleOCR, PPOCRLabel, Streamlit, openpyxl.",
+        "PyMuPDF, Vintern-1B-v2, PaddleOCR, PPOCRLabel, Streamlit, openpyxl.",
     ]:
         writer.paragraph(f"- {citation}")
 

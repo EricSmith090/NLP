@@ -111,7 +111,9 @@ def is_safe_codepoint(ch: str) -> bool:
     if ch == REPLACEMENT or ch in "[]MASK":
         return True
     category = unicodedata.category(ch)
-    # Cc/Cf/Cs/Co/Cn are control, format, surrogate, private-use, unassigned.
+    # Guideline: chars not in any Hán Nôm font must become 〓. Private-use
+    # (Co) and unassigned (Cn) code points render as tofu in the reference
+    # fonts, so they are treated as unencodable rather than safe.
     return category not in {"Cc", "Cf", "Cs", "Co", "Cn"}
 
 
@@ -169,6 +171,59 @@ def looks_like_footnote(line: str) -> bool:
 def _strip_inline_refs(text: str) -> tuple[str, bool]:
     new = INLINE_REF_RE.sub("", text)
     return new, new != text
+
+
+# Full-page OCR transcription produces a single giant "line" per page, so
+# the margin machinery (which inspects each page's marginal lines) never
+# sees the running page marker and lets it pass through. The two concrete
+# forms observed in both Book 3 runs are stripped here, in a deliberately
+# narrow way:
+#
+#   leading: '-14-', '- 38 -', '-30 - (93) Sửa Lưới', '-10 ( 113 )'
+#   trailing: the literal book-title footer, e.g. 'Sửa Lứỡi' / 'Sửa Lưới'
+#
+# Both removals are counted and flagged, never silent.
+_FULLPAGE_LEADING_MARK = re.compile(
+    r"^\s*-?\s*\d{1,4}\s*[-–—]?\s*\(?\s*\d{2,4}\s*\)?(?:[.\-–—]\s*)?"
+)
+_FULLPAGE_TRAILING_TITLES = (
+    "sua luoi",  # flat form of every tonal/casing variant of the book title
+    "sua luoi quyen",
+)
+
+
+def _flat_letters(text: str) -> str:
+    return "".join(
+        ch
+        for ch in unicodedata.normalize("NFD", text)
+        if unicodedata.category(ch) != "Mn"
+    ).casefold()
+
+
+def _strip_leading_page_marker(line: str) -> tuple[str, bool, str]:
+    match = _FULLPAGE_LEADING_MARK.match(line)
+    if match is None:
+        return line, False, ""
+    return line[match.end():].strip(), True, match.group(0).strip()
+
+
+def _strip_trailing_title(line: str) -> tuple[str, bool, str]:
+    if not line:
+        return line, False, ""
+    flat_line = _flat_letters(line)
+    for flat_title in _FULLPAGE_TRAILING_TITLES:
+        if not flat_line.endswith(flat_title):
+            continue
+        # Remove the exact suffix span of the original line whose flat
+        # form matches the title.
+        for span in range(1, len(line) + 1):
+            suffix = line[len(line) - span :]
+            if _flat_letters(suffix) == flat_title:
+                rest = line[: len(line) - span].rstrip()
+                if rest:
+                    return rest, True, suffix.strip()
+                return line, False, ""
+    return line, False, ""
 
 
 def _join_hyphenated_lines(lines: Sequence[str]) -> list[str]:
@@ -354,6 +409,10 @@ def clean_quoc_ngu_lines(
         line, refs_removed = _strip_inline_refs(line)
         if refs_removed:
             flags.append("INLINE_REF_REMOVED")
+        line, mark_removed, mark_text = _strip_leading_page_marker(line)
+        if mark_removed:
+            flags.append("PAGE_MARK_REMOVED")
+            dropped.append(mark_text)
         line = normalize_qn_punctuation(line)
         line = SPACE_RE.sub(" ", line).strip()
         prepared.append(line)
@@ -361,6 +420,12 @@ def clean_quoc_ngu_lines(
     final: list[str] = []
     for line in joined:
         line = MULTISPACE_RE.sub(" ", line).strip()
+        if not line:
+            continue
+        line, footer_removed, footer_text = _strip_trailing_title(line)
+        if footer_removed:
+            flags.append("FOOTER_TITLE_REMOVED")
+            dropped.append(footer_text)
         if line:
             final.append(line)
     final, dupes = _dedupe_consecutive(final)

@@ -22,9 +22,9 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class OCRSettings:
     nom: tuple[str, ...] = ("paddleocr_vl", "kimhannom")
-    quoc_ngu: tuple[str, ...] = ("paddleocr_vl",)
+    quoc_ngu: tuple[str, ...] = ("vintern_1b_v2",)
     ensemble: bool = True
-    api_mode: str = "sample_then_low_confidence"
+    api_mode: str = "api_first"
     sample_pages: int = 12
 
 
@@ -143,11 +143,11 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
                 back_matter_is_toc=bool(b.get("back_matter_is_toc", True)),
                 ocr=OCRSettings(
                     nom=tuple(ocr_raw.get("nom", ["paddleocr_vl", "kimhannom"])),
-                    # quoc_ngu is paddle-only since 2026-11-08; vintern_1b_v2 was dropped
-    # (uncalibrated, no boxes). The API must stay out of QN.
-    quoc_ngu=tuple(ocr_raw.get("quoc_ngu", ["paddleocr_vl"])),
+                    # quoc_ngu is Vintern-1B-v2 full-page transcription since 2026-11-08
+    # (benchmark verified). The API must stay out of QN.
+    quoc_ngu=tuple(ocr_raw.get("quoc_ngu", ["vintern_1b_v2"])),
                     ensemble=bool(ocr_raw.get("ensemble", True)),
-                    api_mode=str(ocr_raw.get("api_mode", "sample_then_low_confidence")),
+                    api_mode=str(ocr_raw.get("api_mode", "api_first")),
                     sample_pages=int(ocr_raw.get("sample_pages", 12)),
                 ),
                 review_profile=str(b.get("review_profile", "strict")),

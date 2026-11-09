@@ -15,9 +15,10 @@ translation_end: 144
 back_matter_is_toc: true
 
 ocr:
-  nom: [paddleocr_vl, kimhannom]
-  quoc_ngu: [paddleocr_vl]
+  # API first for Nôm; local engines take over when the quota is reached.
+  nom: [kimhannom, paddleocr_vl]
+  quoc_ngu: [vintern_1b_v2]
   ensemble: true
-  api_mode: sample_then_low_confidence
+  api_mode: api_first
   sample_pages: 12
 review_profile: strict

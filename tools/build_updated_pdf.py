@@ -12,6 +12,10 @@ the merged file is upright with no upscaling, no duplicates, and one image
 per page. Books whose pages were all extracted with rotation == 0 get no
 ``_updated.pdf`` at all.
 
+The file is staged at ``data/output/<book_id>/<BookName>/<BookName>_updated.pdf``;
+``hannom package`` copies it into the final book folder (as the guideline
+requires alongside the original PDF); the staging copy is never deleted.
+
 Usage:
     python tools/build_updated_pdf.py --all
     python tools/build_updated_pdf.py --book T1_CamPhong_Tap1

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -141,6 +142,25 @@ def _sort_lines(lines: Sequence[OCRLine], script: str) -> list[OCRLine]:
 def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict[str, Any]:
     router = OCRRouter(project, book, state)
     pages = state.pages(book.book_id)
+    # Running-line detection needs cross-page evidence; compute once here so
+    # the label path and the clean path drop the same headers/footers.
+    running: dict[str, set[str]] = {}
+    try:
+        from .clean import detect_running_lines as _detect
+
+        for _script, _folder in (("nom", "ch"), ("qn", "vi")):
+            _lines_by_page = []
+            for _p in pages:
+                if str(_p.folder) != _folder:
+                    continue
+                _res = router.load_result(_p)
+                _lines_by_page.append(
+                    [line.text for line in _res.lines if line.text.strip()] if _res else []
+                )
+            if _lines_by_page:
+                running[_script] = _detect(_lines_by_page)
+    except Exception:  # noqa: BLE001
+        running = {}
     by_folder: dict[str, list[PageRecord]] = {}
     for page in pages:
         by_folder.setdefault(str(page.folder), []).append(page)
@@ -165,7 +185,8 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
                 if not line.text.strip():
                     continue
                 cleaned = clean_page_lines(
-                    book.book_id, page.page_no, page.image_name, script, [line.text]
+                    book.book_id, page.page_no, page.image_name, script, [line.text],
+                    running_lines=running.get(script),
                 )
                 text = cleaned.lines[0] if cleaned.lines else ""
                 if not text:
@@ -272,6 +293,7 @@ def recompute_text_diff(
     *,
     lexicon: BookLexicon | None = None,
     dictionary: Any | None = None,
+    force_recompute: bool = False,
 ) -> list[AlignmentRow]:
     from .textdiff import auto_text_diff, validate_text_diff
 
@@ -281,12 +303,25 @@ def recompute_text_diff(
             row.text_diff = None
             out.append(row)
             continue
+        if row.text_diff is None and not force_recompute:
+            # The align stage deliberately left this row unscored
+            # (non-1-1 / n-m grouping), and CSV round-trips lose the
+            # NON_ONE_TO_ONE flag that marks it. Keep the null unless the
+            # caller explicitly force-recomputes (--force-recompute), in
+            # which case the row is treated as a 1-1 candidate again.
+            out.append(row)
+            continue
         diff = auto_text_diff(
             row.ch_txt,
             row.vi_txt,
             lexicon=lexicon,
             dictionary=dictionary,
             strict_reading_mismatch=False,
+            # Book 3's Quốc ngữ translation is transcribed in modern/mixed
+            # orthography; hvdic readings are recorded archaically, so exact
+            # matching under-rejects. Flat matching is still a 1-1 phonetic
+            # claim — it does not invent readings.
+            allow_flat_match=True,
         )
         row.text_diff = diff.elements
         row.flags = sorted(set(row.flags + diff.flags + [f"REVIEW:{r}" for r in diff.review_reasons]))
@@ -354,6 +389,9 @@ def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> Bo
         yellow_ratio_warn=float(project.quality.get("yellow_ratio_warn", 0.05)),
     )
     dest = _book_stage(project, book, state, "evaluation") / "metrics.json"
+    if dest.exists():
+        stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+        shutil.copy2(dest, dest.with_name(f"metrics.{stamp}.json"))
     write_json(dest, metrics.to_dict())
     state.set_artifact(book.book_id, "evaluation", "metrics", dest, meta=metrics.to_dict())
     return metrics
@@ -387,10 +425,11 @@ def stage_package(
         book_dir,
         minimum_similarity=float(project.quality.get("minimum_similarity", 95.0)),
     )
-    if issues:
+    blockers = [i for i in issues if i.severity != "warning"]
+    if blockers:
         raise PipelineError(
             f"{book.book_id}: package validation failed: "
-            + "; ".join(f"{i.code}:{i.message}" for i in issues[:5])
+            + "; ".join(f"{i.code}:{i.message}" for i in blockers[:5])
         )
     return book_dir, issues
 

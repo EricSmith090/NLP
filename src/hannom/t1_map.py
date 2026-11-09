@@ -200,6 +200,48 @@ def build_image_map(
         vi_pages,
         config=(project.alignment_config or {}).get("alignment", {}),
     )
+    # Scan-missing pages (guideline §Quy định chung về file ánh xạ hình ảnh):
+    # missing_ch ⇔ vi empty, missing_vi ⇒ ch empty. These may not already
+    # appear in the partitioned ch/vi lists (layout marks them separately).
+    seen_ch = {name for p in pairs for name in p.ch}
+    seen_vi = {name for p in pairs for name in p.vi}
+    for p in sorted(
+        [p for p in pages if p.folder == "missing_ch"],
+        key=lambda p: p.page_no,
+        reverse=True,
+    ):
+        if p.image_name not in seen_ch:
+            pairs.append(
+                Pair(
+                    ch=(p.image_name,),
+                    vi=(),
+                    note="Trang Quốc ngữ tương ứng bị mất khi scan",
+                )
+            )
+    for p in sorted(
+        [p for p in pages if p.folder == "missing_vi"],
+        key=lambda p: p.page_no,
+    ):
+        if p.image_name not in seen_vi:
+            pairs.append(
+                Pair(
+                    ch=(),
+                    vi=(p.image_name,),
+                    note="Trang Nôm tương ứng bị mất khi scan",
+                )
+            )
+    # Keep pairs sorted by QN reading order; empty-vi pairs key by Nom position.
+    pair_order = {name: i for i, p in enumerate(vi_pages + sorted(
+        [p for p in pages if p.folder == "missing_vi"],
+        key=lambda p: p.page_no,
+    )) for name in (p.image_name,)}
+    nom_order = {p.image_name: p.page_no for p in pages}
+    pairs.sort(
+        key=lambda pair: (
+            min((pair_order.get(name, 10**9) for name in pair.vi), default=10**9),
+            max((nom_order.get(name, 0) for name in pair.ch), default=0),
+        )
+    )
     issues = validate_image_map(
         pairs,
         ch_names={p.image_name for p in pages if p.folder in {"ch", "missing_ch"}},

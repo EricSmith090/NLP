@@ -130,6 +130,10 @@ def make_element(
     return element
 
 
+def _is_letter(ch: str) -> bool:
+    return is_nom_char(ch) or ch.isalpha()
+
+
 def validate_element(nom: str, vi: str, element: DiffElement) -> list[str]:
     issues: list[str] = []
     nom = nfc(nom)
@@ -138,6 +142,17 @@ def validate_element(nom: str, vi: str, element: DiffElement) -> list[str]:
         issues.append(f"invalid type {element.type!r}")
     if not element.nom_pos and not element.vi_pos:
         issues.append("both sides are empty")
+    for label, text, spans in (("nom", nom, element.nom_pos), ("vi", vi, element.vi_pos)):
+        ordered = sorted(spans)
+        if list(spans) != ordered:
+            issues.append(f"{label} spans must be sorted ascending")
+        for start, end in spans:
+            if not (0 <= start < end <= len(text)):
+                continue
+            if not _is_letter(text[start]):
+                issues.append(f"{label} span {start, end} must start with a letter")
+            if not _is_letter(text[end - 1]):
+                issues.append(f"{label} span {start, end} must end with a letter")
     if element.nom_pos:
         actual = _span_text(nom, element.nom_pos)
         if actual != element.nom_sub_text:
@@ -197,14 +212,14 @@ def validate_text_diff(
         for issue in validate_element(nom, vi, element):
             issues.append(f"element {index}: {issue}")
         for span in element.nom_pos:
-            for other, kind in occupied_nom:
-                if spans_overlap(span, other) and kind != element.type:
-                    issues.append(f"element {index}: overlapping nom positions of different types")
+            for other, _kind in occupied_nom:
+                if spans_overlap(span, other):
+                    issues.append(f"element {index}: overlapping nom positions")
             occupied_nom.append((span, element.type))
         for span in element.vi_pos:
-            for other, kind in occupied_vi:
-                if spans_overlap(span, other) and kind != element.type:
-                    issues.append(f"element {index}: overlapping vi positions of different types")
+            for other, _kind in occupied_vi:
+                if spans_overlap(span, other):
+                    issues.append(f"element {index}: overlapping vi positions")
             occupied_vi.append((span, element.type))
     return issues
 
@@ -255,25 +270,34 @@ def _reading_match(
     readings: Sequence[str],
     tokens: Sequence[tuple[int, int, str]],
     start_index: int,
+    *,
+    allow_flat: bool = False,
 ) -> int | None:
+    """Match one reading against QN tokens.
+
+    Exact (NFC, casefolded) match is tried first. Diacritic-stripped matching
+    is only used when ``allow_flat`` is set, because Entry/v1 keeps tones
+    ("không đổi dấu thanh") and stripping can merge distinct readings.
+    """
     if not readings:
         return None
-    flat_readings = set()
-    for reading in readings:
-        value = reading.strip().casefold()
-        if not value:
-            continue
-        flat_readings.add(value)
-        decomposed = unicodedata.normalize("NFD", value)
-        flat_readings.add("".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn"))
+    exact = {r.strip().casefold() for r in readings if r.strip()}
     for index in range(start_index, len(tokens)):
-        token = tokens[index][2]
+        if tokens[index][2] in exact:
+            return index
+    if not allow_flat:
+        return None
+    flat = {
+        "".join(ch for ch in unicodedata.normalize("NFD", r) if unicodedata.category(ch) != "Mn")
+        for r in exact
+    }
+    for index in range(start_index, len(tokens)):
         token_flat = "".join(
             ch
-            for ch in unicodedata.normalize("NFD", token)
+            for ch in unicodedata.normalize("NFD", tokens[index][2])
             if unicodedata.category(ch) != "Mn"
         )
-        if token in flat_readings or token_flat in flat_readings:
+        if token_flat in flat:
             return index
     return None
 
@@ -286,6 +310,7 @@ def auto_text_diff(
     dictionary: Any | None = None,
     strict_reading_mismatch: bool = False,
     proper_name: bool = False,
+    allow_flat_match: bool = False,
 ) -> DiffResult:
     """Conservative automatic diff.
 
@@ -348,20 +373,71 @@ def auto_text_diff(
             unknown_nom_chars=len(chars),
         )
 
-    # Greedy reading alignment. QN expansions are allowed; unmatched known
-    # Nôm characters are candidates for red.
+    # Global 1-1 phonetic alignment (Needleman-Wunsch, O(n·m)) — far more
+    # robust than a greedy cursor for this text class. Require an
+    # exact or flat reading match to count as anchorable.
+    GAP = -1.2
+
+    def _score(char_index: int, token_index: int) -> float:
+        rs = readings_by_index.get(char_index)
+        if not rs:
+            return 0.0  # neutral; matches are never made on this cell
+        tok = tokens[token_index][2]
+        exact = {r.strip().casefold() for r in rs if r.strip()}
+        if tok in exact:
+            return 2.0
+        if not allow_flat_match:
+            return -1.0
+        flat = {
+            "".join(c for c in unicodedata.normalize("NFD", r) if unicodedata.category(c) != "Mn")
+            for r in exact
+        }
+        tok_flat = "".join(c for c in unicodedata.normalize("NFD", tok) if unicodedata.category(c) != "Mn")
+        if tok_flat in flat:
+            return 1.0
+        return -1.0
+
+    n, m_ = len(chars), len(tokens)
+    NEG = -1e9
+    dp = [[NEG] * (m_ + 1) for _ in range(n + 1)]
+    back = [[None] * (m_ + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + GAP
+        back[i][0] = 'up'
+    for j in range(1, m_ + 1):
+        dp[0][j] = dp[0][j - 1] + GAP
+        back[0][j] = 'left'
+    for i in range(1, n + 1):
+        for j in range(1, m_ + 1):
+            s_ij = _score(i - 1, j - 1)
+            diag = dp[i - 1][j - 1] + s_ij
+            up = dp[i - 1][j] + GAP
+            left = dp[i][j - 1] + GAP
+            best = max(diag, up, left)
+            dp[i][j] = best
+            if best == diag:
+                back[i][j] = 'diag'
+            elif best == up:
+                back[i][j] = 'up'
+            else:
+                back[i][j] = 'left'
+
     matched: set[int] = set()
-    token_cursor = 0
     char_matches: dict[int, int] = {}
-    for index, char in chars:
-        readings = readings_by_index.get(index)
-        if not readings:
-            continue
-        token_index = _reading_match(char, readings, tokens, token_cursor)
-        if token_index is not None:
-            matched.add(index)
-            char_matches[index] = token_index
-            token_cursor = token_index + 1
+    i, j = n, m_
+    while i > 0 or j > 0:
+        step = back[i][j]
+        if step == 'diag':
+            if _score(i - 1, j - 1) > 0:
+                matched.add(i - 1)
+                char_matches[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif step == 'up':
+            i -= 1
+        else:
+            j -= 1
 
     unknown = len(chars) - known
     if unknown:

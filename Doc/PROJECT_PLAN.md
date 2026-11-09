@@ -324,13 +324,17 @@ PDF
 
 ## 7. Key technical choices and rationale
 
-### 7.1 OCR: local majority + API second opinion
+### 7.1 OCR: Kim Hán Nôm API first (superseded local-majority decision)
+
+> Superseded 2026-11-08: Nôm OCR now uses the API first (`api_mode: api_first`); local models are the fallback once the quota is reached, writing to `local_fallback/` files. See `docs/decisions.md` and `configs/ocr.yaml`. The original local-majority rationale below is kept for history.
+
+**Original decision (history):** local majority + API second opinion
 
 **Why:** the Kim Hán Nôm quota is 600 calls/week; each image needs at least 2, realistically 3 calls. All 421 estimated Nôm pages would need 842–1,263 calls (~1.4–2.7 weeks plus retries), leaving little buffer. Local models are free, keep confidential data on-machine, and can process the QN bulk quickly.
 
 **Model plan for 8 GB VRAM / 16 GB RAM:**
 
-- Quốc ngữ: PP-OCRv5 (mobile) local primary — already benchmarked (Book 3 pilot, mean conf 0.89 on 11 QN pages, 2026-11-08). Kim Hán Nôm API is Hán/Nôm-only and must not receive QN pages. Vintern-1B-v2 evaluated and dropped 2026-11-08: uncalibrated adapter, no boxes, no measured benefit; kept only as a documented contingency if QN quality fails the gate.
+- Quốc ngữ: Vintern-1B-v2 primary (benchmark 2026-11-08 on pages 11 and 41 of Book 3: near-perfect transcription of archaic Vietnamese including circumflexes/tildes/unchanged archaic spellings; ~35 s/page, peak 2.3 GB VRAM, RTX 4060). Transcription is a full-page box per image (guideline p.12 allows one box per page). Kim Hán Nôm API is Hán/Nôm-only and must not receive QN pages. PaddleOCR latin/ch models confirmed unusable for this text (128 distinct tokens with systematic tone-mark loss in Book 3) and are no longer used for QN.
 - Nôm: `PaddleOCR-VL` or PP-OCRv5 local primary; Kim Hán Nôm API for low-confidence pages and validation.
 - Run models **sequentially**, batch size 1–4; unload between stages. Do not attempt a 7B ensemble.
 - If PaddleOCR-VL installation fails on Windows, fall back to PP-OCRv5 or a Transformers-based OCR model.
@@ -609,7 +613,7 @@ Review load estimate: 10–20% of Nôm pages (~42–84 pages), more if local Nô
 
 | Date | Work / gate |
 |---|---|
-| **Nov 8–10** | OCR stack installed 2026-11-08 (paddlepaddle 3.3.1 + paddleocr 3.7.0, PP-OCRv5 mobile; Vintern-1B-v2 dropped); benchmark done, 20-page Book 3 sample, 0 errors; API sample if token; 5-page gold sample; decide if enhancement is needed. **Pilot go/no-go Nov 10.** |
+| **Nov 8–10** | OCR stack installed 2026-11-08 (paddlepaddle 3.3.1 + paddleocr 3.7.0 for Nôm draft/geometry; Vintern-1B-v2 on GPU for all QN pages); benchmark done (QN: Vintern, near-perfect; Nôm: Kim Hán Nôm, conf 0.945-0.989 on 24 pages); API sample if token; 5-page gold sample; decide if enhancement is needed. **Pilot go/no-go Nov 10.** |
 | **Nov 11–14** | Scaffold repo; extraction, classification, T1 mapping, label generation, validators; Book 3 end-to-end pilot. |
 | **Nov 15–20** | OCR production: local majority; API low-confidence; cleaning; start Book 2 (largest Nôm section). **OCR complete Nov 20.** |
 | **Nov 21–25** | Alignment and `text_diff`; per-book 95% gate; review queue. |

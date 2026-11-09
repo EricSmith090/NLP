@@ -19,14 +19,28 @@ class Sense:
     reading: str = ""
     gloss: str = ""
     raw: dict[str, Any] = field(default_factory=dict, compare=False)
+    # Reading systems present on the source record (Entry/v1 `system`).
+    # Only {qn, hv, nom} are usable as Quốc ngữ evidence per the
+    # "Không suy đoán" rule; pinyin/jyutping/on/kun/hangul must not match QN.
+    systems: tuple[str, ...] = ()
+    # Entry kind ("char"/"word") and head for word-level lookups.
+    kind: str = ""
+    head: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "source": self.source,
             "definition": self.definition,
             "reading": self.reading,
             "gloss": self.gloss,
         }
+        if self.systems:
+            out["systems"] = list(self.systems)
+        if self.kind:
+            out["kind"] = self.kind
+        if self.head:
+            out["head"] = self.head
+        return out
 
 
 @dataclass
@@ -39,7 +53,10 @@ class LookupResult:
 
     @property
     def found(self) -> bool:
-        return bool(self.senses or self.book_readings)
+        # A structural-only sense (IDS/variant gloss with no reading or
+        # definition, e.g. cjkvi_ids) is not phonetic evidence.
+        has_evidence = any(s.reading or s.definition for s in self.senses)
+        return bool(has_evidence or self.book_readings)
 
     @property
     def readings(self) -> list[str]:
@@ -129,6 +146,28 @@ class DictionaryIndex:
 
     def lookup_text(self, text: str) -> dict[str, LookupResult]:
         return {ch: self.lookup(ch) for ch in text if ch.strip()}
+
+    def lookup_word(self, head: str) -> LookupResult:
+        """Word-level lookup for multi-code-point Nom heads (kind=word)."""
+        present: list[str] = []
+        checked: list[str] = []
+        senses: list[Sense] = []
+        for adapter in self.adapters:
+            checked.append(adapter.name)
+            if not adapter.available():
+                continue
+            present.append(adapter.name)
+            lookup_word = getattr(adapter, "lookup_word", None)
+            if callable(lookup_word):
+                senses.extend(lookup_word(head))
+        result = LookupResult(
+            char=head,
+            senses=senses,
+            sources_checked=checked or self.configured_sources,
+            sources_present=present,
+            book_readings=[],
+        )
+        return result
 
     def unknown_chars(self, text: str) -> list[str]:
         out: list[str] = []

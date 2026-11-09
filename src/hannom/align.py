@@ -22,6 +22,7 @@ from .t1_map import Pair
 from .textdiff import auto_text_diff, validate_text_diff
 
 QN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+(?=[A-ZÀ-Ỹ\"“(\[]|\d)")
+_QN_ABBREV_RE = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|St|No|v|p|fig)\.$", re.IGNORECASE)
 NOM_TERMINAL_RE = re.compile(r"(?<=[\u3002\uFF01\uFF1F\uFF1B\uFF1A])")
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -125,7 +126,13 @@ def split_qn_page(page: Any, max_chars: int = 350) -> list[str]:
     text = nfc(str(getattr(page, "text", "") or ""))
     if not text:
         return []
-    parts = [p.strip() for p in QN_SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    raw = [p.strip() for p in QN_SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    parts: list[str] = []
+    for part in raw:
+        if parts and _QN_ABBREV_RE.search(parts[-1]):
+            parts[-1] = f"{parts[-1]} {part}"
+        else:
+            parts.append(part)
     out: list[str] = []
     for part in parts:
         out.extend(_split_long_text(part, max_chars))
@@ -145,6 +152,49 @@ def _may_join_across_pages(previous: str, following: str, script: str) -> bool:
     return previous[-1] not in ".!?\u2026" and following[:1].islower()
 
 
+def _stream_segments(
+    pairs: Sequence[Pair],
+    cleaned_by_name: dict[str, Any],
+    script: str,
+) -> list[TextSegment] | None:
+    """Global reading-stream co-segmentation (both scripts get the same cuts)."""
+    from .cosegment import PageUnit, stream_cosegment
+
+    nom_units: list[PageUnit] = []
+    qn_units: list[PageUnit] = []
+    for pair in pairs:
+        for name in pair.ch:
+            page = cleaned_by_name.get(name)
+            if page is None:
+                continue
+            nom_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
+        for name in pair.vi:
+            page = cleaned_by_name.get(name)
+            if page is None:
+                continue
+            qn_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
+    stream = stream_cosegment(nom_units, qn_units)
+    if stream is None:
+        return None
+    nom_segs, qn_segs = stream
+    source = nom_segs if script == "nom" else qn_segs
+    out: list[TextSegment] = []
+    for i, s in enumerate(source):
+        out.append(
+            TextSegment(
+                text=s.text,
+                image_name=s.image_name,
+                page_no=s.page_no,
+                page_numbers=s.page_numbers,
+                image_names=s.image_names,
+                script=script,
+                order=i,
+                flags=list(s.flags),
+            )
+        )
+    return out
+
+
 def build_segments(
     pairs: Sequence[Pair],
     cleaned_by_name: dict[str, Any],
@@ -157,9 +207,17 @@ def build_segments(
     decreasing page order; the vi side is increasing.
     """
     warnings: list[str] = []
+    if script in ("nom", "qn"):
+        stream = _stream_segments(pairs, cleaned_by_name, script)
+        if stream is not None:
+            return stream, warnings
+
     segments: list[TextSegment] = []
     order = 0
     for pair in pairs:
+        ch_names = pair.ch
+        vi_names = pair.vi
+
         names = pair.ch if script == "nom" else pair.vi
         for name in names:
             page = cleaned_by_name.get(name)
@@ -212,11 +270,14 @@ def build_segments(
 
 
 def _reading_matches(nom_text: str, vi_text: str, lexicon: Any | None) -> tuple[int, int]:
-    """Return (matched known characters, known characters) for a group."""
+    """Return (matched known characters, known characters) for a group.
+
+    Exact NFC/casefolded syllable match only; diacritic-stripped matching is
+    opt-in and would merge distinct readings, so it is not used for costing.
+    """
     if lexicon is None:
         return 0, 0
     tokens = {s.casefold() for s in qn_syllables(vi_text)}
-    tokens_flat = {strip_diacritics(t) for t in tokens}
     known = matched = 0
     for char in nom_text:
         if not char.strip():
@@ -225,10 +286,7 @@ def _reading_matches(nom_text: str, vi_text: str, lexicon: Any | None) -> tuple[
         if not readings:
             continue
         known += 1
-        if any(
-            r.casefold() in tokens or strip_diacritics(r.casefold()) in tokens_flat
-            for r in readings
-        ):
+        if any(r.casefold() in tokens for r in readings):
             matched += 1
     return matched, known
 

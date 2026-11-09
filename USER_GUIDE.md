@@ -1,0 +1,125 @@
+# USER_GUIDE — Hán Nôm–Quốc ngữ Parallel Corpus Pipeline
+
+End-to-end run on a fresh machine, per `Quy_định_đồ_án_v2.1` and `Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ v1`.
+
+## 1. Environment
+
+- **Python** 3.11+ (verified 3.13.9, Windows 11; Ubuntu is preferred per guideline source requirements).
+- **RAM** 16 GB, **GPU** NVIDIA RTX 4060 8 GB VRAM for Vintern-1B-v2 (QN primary). CPU-only hosts still run extraction/classification/labels/clean/align, but Vintern reports unavailable without CUDA.
+- Set UTF-8 console before running commands that print Vietnamese filenames:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+```
+
+## 2. Install
+
+Core pipeline (pinned in `pyproject.toml`):
+
+```powershell
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+OCR extras (pinned in `pyproject.toml` `[project.optional-dependencies] ocr`):
+
+```powershell
+python -m pip install -e ".[ocr]"
+# torch/torchvision with CUDA are not on PyPI for Windows; install from the cu126 index:
+python -m pip install torch==2.14.1+cu126 torchvision==0.29.1+cu126 --index-url https://download.pytorch.org/whl/cu126
+```
+
+Notes:
+- `transformers` **must** stay at 4.46.3 (5.x is incompatible with Vintern custom code).
+- `paddlex` prefers PyYAML 6.0.2; this project pins 6.0.3 (patch-level, tests pass).
+- A no-op `flash_attn` shim exists site-wide because the stock Vintern config sets `use_flash_attn=false`.
+- `requests==2.32.5` is a core dependency (required by the Kim Hán Nôm client) — it is pinned in `pyproject.toml`, not assumed transitive.
+
+## 3. Secrets and external services
+
+- Copy `.env.example` to `.env` and set `KIMHANNOM_TOKEN=<token>`. The token is read from `KIMHANNOM_TOKEN` env var (`.env` is supported) and is **never** committed or packaged.
+- **Only approved external service:** Kim Hán Nôm API (`https://kimhannom.fit.hcmus.edu.vn`), documented limits 25/min, 50/h, 200/day, 600/week. The client is single-threaded, caches by image SHA-256, backs off exponentially, and records a quota ledger. Multiple accounts must not be used to bypass quota.
+- No confidential PDF/page image may be sent to any other cloud OCR/GPU/Hugging Face. Local Vintern weights (`5CD-AI/Vintern-1B-v2`) download from Hugging Face on first load and stay local thereafter. Paid tools: none. Prompts: Vintern prompt is fixed in `src/hannom/ocr/local_vintern.py` (“Trích xuất toàn bộ văn bản tiếng Việt…”).
+
+## 4. Data layout
+
+| Path | Contents |
+|---|---|
+| `CV20-24127189/*.pdf` | 3 assigned T1 books, 950 image-only pages (confidential, gitignored) |
+| `dictionaries-04-11-2026/entries/*.jsonl` | Official Entry/v1 dictionary drop (12 sources; see `configs/dictionary.yaml`) |
+| `data/` | Working artifacts (gitignored) |
+| `artifacts/` | Reports/screenshots (gitignored) |
+| `configs/books/*.yaml` | Per-book scope, page hints, OCR routing |
+
+`configs/dictionary.yaml` points at `dictionaries-04-11-2026/entries`. If the folder is absent the pipeline still runs; `JsonlDictionary.available()` is false and dictionary misses only route to review (never auto-red).
+
+## 5. Run the pipeline
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+python -m hannom.cli intake
+python -m hannom.cli extract
+python -m hannom.cli classify
+python -m hannom.cli map
+python -m hannom.cli ocr          # Nôm: Kim API first, local fallback on quota (local_fallback/ files); QN: Vintern
+python -m hannom.cli labels
+python -m hannom.cli clean
+python -m hannom.cli align
+python -m hannom.cli textdiff
+python -m hannom.cli evaluate
+python -m hannom.cli review --book T1_SuaLoiQuyen
+python -m hannom.cli package-all
+python tools/validate_submission.py data/output
+```
+
+Per-book variants:
+
+```powershell
+python -m hannom.cli ocr --book T1_SuaLoiQuyen --limit 3
+python -m hannom.cli extract --book T1_CamPhong_Tap2 --force
+python -m hannom.cli pilot --book T1_SuaLoiQuyen
+python -m hannom.cli status
+python -m hannom.cli source-zip
+python -m hannom.cli split
+python tools/build_updated_pdf.py --all
+```
+
+`hannom ocr` prints per-page progress (`[book] OCR i/N`) and caches results in `data/ocr/<book>/<page>.json`; reruns resume unless `--force`. `pilot` stops with `status=blocked_ocr` if no engine is available rather than fabricating later stages.
+
+## 6. Review
+
+- `python -m hannom.cli review --book <id>` launches the local Streamlit app (port 8501). Only flagged rows leave automation: `DICT_MISS`, `DIFF_SEMANTIC`, `OCR_ENGINE_DISAGREE`, `ALIGN_LOW_CONF`, etc. (see `docs/review_guide.md`).
+- Human patches are stored as JSONL and reapplied on rerun; rerunning never overwrites reviewed pages.
+- Two mandatory human steps are not error correction:
+  1. Fill `configs/report.yaml` with all four members' names/IDs/emails.
+  2. Merge `<Book>_updated.pdf` for books with rotated pages into the submission and notify the handout person; capture the four mandatory report screenshots.
+
+## 7. Dictionary adapter notes (Entry/v1)
+
+- `src/hannom/dictionary/jsonl.py` indexes both `kind: char` (single code point, Han/Nôm) and `kind: word` (multi-char), plus `forms` spellings (QN heads → Nôm spellings, e.g. dnqatv).
+- Only reading systems `qn/hv/nom` count as Quốc ngữ evidence. `pinyin/jyutping/on/kun/hangul` are kept as gloss, never matched against QN syllables (Entry/v1 “Không suy đoán”). Missing system is treated as `qn`.
+- Validation counts (`duplicate_ids`, `invalid_freq`, `invalid_enum`, `skipped_unencoded`) are tracked per adapter; `unencoded:true` IDS/`@img` entries are skipped, not turned into invented senses.
+- Structural-only sources (`cjkvi_ids`, `cjkvi_variants`) do not count as phonetic evidence: `LookupResult.found` requires a reading or definition.
+- Diacritic matching is exact-first by default (`strip_diacritics_for_reading_match: false`). Stripped matching would merge distinct readings and is opt-in only.
+
+## 8. Packaging and validation
+
+- `package-all` builds one ZIP with three sibling book folders + report PDF + `source.zip` (guideline extension; `hannom split` makes one ZIP per book if required).
+- `validate_book_package` checks: images exist and are `.jpg`, `Label.txt`/`fileState.txt` present for `ch`/`vi`, all `fileState` = 1, 4 points per box, CSV parses, `text_diff` positions valid (0-based half-open Unicode code points on NFC, `[MASK]`=6 chars excluded, span endpoints are letters, no overlapping spans), XLSX colours match CSV, per-book similarity ≥95%.
+- `<Book>_image_map.json` is **optional** per guideline v2.1; a missing map is a warning, an invalid map is a blocker.
+- `missing/ch` images are duplicated into `ch/`; `missing/vi` images are kept only in `missing/vi` with no label files, and both appear as empty-side pairs in the image map.
+
+## 9. Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `No OCR engine available / blocked_ocr` | Check `python -c "import torch; print(torch.cuda.is_available())"` (Vintern needs CUDA), `KIMHANNOM_TOKEN` in `.env`, `python -m pytest -q`. |
+| `Refusing to call Kim Hán Nôm without --allow-api` (benchmark) | `tools/benchmark_ocr.py` now defaults to local engines; pass `--engine kimhannom --allow-api` explicitly for API. |
+| `image-ocr` invalid boxes | `KimHanNomClient` now falls back to `image-rec` once and records `IMAGE_REC_FALLBACK`. |
+| `QuotaExceeded` / slow OCR | 25/min, 50/h, 200/day, 600/week. In `api_mode: api_first` the pipeline switches to local models automatically once the quota is reached (results go to `data/ocr/<book>/local_fallback/`). Wait or resume later; cache prevents repeat calls. |
+| Similarity FAIL | See `data/evaluation/<book>/metrics.json`. Many FAILs are `DIFF_UNVERIFIED` rows awaiting review — open the review app. |
+| `SOURCE_MISSING USER_GUIDE.md` | `USER_GUIDE.md` is included in `source.zip` by `build_source_zip`; ensure the file exists in the repo root before packaging. |
+
+## 10. Colab (if used)
+
+Pin the same versions as `pyproject.toml`, use a GPU runtime (T4/A100), set `KIMHANNOM_TOKEN` as a Colab secret, and do not upload confidential PDFs. The pipeline’s state (`data/state.sqlite3`) and quota ledger are local to the session; download `source.zip` rather than the full `data/` directory.

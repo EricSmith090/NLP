@@ -43,7 +43,7 @@ def test_lookup_parses_entry_v1_schema(tmp_path: Path):
     assert senses[0].source == "test"
 
 
-def test_word_records_and_multi_codepoint_heads_are_skipped(tmp_path: Path):
+def test_word_records_are_indexed_and_multi_codepoint_char_heads_skipped(tmp_path: Path):
     path = _write(
         tmp_path / "test.jsonl",
         [_entry("一二", id="test:word"), _entry("經", kind="word", id="test:kind"), _entry("經")],
@@ -51,8 +51,10 @@ def test_word_records_and_multi_codepoint_heads_are_skipped(tmp_path: Path):
     dictionary = JsonlDictionary(path)
     assert dictionary.lookup("經"), "char record must survive"
     assert dictionary.lookup("一") == []
-    assert dictionary.skipped_non_char == 1
     assert dictionary.skipped_multi == 1
+    # kind=word entries are now indexed at word level, not dropped.
+    assert dictionary.lookup_word("經"), "word record must be indexed"
+    assert dictionary.lookup("經") == dictionary.lookup_word("經") or dictionary.lookup_word("經")
 
 
 def test_non_han_nom_scripts_are_skipped(tmp_path: Path):
@@ -80,6 +82,25 @@ def test_malformed_lines_are_counted_not_raised(tmp_path: Path):
 def test_unknown_character_lookup_is_empty_not_error(tmp_path: Path):
     path = _write(tmp_path / "test.jsonl", [_entry("一")])
     assert JsonlDictionary(path).lookup("\uffff") == []
+
+
+def test_pinyin_systems_are_not_qn_evidence(tmp_path: Path):
+    path = _write(
+        tmp_path / "test.jsonl",
+        [_entry("人", readings=[{"value": "ren", "system": "pinyin"}])],
+    )
+    sense = JsonlDictionary(path).lookup("人")[0]
+    assert sense.reading == ""
+    assert sense.systems == ()
+
+
+def test_forms_on_qn_head_index_nom_spelling(tmp_path: Path):
+    path = _write(
+        tmp_path / "test.jsonl",
+        [_entry("nhân nghia", script="qn", forms=[{"text": "因", "script": "nom"}])],
+    )
+    dictionary = JsonlDictionary(path)
+    assert dictionary.lookup("因"), "Nom spelling in forms must round-trip"
 
 
 def test_build_dictionary_index_discovers_entries_dir(tmp_path: Path):

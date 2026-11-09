@@ -142,7 +142,11 @@ def align(config: str = "configs/project.yaml", book: Optional[str] = None):
 
 
 @app.command("textdiff")
-def textdiff(config: str = "configs/project.yaml", book: Optional[str] = None):
+def textdiff(
+    config: str = "configs/project.yaml",
+    book: Optional[str] = None,
+    force_recompute: bool = typer.Option(False, "--force-recompute", help="Re-score rows the aligner left unscored (default keeps nulls)."),
+):
     """Recompute text_diff from cleaned text and the learned book lexicon."""
     project = _project(config)
     with open_state(project) as state:
@@ -151,7 +155,7 @@ def textdiff(config: str = "configs/project.yaml", book: Optional[str] = None):
             rows = read_alignment_csv(csv_path)
             dictionary = build_dictionary_index(project.root, project.dictionary_config, book_id=item.book_id)
             lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{item.book_id}.json")
-            rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
+            rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary, force_recompute=force_recompute)
             rows = apply_patches(rows, read_patches(project.data_dir / "review" / f"{item.book_id}.patches.jsonl"))
             write_alignment_csv(csv_path, rows)
             console.print(f"[green]{item.book_id}[/]: {len(rows)} rows")
@@ -250,8 +254,12 @@ def validate(
         issues.extend(validate_book_package(project, item, book_dir))
     if source_zip and source_zip.exists():
         issues.extend(validate_source_zip(source_zip))
-    if issues:
-        for issue in issues[:50]:
+    warnings = [i for i in issues if i.severity == "warning"]
+    blockers = [i for i in issues if i.severity != "warning"]
+    for issue in warnings:
+        console.print(f"[yellow]{issue.code}[/] {issue.message} ({issue.path})")
+    if blockers:
+        for issue in blockers[:50]:
             console.print(f"[red]{issue.code}[/] {issue.message} ({issue.path})")
         raise typer.Exit(code=1)
     console.print("[green]validation passed[/]")

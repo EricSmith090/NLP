@@ -120,10 +120,14 @@ class BookLexicon:
             for char in chars:
                 lookup = dictionary.lookup(char)
                 for reading in lookup.readings:
-                    for form in _reading_forms(reading):
-                        if form in syllable_set or form in syllable_flat:
-                            self.add(char, form)
-                            learned += 1
-                            break
+                    exact_hits = [
+                        form
+                        for form in _reading_forms(reading)
+                        if form in syllable_set
+                    ]
+                    if exact_hits:
+                        self.add(char, exact_hits[0])
+                        learned += 1
+                        break
         self.meta["learned_pairs"] = int(self.meta.get("learned_pairs", 0)) + learned
         return {"learned_pairs": learned, "characters": len(self.data)}

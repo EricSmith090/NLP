@@ -8,12 +8,14 @@ and submission packaging.
 **Deadline:** 2026-11-30  
 **Scope:** 3 books, 950 PDF pages, ≥95% similarity per book (not aggregate)  
 **Current status (2026-11-08):** deterministic stages (0-2) complete and
-verified; test suite is green (57 passed). Local OCR runtime is installed
-and benchmarked (PP-OCRv5 mobile, CPU, Book 3 pilot sample): QN ~42 s/page at
-mean confidence 0.89, Nôm ~21 s/page at 0.71; 20/20 sampled pages OK, 0 errors.
-No mass OCR has been run yet and no Kim Hán Nôm token is installed; final
-labels, alignment, report, and ZIP cannot be produced until OCR + human
-review are done.
+verified; full local OCR pipeline runs. Book 3 ran end-to-end on all 110 OCR
+targets (labels/clean/align/textdiff/evaluate executed). Quốc ngữ QN OCR was
+then swapped to Vintern-1B-v2 (GPU; near-perfect benchmark on pages 11/41);
+the paddle reading was discarded. Nôm is served by the Kim Hán Nôm API
+(verified live end-to-end on a 24-page sample; confidences 0.945-0.989;
+2026-11-08) with a local paddle draft fallback. Books 1/2 are untouched.
+Final numbers for the gate are pending the Book 3 re-run and 26 Nôm pages
+pending manual verification.
 
 ## Assigned books
 
@@ -135,7 +137,7 @@ python -m hannom.cli intake
 python -m hannom.cli extract
 python -m hannom.cli classify
 python -m hannom.cli map
-python -m hannom.cli ocr                 # currently blocked: no engine
+python -m hannom.cli ocr                 # Nôm: Kim Hán Nôm API first (quota-gated), local fallback on quota; QN: Vintern
 python -m hannom.cli labels
 python -m hannom.cli clean
 python -m hannom.cli align
@@ -164,19 +166,30 @@ stages, hashes, and metrics so a rerun resumes rather than redoing work.
 
 ## OCR policy
 
-- Local OCR is the primary path; Kim Hán Nôm API is a measured second
-  opinion for low-confidence Nôm pages.
-- 2026-11-08 benchmark (`tools/benchmark_ocr.py`, see `artifacts/benchmark/`):
-  Book 3 stratified sample (20 pages), 0 errors, CPU-only. Nôm output is a
-  weak draft (mean confidence 0.71; vertical columns are read horizontally);
-  it is a comparison baseline, not a substitute for review or the measured
-  Kim Hán Nôm pass.
+- Nôm OCR: the Kim Hán Nôm API is used first (`api_mode: api_first`, the
+  guideline's ưu tiên). Once the quota (25/min, 50/h, 200/day, 600/week) is
+  exhausted or the API cannot serve a page, the pipeline switches to the
+  local PP-OCRv5/PaddleOCR-VL models; those results are written to
+  `data/ocr/<book>/local_fallback/<page>.json` so they never clash with the
+  API-handled files in `data/ocr/<book>/`. `load_result` prefers the
+  API-handled file and falls back to the local fallback file. Local-only
+  runs remain available via `api_mode: local_only`.
+- QN OCR: Vintern-1B-v2 (Vietnamese-native VLM) is primary. benchmark on
+  pages 11/41 gave near-perfect transcription of the archaic spelling,
+  ~35 s/page, peak 2.3 GB VRAM (RTX 4060, 8 GB). Forces 1 full-page box
+  per image (guideline p.12 allows one box per page). The Kim Hán Nôm API
+  is Hán/Nôm-only and must not receive QN pages.
+- PaddleOCR's latin/ch models are not used for QN anymore; they drop
+  Vietnamese tone marks systematically (128 distinct affected tokens in
+  Book 3, e.g. `dēn` for `đến`, `muōn` for `muốn`).
 - The API token is read from `KIMHANNOM_TOKEN` (`.env` is supported and is
   never packaged).
 - The API client is single-threaded, caches by image SHA-256, applies
   exponential backoff, and records a quota ledger for the documented
   25/minute, 50/hour, 200/day, 600/week limits.
-- Multiple accounts are not used to bypass quota.
+- Multiple accounts are not used to bypass quota. When the quota is reached,
+  the pipeline falls back to local models for the remaining Nôm pages
+  instead of stalling or exceeding the limits.
 - No token, model weight, confidential PDF, `data/`, or `artifacts/`
   directory enters `source.zip`.
 
@@ -235,14 +248,18 @@ review; drafts are never used as evidence.
 ## Environment used for verification
 
 - Windows 11, Python 3.13.9 (`D:\anaconda3\python.exe`), 15.7 GB RAM.
-- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (unused: paddlepaddle ships CPU-only
-  Windows wheels).
-- Local OCR: paddlepaddle 3.3.1, paddleocr 3.7.0 (+ opencv-contrib-python
-  4.10.0.84). paddlex defaults to oneDNN run mode, which crashes on this
-  host (`pir::ArrayAttribute<pir::DoubleAttribute>` on the PIR path); the
-  local adapter forces `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false` and uses
-  PP-OCRv5 mobile det/rec models. PyYAML stays at the pinned 6.0.3
+- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (used by Vintern-1B-v2 for QN OCR).
+- Local OCR (Nôm draft + geometry): paddlepaddle 3.3.1, paddleocr 3.7.0
+  (+ opencv-contrib-python 4.10.0.84). paddlex defaults to oneDNN run mode,
+  which crashes on this host (`pir::ArrayAttribute<pir::DoubleAttribute>` on
+  the PIR path); the local adapter forces `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false`
+  and uses PP-OCRv5 mobile det/rec. PyYAML stays at the pinned 6.0.3
   (paddlex 3.7.2 requests 6.0.2).
+- Vintern-1B-v2 (QN primary): torch 2.14.1+cu126, torchvision 0.29.1+cu126
+  (install via `--index-url https://download.pytorch.org/whl/cu126`),
+  transformers 4.46.3 (5.x incompatible), einops 0.8.2, timm 1.0.31,
+  accelerate 1.15.0. A no-op `flash_attn` shim exists in site-packages; the
+  stock model config sets `use_flash_attn=False`.
 - PyMuPDF 1.28.2, NumPy 2.2.6, SciPy 1.16.3, Pillow 12.3.0,
   pandas 2.3.3, openpyxl 3.1.5, PyYAML 6.0.3, pydantic 2.12.4,
   Typer 0.20.0, Rich 14.2.0, Streamlit 1.51.0, pytest 8.4.2.

@@ -9,9 +9,10 @@ The shared Entry/v1 schema (verified against the 2026-11-04 drop) is::
 
 The reader also accepts the common flat spelling variants and ignores
 records it cannot interpret. Malformed lines are counted, not turned into
-invented senses. Only ``kind == "char"`` records whose head is a single
-code point and whose script is Han/Nôm are indexed, because the review
-and red rules are per character.
+invented senses. Char records whose head is a single code point and whose
+script is Han/Nôm are indexed for per-character lookups; word records and
+``forms`` spellings (e.g. Nôm spellings on a QN head in dnqatv) are indexed
+separately so they are not silently discarded.
 """
 
 from __future__ import annotations
@@ -27,6 +28,17 @@ CHAR_KEYS = ("char", "character", "han", "han_char", "nom", "word", "headword", 
 READING_KEYS = ("reading", "readings", "pronunciation", "pinyin", "vietnamese", "am")
 DEFINITION_KEYS = ("definition", "definitions", "meaning", "gloss", "vi", "definition_vi", "explanation")
 INDEXED_SCRIPTS = {"han", "nom"}
+# Entry/v1 allowed values (Mô tả dữ liệu v1, §Quy tắc kiểm tra).
+ALLOWED_KINDS = {"char", "word"}
+ALLOWED_SCRIPTS = {"han", "nom", "qn", "kana", "hangul", "latin", "other"}
+ALLOWED_SYSTEMS = {"qn", "hv", "nom", "pinyin", "jyutping", "on", "kun", "hangul", "other"}
+# Only these systems count as Quốc ngữ phonetic evidence ("Không suy đoán").
+QN_SYSTEMS = {"qn", "hv", "nom"}
+_VS_RANGES = ((0xFE00, 0xFE0F), (0xE0100, 0xE01EF))
+
+
+def _strip_vs(text: str) -> str:
+    return "".join(ch for ch in text if not any(lo <= ord(ch) <= hi for lo, hi in _VS_RANGES))
 
 
 def _first(record: dict[str, Any], keys: Iterable[str]) -> Any:
@@ -49,18 +61,34 @@ def _flatten(value: Any) -> str:
 
 
 def _readings(record: dict[str, Any]) -> str:
+    text, _systems = _readings_structured(record)
+    return text
+
+
+def _readings_structured(record: dict[str, Any]) -> tuple[str, list[str]]:
+    """Join only QN-usable systems (qn/hv/nom); missing system ⇒ qn per spec."""
     readings = record.get("readings")
     if isinstance(readings, list):
         values: list[str] = []
+        systems: list[str] = []
         for item in readings:
             if isinstance(item, dict):
                 value = item.get("value") or item.get("text") or item.get("pinyin")
-                if value:
-                    values.append(str(value))
+                if not value:
+                    continue
+                system = str(item.get("system") or "qn").strip().casefold() or "qn"
+                if system not in QN_SYSTEMS:
+                    continue
+                values.append(str(value))
+                if system not in systems:
+                    systems.append(system)
             elif isinstance(item, str):
                 values.append(item)
-        return ", ".join(dict.fromkeys(values))
-    return _flatten(_first(record, READING_KEYS))
+                if "qn" not in systems:
+                    systems.append("qn")
+        return ", ".join(dict.fromkeys(values)), systems
+    flat = _flatten(_first(record, READING_KEYS))
+    return flat, (["qn"] if flat else [])
 
 
 def _definition(record: dict[str, Any]) -> str:
@@ -84,18 +112,30 @@ class JsonlDictionary:
         self.skipped_non_char = 0
         self.skipped_script = 0
         self.skipped_multi = 0
+        self.skipped_unencoded = 0
+        self.duplicate_ids = 0
+        self.invalid_freq = 0
+        self.invalid_enum = 0
+        self._seen_ids: set[str] = set()
         self._index: dict[str, list[Sense]] | None = None
+        self._word_index: dict[str, list[Sense]] | None = None
 
     def available(self) -> bool:
         return self.path.exists()
 
     def _load(self) -> dict[str, list[Sense]]:
+        index, _words = self._load_all()
+        return index
+
+    def _load_all(self) -> tuple[dict[str, list[Sense]], dict[str, list[Sense]]]:
         if self._index is not None:
-            return self._index
+            return self._index, self._word_index or {}
         index: dict[str, list[Sense]] = {}
+        word_index: dict[str, list[Sense]] = {}
         if not self.path.exists():
             self._index = index
-            return index
+            self._word_index = word_index
+            return index, word_index
         with self.path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -109,34 +149,104 @@ class JsonlDictionary:
                 if not isinstance(record, dict):
                     self.malformed += 1
                     continue
+                # Entry/v1 validation (counts, never raises).
+                rec_id = record.get("id")
+                if isinstance(rec_id, str) and rec_id:
+                    if rec_id in self._seen_ids:
+                        self.duplicate_ids += 1
+                    else:
+                        self._seen_ids.add(rec_id)
+                freq = record.get("freq")
+                if freq is not None and (not isinstance(freq, int) or freq < 0 or freq > 1000):
+                    self.invalid_freq += 1
+                kind = record.get("kind")
+                script = record.get("script")
+                if isinstance(kind, str) and kind not in ALLOWED_KINDS:
+                    self.invalid_enum += 1
+                if isinstance(script, str) and script not in ALLOWED_SCRIPTS:
+                    self.invalid_enum += 1
+                if isinstance(record.get("readings"), list):
+                    for item in record["readings"]:
+                        if isinstance(item, dict):
+                            sys_ = item.get("system")
+                            if isinstance(sys_, str) and sys_ not in ALLOWED_SYSTEMS:
+                                self.invalid_enum += 1
+                if record.get("unencoded") is True:
+                    self.skipped_unencoded += 1
+                    continue
                 raw_char = _first(record, CHAR_KEYS)
                 if not isinstance(raw_char, str) or not raw_char:
                     self.malformed += 1
                     continue
-                raw_char = unicodedata.normalize("NFC", raw_char)
-                # Only index single code points because the review/red rules
-                # are per character.
-                if len(raw_char) != 1:
-                    self.skipped_multi += 1
-                    continue
-                kind = record.get("kind")
-                if isinstance(kind, str) and kind != "char":
-                    self.skipped_non_char += 1
-                    continue
-                script = record.get("script")
-                if isinstance(script, str) and script and script not in INDEXED_SCRIPTS:
-                    self.skipped_script += 1
-                    continue
+                head = unicodedata.normalize("NFC", raw_char)
+                reading_text, systems = _readings_structured(record)
                 sense = Sense(
                     source=str(record.get("source", self.name)),
                     definition=_definition(record),
-                    reading=_readings(record),
+                    reading=reading_text,
                     gloss=_flatten(record.get("gloss", "")),
                     raw=record,
+                    systems=tuple(systems),
+                    kind=str(kind) if isinstance(kind, str) else "",
+                    head=head,
                 )
-                index.setdefault(raw_char, []).append(sense)
+
+                def _index_head(h: str) -> None:
+                    base = _strip_vs(h)
+                    if kind == "word" or len(base) != 1:
+                        word_index.setdefault(h, []).append(sense)
+                    else:
+                        index.setdefault(h, []).append(sense)
+
+                # Primary head: han/nom char → per-char index; word → word index.
+                if isinstance(script, str) and script and script not in INDEXED_SCRIPTS and script != "qn":
+                    # kana/hangul/latin/other heads are not Han/Nôm evidence.
+                    self.skipped_script += 1
+                    continue
+                if script == "qn":
+                    # QN head: do not index the QN spelling itself as a Nom char.
+                    # Its Nom spelling lives in `forms` below.
+                    pass
+                elif kind == "char":
+                    base = _strip_vs(head)
+                    if len(base) != 1:
+                        self.skipped_multi += 1
+                        continue
+                    index.setdefault(head, []).append(sense)
+                elif kind == "word":
+                    word_index.setdefault(head, []).append(sense)
+                else:
+                    # Unknown kind: treat single-code-point han/nom as char.
+                    if script in INDEXED_SCRIPTS and len(_strip_vs(head)) == 1:
+                        index.setdefault(head, []).append(sense)
+                    else:
+                        self.skipped_non_char += 1
+                        continue
+                # forms: alternate spellings. For a QN head these are Nom
+                # spellings and round-trip to the per-char index.
+                forms = record.get("forms")
+                if isinstance(forms, list):
+                    for form in forms:
+                        if not isinstance(form, dict):
+                            continue
+                        ftext = form.get("text")
+                        if not isinstance(ftext, str) or not ftext:
+                            continue
+                        ftext = unicodedata.normalize("NFC", ftext)
+                        if len(_strip_vs(ftext)) == 1:
+                            index.setdefault(ftext, []).append(sense)
+                        else:
+                            word_index.setdefault(ftext, []).append(sense)
         self._index = index
-        return index
+        self._word_index = word_index
+        return index, word_index
 
     def lookup(self, char: str) -> list[Sense]:
         return list(self._load().get(char, []))
+
+    def lookup_word(self, head: str) -> list[Sense]:
+        _idx, words = self._load_all()
+        # Single-code-point heads live in the char index; word heads here.
+        if len(_strip_vs(head)) == 1:
+            return list(self._load().get(head, []))
+        return list(words.get(head, []))

@@ -15,7 +15,7 @@ text_diff:
   # Unknown readings are routed to review, never auto-red.
   unknown_policy: review
   require_dictionary_for_black: false
-  strip_diacritics_for_reading_match: true
+  strip_diacritics_for_reading_match: false
   proper_name_max_chars: 12
   proper_name_max_syllables: 12
 

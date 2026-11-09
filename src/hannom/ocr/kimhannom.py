@@ -440,6 +440,30 @@ class KimHanNomClient(OCREngine):
             items = details["details"]
             if len(items) == len(texts):
                 difficulty = [item.get("difficult") if isinstance(item, dict) else None for item in items]
+        # image-rec fallback: guideline requires fixing invalid boxes via
+        # image-rec on cropped lines. A full-page image-rec re-run recovers
+        # recognition when image-ocr boxes are missing/invalid.
+        needs_rec = (
+            len(texts) != len(boxes)
+            or (texts and not boxes)
+            or (bool(texts) and len([t for t in texts if t]) > len([b for b in boxes if b is not None]) * 2)
+        )
+        if needs_rec and ocr_id != 3:
+            try:
+                rec = self.recognize(
+                    file_name,
+                    page.sha256,
+                    ocr_id=ocr_id,
+                    lang_type=lang_type,
+                    reading_direction=reading_direction,
+                )
+                r_texts, r_boxes, r_confs = self._extract_boxes(rec.data)
+                if r_texts and r_boxes and len(r_texts) >= len(texts):
+                    texts, boxes, confidences = r_texts, r_boxes, r_confs
+                    warnings.append("IMAGE_REC_FALLBACK")
+            except Exception as exc:  # noqa: BLE001 - fallback is best-effort
+                warnings.append(f"IMAGE_REC_FALLBACK_FAILED:{type(exc).__name__}")
+
         lines: list[OCRLine] = []
         if len(texts) != len(boxes):
             warnings.append(f"OCR_TEXT_BBOX_COUNT_MISMATCH:{len(texts)}:{len(boxes)}")
