@@ -17,6 +17,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from ..labels import points_to_quad
 from ..models import OCRLine, OCRResult, PageRecord
 from ..state import State, utc_now
 from .base import OCREngine, OCRUnavailable
-from .quota import QuotaLedger
+from .quota import QuotaExceeded, QuotaLedger
 
 
 class KimHanNomError(RuntimeError):
@@ -102,6 +103,54 @@ class KimHanNomClient(OCREngine):
         )
         return self._session
 
+    def _check_quota(self) -> None:
+        """Raise QuotaExceeded, or (wait_on_quota) sleep until a call is allowed."""
+        while True:
+            try:
+                self.ledger.check()
+                return
+            except QuotaExceeded as exc:
+                if not self.project.api.wait_on_quota:
+                    raise
+                wait = max(1.0, float(exc.retry_after)) + 5.0
+                resume = datetime.now() + timedelta(seconds=wait)
+                print(
+                    f"[kimhannom] {exc} -> waiting until {resume:%d/%m %H:%M} then resuming",
+                    flush=True,
+                )
+                time.sleep(wait)
+
+    def _prepare_upload(self, page: PageRecord) -> tuple[Path, str, int]:
+        """(image to upload, its sha256, scale). scale > 1 uploads an enlarged copy.
+
+        The enlarged copy is deterministic and keyed by the original page
+        hash, so caches stay valid and reruns never re-upload it.
+        """
+        scale = max(1, int(self.project.api.upscale))
+        if scale == 1:
+            return Path(page.path), page.sha256, 1
+        out = self.project.data_dir / "ocr" / "api_upscaled" / f"{page.sha256}_x{scale}.jpg"
+        if not out.exists():
+            from PIL import Image
+
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(page.path) as img:
+                rgb = img.convert("RGB")
+                big = rgb.resize((rgb.width * scale, rgb.height * scale), Image.LANCZOS)
+            tmp = out.with_suffix(".tmp.jpg")
+            big.save(tmp, quality=95)
+            tmp.replace(out)
+        return out, hashlib.sha256(out.read_bytes()).hexdigest(), scale
+
+    def _page_layout(self, file_name: str, image_sha256: str) -> dict[str, Any]:
+        """Page layout for image-ocr: from structure-classification, or fixed."""
+        if self.project.api.classify:
+            return self.classify(file_name, image_sha256).data
+        return {
+            "ocr_id": self.project.api.fixed_ocr_id,
+            "reading_direction": self.project.api.fixed_reading_direction,
+        }
+
     def _cache_key(self, endpoint: str, image_sha256: str, params: dict[str, Any]) -> str:
         payload = json.dumps({"endpoint": endpoint, "image": image_sha256, "params": params}, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -174,7 +223,7 @@ class KimHanNomClient(OCREngine):
         url = f"{self.project.api.base_url}/api/web/clc-sinonom/{endpoint}"
         last_error: Exception | None = None
         for attempt in range(1, self.project.api.max_retries + 1):
-            self.ledger.check()
+            self._check_quota()
             wait = self.ledger.seconds_until_allowed()
             if wait > 0:
                 time.sleep(min(wait, self.project.api.min_delay_seconds * 2))
@@ -400,16 +449,16 @@ class KimHanNomClient(OCREngine):
     def recognize_page(self, page: PageRecord, script: str) -> OCRResult:
         if not self.is_available():
             raise OCRUnavailable(f"Kim Hán Nôm unavailable: set {self.project.api.token_env}")
-        file_name = self.upload(page.path, page.sha256)
+        upload_path, upload_sha, scale = self._prepare_upload(page)
+        file_name = self.upload(upload_path, upload_sha)
         try:
-            classification = self.classify(file_name, page.sha256)
-            cdata = classification.data
+            cdata = self._page_layout(file_name, upload_sha)
             ocr_id = int(cdata.get("ocr_id", 1) or 1)
             lang_type = 2 if script == "nom" else 1
             reading_direction = int(cdata.get("reading_direction", 1) or 1)
             response = self.ocr(
                 file_name,
-                page.sha256,
+                upload_sha,
                 ocr_id=ocr_id,
                 lang_type=lang_type,
                 reading_direction=reading_direction,
@@ -417,15 +466,14 @@ class KimHanNomClient(OCREngine):
         except ApiBusinessError:
             # A cached server-side file_name can expire. Re-upload exactly
             # once, then let a second business error surface unchanged.
-            file_name = self.upload(page.path, page.sha256, force=True)
-            classification = self.classify(file_name, page.sha256)
-            cdata = classification.data
+            file_name = self.upload(upload_path, upload_sha, force=True)
+            cdata = self._page_layout(file_name, upload_sha)
             ocr_id = int(cdata.get("ocr_id", 1) or 1)
             lang_type = 2 if script == "nom" else 1
             reading_direction = int(cdata.get("reading_direction", 1) or 1)
             response = self.ocr(
                 file_name,
-                page.sha256,
+                upload_sha,
                 ocr_id=ocr_id,
                 lang_type=lang_type,
                 reading_direction=reading_direction,
@@ -452,7 +500,7 @@ class KimHanNomClient(OCREngine):
             try:
                 rec = self.recognize(
                     file_name,
-                    page.sha256,
+                    upload_sha,
                     ocr_id=ocr_id,
                     lang_type=lang_type,
                     reading_direction=reading_direction,
@@ -478,6 +526,10 @@ class KimHanNomClient(OCREngine):
             except ValueError as exc:
                 warnings.append(f"BBOX_INVALID:{exc}")
                 continue
+            if scale != 1:
+                # Boxes come back in the enlarged image; map them onto the
+                # original page image that is labelled and submitted.
+                quad = tuple((x / scale, y / scale) for x, y in quad)
             confidence = confidences[index] if index < len(confidences) else None
             line_difficult = difficulty[index] if difficulty is not None else None
             lines.append(
@@ -492,6 +544,6 @@ class KimHanNomClient(OCREngine):
             image_sha256=page.sha256,
             engine=self.name,
             lines=lines,
-            raw=response.raw,
+            raw={**(response.raw or {}), "upload_scale": scale, "classified": bool(self.project.api.classify)},
             warnings=sorted(set(warnings)),
         )

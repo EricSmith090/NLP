@@ -64,6 +64,20 @@ class ApiSettings:
     timeout_seconds: float = 120.0
     max_retries: int = 3
     cache_dir: Path = Path("data/ocr/api_cache")
+    # When a quota window (minute/hour/day/week) is full: False = stop the run
+    # (original behaviour), True = sleep until the window frees up, then go on.
+    wait_on_quota: bool = False
+    # Call structure-classification before image-ocr (1 extra call per page).
+    # False = skip it and use the fixed layout below (known printed vertical
+    # Nôm books), saving one quota call per page.
+    classify: bool = True
+    fixed_ocr_id: int = 1
+    fixed_reading_direction: int = 1
+    # Upload the page enlarged by this integer factor (1 = original image).
+    # Small, faint scans OCR better at 2x (tested 2026-11-11 on Tap2 p277:
+    # 3 dropped characters recovered). Boxes are scaled back to the original
+    # image, so Label.txt always matches the submitted JPG.
+    upscale: int = 1
 
 
 @dataclass(frozen=True)
@@ -167,6 +181,11 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
         timeout_seconds=float(api_raw.get("timeout_seconds", 120.0)),
         max_retries=int(api_raw.get("max_retries", 3)),
         cache_dir=_resolve(root, str(api_raw.get("cache_dir", "data/ocr/api_cache"))),
+        wait_on_quota=bool(api_raw.get("wait_on_quota", False)),
+        classify=bool(api_raw.get("classify", True)),
+        fixed_ocr_id=int(api_raw.get("fixed_ocr_id", 1)),
+        fixed_reading_direction=int(api_raw.get("fixed_reading_direction", 1)),
+        upscale=max(1, int(api_raw.get("upscale", 1))),
     )
 
     return ProjectConfig(
