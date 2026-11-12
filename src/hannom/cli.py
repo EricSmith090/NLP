@@ -162,6 +162,9 @@ def charalign_cmd(
     lexicon: Optional[str] = typer.Option(None, "--lexicon", help="JSON {char: [readings]} confirmed by a human"),
     band: int = typer.Option(400, "--band", help="Alignment band in syllables around the page anchors"),
     layout: str = typer.Option("T1", "--layout", help="T1 = Nôm pages are read in decreasing page order"),
+    strip_text: Optional[str] = typer.Option(
+        None, "--strip-text", help="Comma-separated exact transcriptions to drop from the Nôm side (e.g. margin running heads)"
+    ),
     config: str = "configs/project.yaml",
     rebuild_readings: bool = typer.Option(False, "--rebuild-readings", help="Rebuild the dictionary readings cache"),
 ):
@@ -186,7 +189,12 @@ def charalign_cmd(
     confirmed = None
     if lexicon:
         confirmed = {k: set(v) for k, v in json.loads(Path(lexicon).read_text(encoding="utf-8")).items()}
-    result = align_book(nom_pages, qn_pages, readings, pairs, confirmed, band=band, layout=layout)
+    strip_texts = [
+        item.strip()
+        for item in (strip_text or "").split(",")
+        if item.strip()
+    ]
+    result = align_book(nom_pages, qn_pages, readings, pairs, confirmed, band=band, layout=layout, strip_texts=strip_texts)
     paths = write_outputs(result, Path(out), book_name or folder.name)
     stats = result.stats
     console.print(f"Nôm chars {stats['nom_chars']}, QN syllables {stats['qn_syllables']}, pairs {stats['pairs']}")

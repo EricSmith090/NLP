@@ -101,14 +101,16 @@ class Dropped:
     reason: str
 
 
-def clean_nom_pages(pages: Sequence[tuple[str, list[dict[str, Any]]]]) -> tuple[list[tuple[str, list[str]]], list[Dropped]]:
+def clean_nom_pages(pages: Sequence[tuple[str, list[dict[str, Any]]]], strip_texts: Sequence[str] = ()) -> tuple[list[tuple[str, list[str]]], list[Dropped]]:
     """Remove page numbers, running headers and low-confidence noise boxes.
 
     A running header (the book title printed in the margin, e.g. 所𥚇卷) is a
     short text that recurs on many pages *and* sits at the page edge (first
     or last box) nearly every time; a short phrase of the body text that
-    happens to repeat is kept.
+    happens to repeat is kept. ``strip_texts`` names exact transcriptions
+    that are known margin boxes for this book and are always dropped.
     """
+    strip = {unicodedata.normalize("NFC", t).strip() for t in strip_texts}
     occurrences: Counter[str] = Counter()
     at_edge: Counter[str] = Counter()
     for _, boxes in pages:
@@ -132,6 +134,8 @@ def clean_nom_pages(pages: Sequence[tuple[str, list[dict[str, Any]]]]) -> tuple[
             reason = None
             if not text:
                 reason = "empty"
+            elif strip and text in strip:
+                reason = "running_header"
             elif text in running:
                 reason = "running_header"
             elif all(c in CN_NUMERALS for c in text):
@@ -629,11 +633,12 @@ def align_book(
     confirmed_lexicon: dict[str, set[str]] | None = None,
     band: int = 400,
     layout: str = "T1",
+    strip_texts: Sequence[str] = (),
 ) -> BookResult:
     reverse_nom = layout.upper().startswith("T1")
     nom_pages = sorted(nom_pages, key=lambda p: page_number(p[0]), reverse=reverse_nom)
     qn_pages = sorted(qn_pages, key=lambda p: page_number(p[0]))
-    cleaned, dropped = clean_nom_pages(nom_pages)
+    cleaned, dropped = clean_nom_pages(nom_pages, strip_texts)
     nom, nom_starts = build_nom_stream(cleaned)
     stream_text, qn, qn_starts, markers = build_qn_stream(qn_pages)
     anchors = []
