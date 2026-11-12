@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -102,13 +103,101 @@ def ocr(
     engine: Optional[list[str]] = typer.Option(None, "--engine", help="Override engine list"),
     limit: Optional[int] = None,
     force: bool = False,
+    only: Optional[str] = typer.Option(
+        None, "--only", help="nom = only Nôm pages (ch/); qn = only Quốc ngữ pages (vi/intro/toc/ref)"
+    ),
+    wait_quota: bool = typer.Option(
+        False, "--wait-quota", help="When the Kim Hán Nôm quota is full, wait and resume instead of stopping"
+    ),
+    no_classify: bool = typer.Option(
+        False, "--no-classify", help="Skip structure-classification (saves 1 API call per page); use fixed layout"
+    ),
+    upscale: Optional[int] = typer.Option(
+        None, "--upscale", help="Upload pages enlarged N times to the API (boxes are mapped back)"
+    ),
 ):
     """Run local OCR; Kim Hán Nôm is only used if configured and available."""
+    if only not in (None, "nom", "qn"):
+        raise typer.BadParameter("--only must be 'nom' or 'qn'")
+    if upscale is not None and upscale < 1:
+        raise typer.BadParameter("--upscale must be >= 1")
     project = _project(config)
+    api_overrides: dict = {}
+    if wait_quota:
+        api_overrides["wait_on_quota"] = True
+    if no_classify:
+        api_overrides["classify"] = False
+    if upscale is not None:
+        api_overrides["upscale"] = upscale
+    if api_overrides:
+        project = replace(project, api=replace(project.api, **api_overrides))
     with open_state(project) as state:
         for item in _books(project, book):
-            results = stage_ocr(project, item, state, engines=engine, force=force, limit=limit)
+            pages = None
+            if only:
+                pages = filter_pages_by_script(state.pages(item.book_id), only)
+                if not pages:
+                    # run_book treats an empty list as "all pages"; never let
+                    # --only silently widen to the whole book.
+                    console.print(f"[yellow]{item.book_id}[/]: no {only} pages (run classify/map first?)")
+                    continue
+            results = stage_ocr(
+                project, item, state, engines=engine, force=force, limit=limit, pages=pages
+            )
             console.print(f"[green]{item.book_id}[/]: OCR results {len(results)}")
+
+
+@app.command("charalign")
+def charalign_cmd(
+    label_dir: str = typer.Option(..., "--label-dir", help="Book folder with ch/Label.txt, vi/Label.txt, *_image_map.json"),
+    out: str = typer.Option(..., "--out", help="Output folder (CSV + review files + stats.json)"),
+    book_name: Optional[str] = typer.Option(None, "--book-name", help="CSV file name (default: the folder name)"),
+    lexicon: Optional[str] = typer.Option(None, "--lexicon", help="JSON {char: [readings]} confirmed by a human"),
+    band: int = typer.Option(400, "--band", help="Alignment band in syllables around the page anchors"),
+    layout: str = typer.Option("T1", "--layout", help="T1 = Nôm pages are read in decreasing page order"),
+    config: str = "configs/project.yaml",
+    rebuild_readings: bool = typer.Option(False, "--rebuild-readings", help="Rebuild the dictionary readings cache"),
+):
+    """Character-level Nôm↔Quốc ngữ alignment with v2.1 text_diff (dịch âm books)."""
+    from .charalign import align_book, read_image_map, read_label_txt, write_outputs
+    from .dictionary.readings import load_readings
+
+    project = _project(config)
+    cfg = (project.dictionary_config or {}).get("dictionary", project.dictionary_config or {})
+    entries_dir = project.root / str(cfg.get("entries_dir", "dictionaries/entries"))
+    cache = project.data_dir / "dictionary" / "char_readings.json"
+    console.print(f"Dictionary readings: {cache} (source {entries_dir})")
+    readings = load_readings(entries_dir, cache, rebuild=rebuild_readings)
+    console.print(f"  characters with readings: {len(readings)}")
+
+    folder = Path(label_dir)
+    nom_pages = read_label_txt(folder / "ch" / "Label.txt")
+    vi_pages = read_label_txt(folder / "vi" / "Label.txt")
+    qn_pages = [(name, " ".join(str(b.get("transcription", "")) for b in boxes)) for name, boxes in vi_pages]
+    maps = sorted(folder.glob("*image_map.json"))
+    pairs = read_image_map(maps[0] if maps else None)
+    confirmed = None
+    if lexicon:
+        confirmed = {k: set(v) for k, v in json.loads(Path(lexicon).read_text(encoding="utf-8")).items()}
+    result = align_book(nom_pages, qn_pages, readings, pairs, confirmed, band=band, layout=layout)
+    paths = write_outputs(result, Path(out), book_name or folder.name)
+    stats = result.stats
+    console.print(f"Nôm chars {stats['nom_chars']}, QN syllables {stats['qn_syllables']}, pairs {stats['pairs']}")
+    console.print(f"Nôm only {stats['nom_only']}, QN only {stats['qn_only']}, dictionary coverage {stats['dictionary_coverage']}")
+    console.print(f"Score now: {stats['score_now']}")
+    console.print(f"Score if learned candidates confirmed: {stats['score_if_candidates_confirmed']}")
+    console.print(f"text_diff format problems: {stats['text_diff_problem_count']}")
+    for key, path in paths.items():
+        console.print(f"  {key}: {path}")
+
+
+OCR_FOLDERS_BY_SCRIPT = {"nom": {"ch"}, "qn": {"vi", "intro", "toc", "ref"}}
+
+
+def filter_pages_by_script(pages, only: str) -> list:
+    """Pages whose folder belongs to the requested script (nom/qn)."""
+    wanted = OCR_FOLDERS_BY_SCRIPT[only]
+    return [p for p in pages if str(p.folder) in wanted]
 
 
 @app.command()
