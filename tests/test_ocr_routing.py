@@ -343,7 +343,7 @@ def test_load_result_prefers_api_file_over_local_fallback(tmp_path: Path):
             book_id="T1_Test",
             page_no=1,
             image_name="Test.001.jpg",
-            image_sha256="0" * 64,
+            image_sha256=f"{1:064d}",
             engine=engine,
             lines=[
                 OCRLine(

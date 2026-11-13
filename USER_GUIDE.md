@@ -86,6 +86,17 @@ python tools/build_updated_pdf.py --all
 
 `hannom ocr` prints per-page progress (`[book] OCR i/N`) and caches results in `data/ocr/<book>/<page>.json`; reruns resume unless `--force`. `pilot` stops with `status=blocked_ocr` if no engine is available rather than fabricating later stages.
 
+**OCR honesty notes (Verify-C fixes, 2026-11-13):**
+
+- The quota ledger records the server's **business code** per call (`api_calls.business_code`, e.g. `000000` / `000108`) — failed attempts still count toward the windows, deliberately (conservative). Every call, including HTTP-200 business failures, is now distinguishable offline.
+- `_success_code` is strict: only the string `"000000"` passes. `0`, `False`, `"0"`, `null` are failures.
+- Cache-hit results **re-promote** warnings into `pages.review_flags` automatically (`ENGINE_UNAVAILABLE` carries a reason: `no_token` / `import_error` / `quota`; also `IMAGE_REC_FALLBACK`, `API_CLASSIFIED_NOT_SINO_NOM`, `OCR_ROUTING_UNKNOWN_MODE`, `OCR_LINE_WITHOUT_BBOX`).
+- **After any re-bin** (`BIN_OVERRIDE_*`, `inventory_*` changes), label bins are stale — re-run `python -m hannom.cli labels [--book <id>]`. Nothing else tracks this dependency.
+- `image-rec` is used only as the documented cropped-line recovery; a full-page re-run path stays reachable but is flagged; image-ocr payloads no longer persist `result_image_base64` going forward (existing `data/ocr/api_cache/` payloads keep it — ~92 MB of base64 page images; delete it only if you understand what it is).
+- `--no-classify` skips `structure-classification` losslessly for this fixed-layout corpus (183/183 evidence) and saves 264 calls on Tap2 (`python -m hannom.cli ocr --only nom --no-classify --wait-quota`, effective from the W47 rollover 2026-11-16).
+- `difficult` is dead weight (always `false`); `ensemble` config was removed. Vintern is pinned to a fixed model revision (`c3f01cf…c8bc`) with a per-call wall-clock watchdog (`max_time_seconds=300`).
+
+
 ## 6. Review
 
 - `python -m hannom.cli review --book <id>` launches the local Streamlit app (port 8501). Only flagged rows leave automation: `DICT_MISS`, `DIFF_SEMANTIC`, `OCR_ENGINE_DISAGREE`, `ALIGN_LOW_CONF`, etc. (see `docs/review_guide.md`).
@@ -116,7 +127,9 @@ python tools/build_updated_pdf.py --all
 | `No OCR engine available / blocked_ocr` | Check `python -c "import torch; print(torch.cuda.is_available())"` (Vintern needs CUDA), `KIMHANNOM_TOKEN` in `.env`, `python -m pytest -q`. |
 | `Refusing to call Kim Hán Nôm without --allow-api` (benchmark) | `tools/benchmark_ocr.py` now defaults to local engines; pass `--engine kimhannom --allow-api` explicitly for API. |
 | `image-ocr` invalid boxes | `KimHanNomClient` now falls back to `image-rec` once and records `IMAGE_REC_FALLBACK`. |
-| `QuotaExceeded` / slow OCR | 25/min, 50/h, 200/day, 600/week. In `api_mode: api_first` the pipeline switches to local models automatically once the quota is reached (results go to `data/ocr/<book>/local_fallback/`). Wait or resume later; cache prevents repeat calls. |
+| `QuotaExceeded` / slow OCR | 25/min, 50/h, 200/day, 600/week. In `api_mode: api_first` the pipeline switches to local models automatically once the quota is reached (results go to `data/ocr/<book>/local_fallback/`). Wait or resume later; cache prevents repeat calls. Every attempt (incl. business failures) records `business_code` — count all rows, not just `http_200`. |
+| `Label.txt` stale / missing after re-bin | `python -m hannom.cli labels --book <id>` — label bins are one-shot and not rebuilt by classification/re-bin steps. Check `fileState.txt` lines are all `1` afterwards. |
+| `ocr_confidence is NULL` in DB for OCR'd pages | The 2026-11-13 re-sync populated the 51 affected pages (50 SLQ + Tap1 p147); new cache hits promote flags/confidences automatically — re-run `hannom labels`/review queries after any migration. |
 | Similarity FAIL | See `data/evaluation/<book>/metrics.json`. Many FAILs are `DIFF_UNVERIFIED` rows awaiting review — open the review app. |
 | `SOURCE_MISSING USER_GUIDE.md` | `USER_GUIDE.md` is included in `source.zip` by `build_source_zip`; ensure the file exists in the repo root before packaging. |
 

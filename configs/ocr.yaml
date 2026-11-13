@@ -38,4 +38,3 @@ routing:
     low_confidence_threshold: 0.75
     agreement_threshold: 0.85
   api_mode: api_first
-  max_pages_per_api_batch: 12

@@ -1,7 +1,14 @@
 """Rolling-window quota ledger for the Kim Hán Nôm API.
 
-The API manual gives 25/minute, 50/hour, 200/day, 600/week. We enforce all
-four windows locally and also enforce a minimum delay between requests.
+The API manual lists 25/minute, 50/hour, 200/day, 600/week and labels the
+table "Giới hạn số lượt gọi (website)" — the v2.1 guideline (p.4) applies the
+same numbers to direct API calls ("Khi gọi trực tiếp qua API … Giới hạn trên
+website"). We enforce all four windows locally and a minimum delay between
+requests. Every attempt is recorded, including business failures: the
+`business_code` column holds the server's business code (e.g. "000000",
+"000108"); failed attempts count toward the limits (conservative, by
+decision). Rows dated in the future (>5 min past now) are treated as absent
+by every window count.
 """
 
 from __future__ import annotations
@@ -10,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Mapping
 
-from ..state import State, iso, utc_now
+from ..state import State, utc_now
 
 
 class QuotaExceeded(RuntimeError):
@@ -27,15 +34,6 @@ class QuotaSnapshot:
     day: int
     week: int
     limits: Mapping[str, int]
-
-    def to_dict(self) -> dict[str, int]:
-        return {
-            "minute": self.minute,
-            "hour": self.hour,
-            "day": self.day,
-            "week": self.week,
-            **{f"limit_{k}": v for k, v in self.limits.items()},
-        }
 
 
 WINDOWS = {
@@ -60,7 +58,7 @@ class QuotaLedger:
     def snapshot(self, now: datetime | None = None) -> QuotaSnapshot:
         now = now or utc_now()
         counts = {
-            name: self.state.count_api_calls(now - timedelta(seconds=seconds))
+            name: self.state.count_api_calls(now - timedelta(seconds=seconds), until=now)
             for name, seconds in WINDOWS.items()
         }
         return QuotaSnapshot(
@@ -74,13 +72,13 @@ class QuotaLedger:
     def seconds_until_allowed(self, now: datetime | None = None) -> float:
         now = now or utc_now()
         waits = [0.0]
-        last = self.state.last_api_call()
+        last = self.state.last_api_call(until=now)
         if last is not None:
             waits.append(max(0.0, (last + timedelta(seconds=self.min_delay_seconds) - now).total_seconds()))
         for name, seconds in WINDOWS.items():
             limit = self.limits[name]
             since = now - timedelta(seconds=seconds)
-            rows = self.state.api_calls_since(since)
+            rows = self.state.api_calls_since(since, until=now)
             if len(rows) >= limit:
                 # The oldest call in this window must age out.
                 oldest = datetime.fromisoformat(rows[0]["requested_at"])
@@ -111,6 +109,7 @@ class QuotaLedger:
         status: str,
         response_path: str | None = None,
         note: str | None = None,
+        business_code: str | None = None,
         now: datetime | None = None,
     ) -> None:
         self.state.log_api_call(
@@ -119,8 +118,6 @@ class QuotaLedger:
             status=status,
             response_path=response_path,
             note=note,
+            business_code=business_code,
             requested_at=now or utc_now(),
         )
-
-    def validate_ledger_timestamp(self, dt: datetime) -> str:
-        return iso(dt)

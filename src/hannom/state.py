@@ -17,7 +17,11 @@ from typing import Any, Iterator
 
 from .models import PageRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Rows dated more than this far in the future are treated as absent from
+# every rolling window (clock skew guard; see D6 / §13.1 of verify-C-ocr.md).
+FUTURE_TOLERANCE = timedelta(minutes=5)
 
 
 class StateError(RuntimeError):
@@ -60,7 +64,8 @@ CREATE TABLE IF NOT EXISTS api_calls (
     response_path TEXT,
     quota_day TEXT,
     quota_week TEXT,
-    note TEXT
+    note TEXT,
+    business_code TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_api_calls_time ON api_calls(requested_at);
 
@@ -147,9 +152,14 @@ class State:
                 f"state DB at {self.path} has user_version={version}, newer than "
                 f"SCHEMA_VERSION={SCHEMA_VERSION}; upgrade the pipeline instead of opening it"
             )
-        # CREATE TABLE IF NOT EXISTS keeps a valid v1 database untouched; a
-        # brand-new file (user_version=0) gets the schema stamped with v1.
+        # CREATE TABLE IF NOT EXISTS keeps a valid current-version database
+        # untouched; a brand-new file (user_version=0) gets the schema
+        # stamped directly. v1 -> v2 adds api_calls.business_code (D5).
         with self.tx() as c:
+            if version == 1:
+                cols = {row[1] for row in c.execute("PRAGMA table_info(api_calls)")}
+                if "business_code" not in cols:
+                    c.execute("ALTER TABLE api_calls ADD COLUMN business_code TEXT")
             c.executescript(SCHEMA)
             c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -357,15 +367,21 @@ class State:
         response_path: str | None = None,
         token_id: str | None = None,
         note: str | None = None,
+        business_code: str | None = None,
         requested_at: datetime | None = None,
     ) -> None:
         dt = requested_at or utc_now()
+        if dt > utc_now() + FUTURE_TOLERANCE:
+            raise StateError(
+                f"api_calls.requested_at is {iso(dt)}, in the future beyond "
+                f"{FUTURE_TOLERANCE} tolerance; refusing to record a skewed row"
+            )
         with self.tx() as c:
             c.execute(
                 """INSERT INTO api_calls
                 (endpoint, image_sha256, token_id, requested_at, status,
-                 response_path, quota_day, quota_week, note)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
+                 response_path, quota_day, quota_week, note, business_code)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
                     endpoint,
                     image_sha256,
@@ -378,32 +394,48 @@ class State:
                     # weekly quota audits remain readable and sortable.
                     f"{dt.isocalendar().year}-W{dt.isocalendar().week:02d}",
                     note,
+                    business_code,
                 ),
             )
 
-    def count_api_calls(self, since: datetime, endpoint: str | None = None) -> int:
+    def count_api_calls(
+        self, since: datetime, endpoint: str | None = None, until: datetime | None = None
+    ) -> int:
         sql = "SELECT COUNT(*) AS n FROM api_calls WHERE requested_at >= ?"
         args: list[Any] = [iso(since)]
         if endpoint:
             sql += " AND endpoint=?"
             args.append(endpoint)
+        if until is not None:
+            sql += " AND requested_at <= ?"
+            args.append(iso(until))
         return int(self._conn.execute(sql, args).fetchone()["n"])
 
-    def last_api_call(self, endpoint: str | None = None) -> datetime | None:
-        sql = "SELECT requested_at FROM api_calls"
+    def last_api_call(
+        self, endpoint: str | None = None, until: datetime | None = None
+    ) -> datetime | None:
+        sql = "SELECT requested_at FROM api_calls WHERE 1=1"
         args: list[Any] = []
         if endpoint:
-            sql += " WHERE endpoint=?"
+            sql += " AND endpoint=?"
             args.append(endpoint)
+        if until is not None:
+            sql += " AND requested_at <= ?"
+            args.append(iso(until))
         sql += " ORDER BY requested_at DESC LIMIT 1"
         row = self._conn.execute(sql, args).fetchone()
         return datetime.fromisoformat(row["requested_at"]) if row else None
 
-    def api_calls_since(self, since: datetime) -> list[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT * FROM api_calls WHERE requested_at >= ? ORDER BY requested_at",
-            (iso(since),),
-        ).fetchall()
+    def api_calls_since(
+        self, since: datetime, until: datetime | None = None
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM api_calls WHERE requested_at >= ?"
+        args: list[Any] = [iso(since)]
+        if until is not None:
+            sql += " AND requested_at <= ?"
+            args.append(iso(until))
+        sql += " ORDER BY requested_at"
+        return self._conn.execute(sql, args).fetchall()
 
     def add_review(
         self,

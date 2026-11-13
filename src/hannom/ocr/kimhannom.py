@@ -43,9 +43,23 @@ class ApiBusinessError(KimHanNomError):
 
 
 def _success_code(value: Any) -> bool:
-    # The manual documents the string "000000"; accept the integer zero some
-    # deployments return, but do not guess arbitrary success values.
-    return value == "000000" or value == 0
+    # The manual documents exactly one success value: the string "000000".
+    # Anything else (integer 0, boolean False, "0", null, ...) is a failure.
+    return value == "000000"
+
+
+# Keys the Vintern/server responses embed but downstream stages must never
+# persist: a full base64-encoded image. They are stripped on save.
+_SCRUBBED_KEYS = ("result_image_base64",)
+
+
+def scrub_server_payload(obj: Any) -> Any:
+    """Recursively strip keys listed in ``_SCRUBBED_KEYS`` from a payload."""
+    if isinstance(obj, dict):
+        return {k: scrub_server_payload(v) for k, v in obj.items() if k not in _SCRUBBED_KEYS}
+    if isinstance(obj, list):
+        return [scrub_server_payload(item) for item in obj]
+    return obj
 
 
 @dataclass
@@ -64,25 +78,27 @@ class KimHanNomClient(OCREngine):
         project: ProjectConfig,
         state: State,
         token: str | None = None,
-        token_id: str | None = None,
     ):
         self.project = project
         self.state = state
         self.token = token or os.environ.get(project.api.token_env, "")
-        self.token_id = token_id or (hashlib.sha256(self.token.encode()).hexdigest()[:8] if self.token else None)
         self.ledger = QuotaLedger(state, project.api.limits, project.api.min_delay_seconds)
         self.cache_dir = project.api.cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._session = None
 
     def is_available(self) -> bool:
+        return self.unavailability_reason() == "available"
+
+    def unavailability_reason(self) -> str:
+        """Why the client cannot serve pages: available|no_token|import_error."""
         if not self.token:
-            return False
+            return "no_token"
         try:
             import requests  # noqa: F401
         except ImportError:
-            return False
-        return True
+            return "import_error"
+        return "available"
 
     def _get_session(self):
         if self._session is not None:
@@ -162,13 +178,21 @@ class KimHanNomClient(OCREngine):
         path = self._cache_path(key)
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return ApiResponse(
-            endpoint=data["endpoint"],
-            data=data["data"],
-            raw=data.get("raw", {}),
-            cached=True,
-        )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[kimhannom] ignoring corrupt API cache file {path}: {exc}", flush=True)
+            return None
+        try:
+            return ApiResponse(
+                endpoint=data["endpoint"],
+                data=data["data"],
+                raw=data.get("raw", {}),
+                cached=True,
+            )
+        except (KeyError, TypeError):
+            print(f"[kimhannom] ignoring malformed API cache file {path}", flush=True)
+            return None
 
     def _save_cache(self, key: str, response: ApiResponse) -> None:
         path = self._cache_path(key)
@@ -179,7 +203,10 @@ class KimHanNomClient(OCREngine):
             "raw": response.raw,
             "saved_at": utc_now().isoformat(),
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(scrub_server_payload(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _upload_cache_path(self, image_sha256: str) -> Path:
         return self.cache_dir / "uploads" / image_sha256[:2] / f"{image_sha256}.json"
@@ -247,9 +274,15 @@ class KimHanNomClient(OCREngine):
                         f"{endpoint}: HTTP {status}: {response.text[:300]!r}"
                     )
                 raw = response.json()
-                self.ledger.record(endpoint, image_sha256, f"http_{status}")
                 if not isinstance(raw, dict):
+                    self.ledger.record(endpoint, image_sha256, f"http_{status}", note="non_dict_response")
                     raise KimHanNomError("API response is not a JSON object")
+                self.ledger.record(
+                    endpoint,
+                    image_sha256,
+                    f"http_{status}",
+                    business_code=str(raw.get("code")) if raw.get("code") is not None else None,
+                )
                 if not _success_code(raw.get("code")):
                     message = raw.get("message")
                     raise ApiBusinessError(f"{endpoint}: {raw.get('code')}: {message}")
@@ -488,6 +521,8 @@ class KimHanNomClient(OCREngine):
             items = details["details"]
             if len(items) == len(texts):
                 difficulty = [item.get("difficult") if isinstance(item, dict) else None for item in items]
+            else:
+                warnings.append("DIFFICULT_LENGTH_MISMATCH")
         # image-rec fallback: guideline requires fixing invalid boxes via
         # image-rec on cropped lines. A full-page image-rec re-run recovers
         # recognition when image-ocr boxes are missing/invalid.
@@ -511,6 +546,10 @@ class KimHanNomClient(OCREngine):
                     warnings.append("IMAGE_REC_FALLBACK")
             except Exception as exc:  # noqa: BLE001 - fallback is best-effort
                 warnings.append(f"IMAGE_REC_FALLBACK_FAILED:{type(exc).__name__}")
+        elif needs_rec:
+            # ocr_id == 3 (scene pictures): image-rec is documented for text
+            # lines only; record that recovery was considered and waived.
+            warnings.append("OCR_REC_SKIPPED_SCENE")
 
         lines: list[OCRLine] = []
         if len(texts) != len(boxes):

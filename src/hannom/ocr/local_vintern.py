@@ -33,6 +33,33 @@ from .base import OCREngine, OCRUnavailable
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
+# Pinned to the exact snapshot the pipeline was benchmarked and run against
+# (refs/main in the local HF cache, verified 2026-11-13). Update only with a
+# fresh benchmark + review.
+_VINTERN_REVISION = "c3f01cf5b55816c092fb493babc672b0dc33c8bc"
+
+
+def _max_time_criteria(budget: float):
+    """StoppingCriteriaList enforcing a wall-clock budget for one generation.
+
+    transformers 4.46 has no built-in wall-clock stopping criterion; this is
+    the documented extension point (generate's ``stopping_criteria`` kwarg).
+    Imported lazily so importing this module never pulls transformers.
+    """
+    from transformers.generation import StoppingCriteria, StoppingCriteriaList
+
+    import time as _time
+
+    class _MaxTime(StoppingCriteria):
+        def __init__(self, max_time_seconds: float) -> None:
+            super().__init__()
+            self.start = _time.time()
+            self.budget = float(max_time_seconds)
+
+        def __call__(self, input_ids, scores=None, **_kwargs):  # noqa: ANN001
+            return (_time.time() - self.start) > self.budget
+
+    return StoppingCriteriaList([_MaxTime(budget)])
 _PROMPT = (
     "<image>\nTrích xuất toàn bộ văn bản tiếng Việt có trong ảnh. "
     "Chỉ trả về phần văn bản, mỗi dòng một dòng, theo đúng thứ tự từ trên xuống dưới."
@@ -42,10 +69,13 @@ _PROMPT = (
 class VinternEngine(OCREngine):
     name = "vintern_1b_v2"
 
-    def __init__(self, model_id: str = "5CD-AI/Vintern-1B-v2", max_num: int = 12, max_new_tokens: int = 2048):
+    def __init__(self, model_id: str = "5CD-AI/Vintern-1B-v2", max_num: int = 12, max_new_tokens: int = 2048, max_time_seconds: float = 300.0):
         self.model_id = model_id
         self.max_num = max_num
         self.max_new_tokens = max_new_tokens
+        # Wall-clock budget per model.chat call; a hung CUDA generation must
+        # not block the pipeline forever (operator-adjustable).
+        self.max_time_seconds = float(max_time_seconds)
         self._model = None
         self._tokenizer = None
 
@@ -75,12 +105,13 @@ class VinternEngine(OCREngine):
         t0 = time.time()
         self._model = AutoModel.from_pretrained(
             self.model_id,
+            revision=_VINTERN_REVISION,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         ).eval().cuda()
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self.model_id, trust_remote_code=True, use_fast=False
+            self.model_id, revision=_VINTERN_REVISION, trust_remote_code=True, use_fast=False
         )
         print(f"[{self.name}] model loaded in {time.time() - t0:.1f}s")
         return self._model, self._tokenizer
@@ -149,17 +180,28 @@ class VinternEngine(OCREngine):
         transform = build_transform(image_size)
         return torch.stack([transform(img) for img in processed])
 
+    def _generation_config(self) -> dict:
+        config = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": False,
+            "num_beams": 1,
+            "repetition_penalty": 1.2,
+        }
+        try:
+            config["stopping_criteria"] = _max_time_criteria(self.max_time_seconds)
+        except Exception as exc:  # transformers API drift: degrade, never crash
+            print(
+                f"[{self.name}] time watchdog unavailable ({type(exc).__name__}: {exc}); continuing without it",
+                flush=True,
+            )
+        return config
+
     def _generate_on_image(self, image_path: str | Path, model, tokenizer):
         """Generate OCR text for one image file. Returns the raw stripped text."""
         import torch  # type: ignore
 
         pixel_values = self._load_image(str(image_path)).to(torch.bfloat16).cuda()
-        generation_config = dict(
-            max_new_tokens=self.max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            repetition_penalty=1.2,
-        )
+        generation_config = self._generation_config()
         response, _ = model.chat(
             tokenizer, pixel_values, _PROMPT, generation_config, history=None, return_history=True
         )
@@ -219,12 +261,7 @@ class VinternEngine(OCREngine):
         import torch  # type: ignore
 
         pixel_values = self._load_image(str(page.path)).to(torch.bfloat16).cuda()
-        generation_config = dict(
-            max_new_tokens=self.max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            repetition_penalty=1.2,
-        )
+        generation_config = self._generation_config()
         t0 = time.time()
         response, _ = model.chat(tokenizer, pixel_values, _PROMPT, generation_config, history=None, return_history=True)
         elapsed = time.time() - t0

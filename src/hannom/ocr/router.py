@@ -13,7 +13,7 @@ from ..models import OCRLine, OCRResult, PageRecord
 from ..state import State
 from .agreement import choose_consensus
 from .base import OCREngine, OCRUnavailable
-from .kimhannom import KimHanNomClient
+from .kimhannom import KimHanNomClient, scrub_server_payload
 from .mock import MockOCREngine
 from .quota import QuotaExceeded
 
@@ -28,6 +28,11 @@ PROPAGATED_WARNING_CODES = {
     "BBOX_INVALID",
     "OCR_TEXT_BBOX_COUNT_MISMATCH",
     "BAND_RETRY_AFTER_FULLPAGE_FAILURE",
+    "ENGINE_UNAVAILABLE",
+    "IMAGE_REC_FALLBACK",
+    "API_CLASSIFIED_NOT_SINO_NOM",
+    "OCR_ROUTING_UNKNOWN_MODE",
+    "OCR_LINE_WITHOUT_BBOX",
 }
 
 
@@ -39,6 +44,14 @@ def promote_review_flags(warnings: Iterable[str], flags: Iterable[str] | None = 
         if code in PROPAGATED_WARNING_CODES and code not in promoted:
             promoted.append(code)
     return promoted
+
+
+def _unavailability_reason(engine: object) -> str:
+    """Human-meaningful reason for an engine being unavailable (D20)."""
+    fn = getattr(engine, "unavailability_reason", None)
+    if callable(fn):
+        return str(fn())
+    return "unavailable"
 
 
 def sample_page_numbers(page_numbers: Iterable[int], count: int) -> set[int]:
@@ -141,8 +154,22 @@ class OCRRouter:
         for path in (self._path(page), self._fallback_path(page.page_no)):
             if not path.exists():
                 continue
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return OCRResult(
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"[ocr] ignoring corrupt result file {path}: {exc}", flush=True)
+                continue
+            if not isinstance(data, dict):
+                print(f"[ocr] ignoring malformed result file {path}", flush=True)
+                continue
+            if str(data.get("image_sha256") or "") != page.sha256:
+                print(
+                    f"[ocr] ignoring stale result {path}: "
+                    f"image_sha256 {str(data.get('image_sha256'))[:8]}… != page {page.sha256[:8]}…",
+                    flush=True,
+                )
+                continue
+            result = OCRResult(
                 book_id=data["book_id"],
                 page_no=data["page_no"],
                 image_name=data["image_name"],
@@ -163,11 +190,21 @@ class OCRRouter:
                 warnings=list(data.get("warnings", [])),
                 cached=True,
             )
+            # Cache hits must also promote page-level warnings into
+            # review_flags, otherwise a stale cache never reaches the gate.
+            promoted = promote_review_flags(result.warnings, page.review_flags)
+            if promoted != list(page.review_flags or []):
+                self.state.update_page(
+                    page.book_id,
+                    page.page_no,
+                    review_flags=promoted,
+                )
+            return result
         return None
 
     def save_result(self, result: OCRResult, local_fallback: bool = False) -> Path:
         path = self._fallback_path(result.page_no) if local_fallback else self._path_for(result.page_no)
-        payload = asdict(result)
+        payload = scrub_server_payload(asdict(result))
         payload["lines"] = [
             {
                 "text": line.text,
@@ -284,7 +321,7 @@ class OCRRouter:
                 try:
                     engine = self.build_engine(name)
                     if not engine.is_available():
-                        unavailable.append(f"{name}: unavailable")
+                        unavailable.append(f"{name}: {_unavailability_reason(engine)}")
                         continue
                     result = engine.recognize_page(page, script)
                     results.append(result)
@@ -313,7 +350,7 @@ class OCRRouter:
                     try:
                         engine = self.build_engine(name)
                         if not engine.is_available():
-                            unavailable.append(f"{name}: unavailable")
+                            unavailable.append(f"{name}: {_unavailability_reason(engine)}")
                             continue
                         results.append(engine.recognize_page(page, script))
                         api_called = True
