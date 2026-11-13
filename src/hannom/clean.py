@@ -72,9 +72,10 @@ class CleanedPage:
     flags: list[str] = field(default_factory=list)
     dropped_lines: list[str] = field(default_factory=list)
     replacements: dict[str, int] = field(default_factory=dict)
+    marker: int | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "book_id": self.book_id,
             "page_no": self.page_no,
             "image_name": self.image_name,
@@ -85,6 +86,9 @@ class CleanedPage:
             "dropped_lines": self.dropped_lines,
             "replacements": self.replacements,
         }
+        if self.marker is not None:
+            d["marker"] = self.marker
+        return d
 
 
 def nfc(text: str) -> str:
@@ -186,6 +190,21 @@ def _strip_inline_refs(text: str) -> tuple[str, bool]:
 _FULLPAGE_LEADING_MARK = re.compile(
     r"^\s*-?\s*\d{1,4}\s*[-–—]?\s*\(?\s*\d{2,4}\s*\)?(?:[.\-–—]\s*)?"
 )
+# Anchored pattern for the printed cross-reference marker inside a dropped
+# line (the Nôm printed page the QN page pairs with). Requires the `- N -`
+# context so stray footnote parens never match.
+_MARKER_LINE_RE = re.compile(
+    r"^\s*-?\s*\d{1,4}\s*[-–—]?\s*\(\s*(\d{2,4})\s*\)"
+)
+
+
+def extract_qn_marker(dropped: list[str]) -> int | None:
+    """Return the Nôm printed page number from a dropped header line."""
+    for raw in dropped:
+        match = _MARKER_LINE_RE.match(str(raw))
+        if match:
+            return int(match.group(1))
+    return None
 _FULLPAGE_TRAILING_TITLES = (
     "sua luoi",  # flat form of every tonal/casing variant of the book title
     "sua luoi quyen",
@@ -384,6 +403,7 @@ def clean_nom_page(
         flags=flags,
         dropped_lines=dropped,
         replacements=replacements,
+        marker=extract_qn_marker(dropped),
     )
 
 
@@ -453,6 +473,7 @@ def clean_quoc_ngu_page(
         lines=cleaned,
         flags=flags,
         dropped_lines=dropped,
+        marker=extract_qn_marker(dropped),
     )
 
 

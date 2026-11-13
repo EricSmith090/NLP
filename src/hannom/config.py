@@ -46,6 +46,11 @@ class BookConfig:
     # carry identify them; the rest are declarative misc/ policy.
     inventory_vi: tuple[int, ...] = ()
     inventory_misc: tuple[int, ...] = ()
+    # Printed cross-reference: the QN pages carry "- N - ( N )" headers; the
+    # Nôm printed page = Nôm PDF − 2. When set (PDF page), the image map is
+    # built as a deterministic bijection Nôm PDF = vi_to_nom_offset − vi PDF
+    # instead of the heuristic DP. Empirical per-book constant.
+    vi_to_nom_offset: int | None = None
     ocr: OCRSettings = field(default_factory=OCRSettings)
     review_profile: str = "strict"
 
@@ -162,6 +167,12 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
                 back_matter_is_toc=bool(b.get("back_matter_is_toc", True)),
                 inventory_vi=tuple(int(x) for x in (b.get("inventory_vi", []) or [])),
                 inventory_misc=tuple(int(x) for x in (b.get("inventory_misc", []) or [])),
+                vi_to_nom_offset=(
+                    int(b["vi_to_nom_offset"])
+                    if b.get("vi_to_nom_offset") is not None
+                    and int(b["vi_to_nom_offset"]) > 0
+                    else None
+                ),
                 ocr=OCRSettings(
                     nom=tuple(ocr_raw.get("nom", ["paddleocr_vl", "kimhannom"])),
                     # quoc_ngu is Vintern-1B-v2 full-page transcription since 2026-11-08

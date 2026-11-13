@@ -29,6 +29,7 @@ import csv
 import json
 import re
 import unicodedata
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +40,7 @@ from .dictionary.readings import Readings, is_ideograph, norm_reading
 QN_TOKEN_RE = re.compile(r"[^\W_]+")
 SENTENCE_END = frozenset(".?!;:")
 FOOTNOTE_RE = re.compile(r"\s*[\(\[]\s*\d{1,3}\s*[\)\]]")
-QN_HEADER_RE = re.compile(r"^\s*-\s*\d+\s*-\s*(?:\(\s*(\d+)\s*\))?")
+QN_HEADER_RE = re.compile(r"^\s*-\s*\d{1,4}\s*[-–—]?\s*\(\s*(\d{2,4})\s*\)")
 HYPHEN_BREAK_RE = re.compile(r"(\w)-\s+(\w)")
 CN_NUMERALS = frozenset("〇零一二三四五六七八九十百千廿卅")
 PAGE_NO_RE = re.compile(r"\.(\d+)(?:_\d+)?\.jpg$", re.IGNORECASE)
@@ -608,11 +609,28 @@ def read_label_txt(path: Path) -> list[tuple[str, list[dict[str, Any]]]]:
     return pages
 
 
-def read_image_map(path: Path | None) -> list[tuple[list[str], list[str]]]:
+def read_image_map(
+    path: Path | None,
+    *,
+    honor_status: bool = True,
+) -> list[tuple[list[str], list[str]]]:
+    """Read a book's image map. When ``honor_status`` is set, pairs whose
+    adjudicated ``status`` is ``unresolved`` are skipped (they are not
+    evidence) and reported via ``warnings.warn`` — never silently used as
+    band anchors. Missing/unknown statuses behave as before (candidate)."""
     if path is None or not Path(path).exists():
         return []
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [(list(p.get("ch", [])), list(p.get("vi", []))) for p in data.get("pairs", [])]
+    pairs: list[tuple[list[str], list[str]]] = []
+    skipped = 0
+    for p in data.get("pairs", []):
+        if honor_status and str(p.get("status") or "") == "unresolved":
+            skipped += 1
+            continue
+        pairs.append((list(p.get("ch", [])), list(p.get("vi", []))))
+    if skipped:
+        warnings.warn(f"image map {path.name}: {skipped} unresolved pair(s) skipped", stacklevel=2)
+    return pairs
 
 
 @dataclass

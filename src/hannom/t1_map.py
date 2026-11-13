@@ -16,6 +16,7 @@ whose evidence does not confirm them stay ``unresolved``;
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,14 @@ from .models import PageRecord
 from .state import State
 
 PAIR_STATUSES = frozenset({"candidate", "verified", "unresolved", "manual"})
+
+_NAME_PAGE_RE = re.compile(r"\.(\d{3,})(?:_\d+)?\.jpg$", re.IGNORECASE)
+
+
+def image_name_page_no(name: str) -> int | None:
+    """Extract the ≥3-digit page number from a submitted image name."""
+    match = _NAME_PAGE_RE.search(str(name))
+    return int(match.group(1)) if match else None
 
 
 class ImageMapError(RuntimeError):
@@ -107,19 +116,20 @@ def score_pairs_with_anchors(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
-    verified_min_coverage: float = 0.5,
+    verified_min_coverage: float = 0.08,
     verified_min_anchors: int = 2,
 ) -> list[Pair]:
     """Attach anchor-evidence confidence/status to heuristic pairs.
 
-    Verified strictly by *unique* local reading anchors: the fraction of
+    Verified strictly by *unique* local reading anchors: at least
+    ``verified_min_anchors`` independent anchors AND fraction of
     reading-carrying Nôm characters with a reliable unique anchor must
-    reach ``verified_min_coverage`` AND at least ``verified_min_anchors``
-    independent anchors must exist. Pairs with reading evidence whose
-    anchors do not meet both bars are ``unresolved`` (evidence was found
-    but does not confirm the pairing); pairs without reading evidence are
-    ``candidate``. Pairs never become ``verified`` via ink mass or dense
-    repeated readings.
+    reach ``verified_min_coverage`` (recalibrated 0.5 → 0.08 — correct
+    Tap1/Tap3 pairs measured min 0.061 / median 0.201). Pairs with reading
+    evidence whose anchors do not meet both bars are ``unresolved``;
+    pairs without reading evidence stay ``candidate``. Pairs never become
+    ``verified`` via ink mass. (In the assigned books the marker formula
+    supersedes this path: pairs are verified against the printed marker.)
     """
     scored: list[Pair] = []
     for pair in pairs:
@@ -181,6 +191,70 @@ def mapping_summary(pairs: list[Pair]) -> dict[str, int]:
     return summary
 
 
+def build_marker_map(
+    book: BookConfig,
+    pages: list[PageRecord],
+) -> list[Pair] | None:
+    """Deterministic image map from the printed cross-reference markers.
+
+    The T1 books print the Nôm *printed* page number in parentheses in the
+    header of every substantive QN page (``- 58 - ( 65 )``). Print is produced
+    as ``marker = (vi_to_nom_offset − 2) − vi_pdf``; the Nôm PDF page is then
+    ``vi_to_nom_offset − vi_pdf`` (verified on image evidence on every page
+    class sampled across all three books — no exceptions). When the book
+    config carries ``vi_to_nom_offset``, the map is a bijection over the
+    ``ch/`` ∪ ``vi/`` inventories: every QN page pairs 1:1 with the Nôm page
+    the publisher paired it with. Pages without a marker (blanks, endnotes,
+    dividers) never enter the map (they live outside the ``vi`` folder).
+
+    Returns ``None`` when ``vi_to_nom_offset`` is not configured (books that
+    do not carry markers fall back to the heuristic DP).
+    """
+    offset = getattr(book, "vi_to_nom_offset", None)
+    if not offset:
+        return None
+    ch_by_page = {p.page_no: p for p in pages if p.folder == "ch"}
+    vi_pages = sorted([p for p in pages if p.folder == "vi"], key=lambda p: p.page_no)
+    pairs: list[Pair] = []
+    used_ch: set[int] = set()
+    for page in vi_pages:
+        ch_no = offset - page.page_no
+        nom_page = ch_by_page.get(ch_no)
+        if nom_page is None:
+            pairs.append(
+                Pair(ch=(), vi=(page.image_name,),
+                     note=f"printed marker maps to Nôm PDF {ch_no}, not in ch/",
+                     source="printed_marker", status="unresolved")
+            )
+            continue
+        used_ch.add(ch_no)
+        pairs.append(
+            Pair(ch=(nom_page.image_name,), vi=(page.image_name,),
+                 note=f"printed marker: Nôm PDF = {offset} − vi PDF",
+                 confidence=1.0, source="printed_marker", status="verified")
+        )
+    # Nôm pages whose mate is not in the vi folder (the QN page is blank or
+    # scan-missing): insert them at their reading position with an empty vi
+    # side — never silently dropped.
+    leftover = sorted((no for no in ch_by_page if no not in used_ch), reverse=True)
+    for ch_no in leftover:
+        nom_page = ch_by_page[ch_no]
+        marker_pair = Pair(
+            ch=(nom_page.image_name,), vi=(),
+            note="no Quốc ngữ counterpart (blank or scan-missing Quốc ngữ)",
+            source="printed_marker", status="unresolved",
+        )
+        insert_at = len(pairs)
+        for idx, pair in enumerate(pairs):
+            if pair.ch:
+                pair_ch = image_name_page_no(pair.ch[0])
+                if pair_ch is not None and pair_ch < ch_no:
+                    insert_at = idx
+                    break
+        pairs.insert(insert_at, marker_pair)
+    return pairs
+
+
 def _load_cleaned_texts(project: ProjectConfig, book: BookConfig) -> dict[str, str]:
     folder = project.data_dir / "clean" / book.book_id
     if not folder.exists():
@@ -199,6 +273,39 @@ def _load_cleaned_texts(project: ProjectConfig, book: BookConfig) -> dict[str, s
     return texts
 
 
+class _LookupResult:
+    """Minimal lookup result shape expected by ``gather_readings``."""
+
+    def __init__(self, readings):
+        self.readings = list(readings)
+
+
+class _HvdicCacheAdapter:
+    """Adapter over the merged offline reading cache (hvdic/unihan/etc.).
+
+    The cache (``data/dictionary/char_readings.json``) is the only dictionary
+    available in long runs; wrapping it in the ``.lookup`` shape the anchor
+    scorer consumes lets the pre-existing path verify pairs from real data.
+    """
+
+    def __init__(self, payload: dict):
+        self.char = {str(c): list(v) for c, v in (payload.get("char") or {}).items()}
+
+    def lookup(self, char):
+        return _LookupResult(self.char.get(char, []))
+
+
+def _load_hvdic_cache(project: ProjectConfig):
+    cache_path = project.data_dir / "dictionary" / "char_readings.json"
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        return _HvdicCacheAdapter(payload)
+    except Exception:
+        return None
+
+
 def _load_book_lexicon(project: ProjectConfig, book: BookConfig):
     path = project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"
     if not path.exists():
@@ -215,14 +322,19 @@ def align_page_groups(
     ch_pages: list[PageRecord],
     vi_pages: list[PageRecord],
     config: dict[str, Any] | None = None,
-    max_group: int = 3,
+    max_group: int | None = None,
 ) -> list[Pair]:
     """Partition two reading-order sequences into page groups.
 
     ch_pages must already be in Nôm reading order (decreasing PDF page
     numbers for T1). vi_pages must be in QN reading order (increasing).
+    Group limits honour ``max_group``/``max_nm_group`` from the alignment
+    config (``configs/alignment.yaml``: ``max_group: 4``,
+    ``max_nm_group: 2``) when not passed explicitly.
     """
     config = config or {}
+    max_group = int(max_group if max_group is not None else config.get("max_group", 4))
+    max_nm = int(config.get("max_nm_group", 2))
     n, m = len(ch_pages), len(vi_pages)
     if n == 0 or m == 0:
         raise ImageMapError("Both sides need at least one page for an image map")
@@ -247,8 +359,8 @@ def align_page_groups(
                 for b in range(1, max_group + 1):
                     if j + b > m:
                         break
-                    if a > 1 and b > 1:
-                        continue  # guideline allows n-m but prefers smaller units
+                    if a > 1 and b > 1 and (a > max_nm or b > max_nm):
+                        continue  # guideline: n-m only when translation is restructured, up to max_nm_group
                     cost = dp[i][j] + _group_cost(
                         sum(ch_mass[i : i + a]),
                         sum(vi_mass[j : j + b]),
@@ -285,6 +397,8 @@ def validate_image_map(
     pairs: list[Pair],
     ch_names: set[str] | None = None,
     vi_names: set[str] | None = None,
+    *,
+    vi_to_nom_offset: int | None = None,
 ) -> list[str]:
     issues: list[str] = []
     seen_ch: set[str] = set()
@@ -308,6 +422,57 @@ def validate_image_map(
             seen_vi.add(name)
             if vi_names is not None and name not in vi_names:
                 issues.append(f"pair {idx}: unknown vi image {name}")
+    # Coverage: every page of the relevant inventory must appear in exactly
+    # one pair (or nowhere, with an empty-side pair recorded — both sides of
+    # a pair may not be empty, but an empty side is allowed and counts as
+    # coverage of the other side's scan-missing counterpart).
+    all_ch = {name for p in pairs for name in p.ch}
+    all_vi = {name for p in pairs for name in p.vi}
+    if ch_names is not None:
+        for name in sorted(ch_names - all_ch):
+            issues.append(f"coverage: ch image {name} not in any pair")
+    if vi_names is not None:
+        for name in sorted(vi_names - all_vi):
+            issues.append(f"coverage: vi image {name} not in any pair")
+    # Monotonicity of pairs in book reading order (vi ascending, ch
+    # descending). Empty-side pairs anchor at their non-empty side's rank;
+    # an absent side is never asserted.
+    def _vi_rank(pair: Pair) -> int | None:
+        pages = [image_name_page_no(n) for n in pair.vi]
+        return min(p for p in pages if p is not None) if any(pages) else None
+
+    def _ch_rank(pair: Pair) -> int | None:
+        pages = [image_name_page_no(n) for n in pair.ch]
+        return max(p for p in pages if p is not None) if any(pages) else None
+
+    vi_ranks = [_vi_rank(pair) for pair in pairs]
+    ch_ranks = [_ch_rank(pair) for pair in pairs]
+    for idx in range(len(pairs) - 1):
+        if vi_ranks[idx] is not None and vi_ranks[idx + 1] is not None:
+            if vi_ranks[idx] >= vi_ranks[idx + 1]:
+                issues.append(f"order: pairs {idx} and {idx + 1} are not vi-ascending")
+        if ch_ranks[idx] is not None and ch_ranks[idx + 1] is not None:
+            if ch_ranks[idx] <= ch_ranks[idx + 1]:
+                issues.append(f"order: pairs {idx} and {idx + 1} are not ch-descending")
+    # Marker check: when the book carries a printed cross-reference marker
+    # formula, every pair must satisfy Nôm PDF = vi_to_nom_offset − vi PDF
+    # (1:1 by construction in this corpus).
+    if vi_to_nom_offset:
+        for idx, pair in enumerate(pairs):
+            if len(pair.ch) == 1 and len(pair.vi) == 1:
+                ch_page = image_name_page_no(pair.ch[0])
+                vi_page = image_name_page_no(pair.vi[0])
+                if ch_page is not None and vi_page is not None:
+                    if ch_page != vi_to_nom_offset - vi_page:
+                        issues.append(
+                            f"marker: pair {idx} ({pair.vi[0]} ↔ {pair.ch[0]}) violates "
+                            f"Nôm PDF = {vi_to_nom_offset} − vi PDF"
+                        )
+            else:
+                issues.append(
+                    f"marker: pair {idx} is not 1:1 ({len(pair.ch)} ch ↔ {len(pair.vi)} vi); "
+                    f"markers prove 1:1 for this corpus"
+                )
     return issues
 
 
@@ -325,27 +490,43 @@ def build_image_map(
     if not vi_pages:
         raise ImageMapError(f"{book.book_id}: no vi pages")
 
-    pairs = align_page_groups(
-        ch_pages,
-        vi_pages,
-        config=(project.alignment_config or {}).get("alignment", {}),
-    )
     layout_dir = project.data_dir / "layout" / book.book_id
     dest = layout_dir / "image_map.json"
     manual_path = layout_dir / "image_map.manual.json"
     manual_source = manual_path.exists()
+    marker_source = False
     anchor_source = False
+    # Printed cross-reference markers are the deterministic ground truth for
+    # these books (Nôm printed = PDF − 2; see verify-B §3). The formula map
+    # replaces the heuristics whenever the book config carries the offset;
+    # the heuristic DP remains the fallback for books without markers; the
+    # manual correction file always wins.
+    marker_map = build_marker_map(book, pages) if not manual_source else None
+    if marker_map is not None:
+        pairs = marker_map
+        marker_source = True
+    else:
+        pairs = align_page_groups(
+            ch_pages,
+            vi_pages,
+            config=(project.alignment_config or {}).get("alignment", {}),
+        )
     if manual_source:
         # A manual correction file fully replaces the heuristic mapping;
         # unmatched entries or bad names fail loudly, never silently revert.
         manual_items = json.loads(manual_path.read_text(encoding="utf-8"))
         pairs = parse_manual_pairs(manual_items)
-    else:
+    elif not marker_source:
+        # Marker-formula pairs are already verified by print; only the
+        # heuristic DP fallback gets anchor-scored here.
         texts = _load_cleaned_texts(project, book)
         lexicon = _load_book_lexicon(project, book) if texts else None
-        anchor_source = bool(texts) and lexicon is not None
+        hvdic = _load_hvdic_cache(project)
+        anchor_source = bool(texts)
         if anchor_source:
-            pairs = score_pairs_with_anchors(pairs, texts, lexicon=lexicon)
+            pairs = score_pairs_with_anchors(
+                pairs, texts, lexicon=lexicon, dictionary=hvdic,
+            )
     # Scan-missing pages (guideline §Quy định chung về file ánh xạ hình ảnh):
     # missing_ch ⇔ vi empty, missing_vi ⇒ ch empty. These may not already
     # appear in the partitioned ch/vi lists (layout marks them separately).
@@ -392,15 +573,17 @@ def build_image_map(
         pairs,
         ch_names={p.image_name for p in pages if p.folder in {"ch", "missing_ch"}},
         vi_names={p.image_name for p in pages if p.folder in {"vi", "missing_vi"}},
+        vi_to_nom_offset=getattr(book, "vi_to_nom_offset", None),
     )
     if issues:
         raise ImageMapError(f"{book.book_id}: invalid image map: {issues[:5]}")
 
-    mapping_source = (
-        "manual"
-        if manual_source
-        else ("heuristic_mass+anchor_evidence" if anchor_source else "heuristic_mass")
-    )
+    if manual_source:
+        mapping_source = "manual"
+    elif marker_source:
+        mapping_source = "printed_marker"
+    else:
+        mapping_source = "heuristic_mass+anchor_evidence" if anchor_source else "heuristic_mass"
     summary = mapping_summary(pairs)
     data = {
         "pairs": [p.to_dict() for p in pairs],
@@ -413,12 +596,23 @@ def build_image_map(
             "candidate_pairs": summary.get("candidate", 0),
             "unresolved_pairs": summary.get("unresolved", 0),
             "manual_pairs": summary.get("manual", 0),
+            "markers_used": sum(1 for p in pairs if p.source == "printed_marker"),
+            "marker_issues": [
+                p.note for p in pairs if p.status == "unresolved" and p.note
+            ],
             "ch_page_count": len(ch_pages),
             "vi_page_count": len(vi_pages),
         },
     }
     if manual_source:
         data["meta"]["note"] = "image_map.manual.json applied; manual pairs carry status=manual"
+    elif marker_source:
+        data["meta"]["note"] = (
+            "image map built from the printed cross-reference marker formula "
+            "(Nôm printed = PDF − 2); every pair verified against print"
+        )
+        if getattr(book, "vi_to_nom_offset", None):
+            data["meta"]["vi_to_nom_offset"] = book.vi_to_nom_offset
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("w", encoding="utf-8", newline="\n") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)

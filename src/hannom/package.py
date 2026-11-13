@@ -242,14 +242,20 @@ def build_book_folder(
     if staged_updated.exists():
         shutil.copy2(staged_updated, book_dir / f"{book.book_name}_updated.pdf")
 
-    # Image map. Use the exact names present in the final folders.
-    if image_map_pairs is None:
-        image_map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
-        image_map_pairs = load_image_map(image_map_path) if image_map_path.exists() else []
-    image_map = {"pairs": [pair.to_dict() for pair in image_map_pairs]}
-    (book_dir / f"{book.book_name}_image_map.json").write_text(
-        json.dumps(image_map, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    # Image map. Copy the maintained artifact verbatim (pairs + full meta:
+    # mapping_source, markers_used, vi_page_count, verified/candidate
+    # counts) instead of round-tripping through Pair objects (which dropped
+    # the whole meta block and silently re-defaulted statuses).
+    image_map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
+    if image_map_path.exists():
+        (book_dir / f"{book.book_name}_image_map.json").write_bytes(image_map_path.read_bytes())
+    else:
+        if image_map_pairs is None:
+            image_map_pairs = []
+        fallback = {"pairs": [pair.to_dict() for pair in image_map_pairs]}
+        (book_dir / f"{book.book_name}_image_map.json").write_text(
+            json.dumps(fallback, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
 
     csv_path = book_dir / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
@@ -450,12 +456,32 @@ def validate_book_package(
         # Guideline v2.1: <Tên sách>_image_map.json is optional. Emit a warning
         # only; a missing optional file must not block packaging.
         issues.append(PackageIssue("MISSING_IMAGE_MAP", "image_map.json missing (optional per guideline v2.1)", severity="warning"))
-    # Promote present-but-invalid maps to errors up front.
+    # Promote present-but-invalid maps to errors up front: coverage, order,
+    # duplicate/unknown names and the printed-marker formula are all checked
+    # against the actual folder contents, not just the map's internal shape.
     if (book_dir / f"{book.book_name}_image_map.json").exists():
         try:
             from .t1_map import load_image_map as _load_map, validate_image_map as _validate_map
+
             img_map_pairs = _load_map(book_dir / f"{book.book_name}_image_map.json")
-            for msg in _validate_map(img_map_pairs):
+            ch_names = {p.name for p in (book_dir / "ch").glob("*.jpg")} if (book_dir / "ch").exists() else set()
+            vi_names = {p.name for p in (book_dir / "vi").glob("*.jpg")} if (book_dir / "vi").exists() else set()
+            missing_ch = (
+                {p.name for p in (book_dir / "missing" / "ch").glob("*.jpg")}
+                if (book_dir / "missing" / "ch").exists()
+                else set()
+            )
+            missing_vi = (
+                {p.name for p in (book_dir / "missing" / "vi").glob("*.jpg")}
+                if (book_dir / "missing" / "vi").exists()
+                else set()
+            )
+            for msg in _validate_map(
+                img_map_pairs,
+                ch_names=ch_names | missing_ch,
+                vi_names=vi_names | missing_vi,
+                vi_to_nom_offset=getattr(book, "vi_to_nom_offset", None),
+            ):
                 issues.append(PackageIssue("IMAGE_MAP_INVALID", msg, path=str(book_dir)))
         except Exception as exc:  # noqa: BLE001
             issues.append(PackageIssue("IMAGE_MAP_INVALID", str(exc), path=str(book_dir)))

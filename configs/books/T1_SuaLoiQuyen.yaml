@@ -12,10 +12,13 @@ nom_end_hint: 116
 translation_start: 11
 translation_end: 63
 back_matter_is_toc: true
+# Printed cross-reference in every substantive QN page (header):
+# Nôm printed = Nôm PDF − 2; this book's offset: Nôm PDF = 127 − vi PDF.
+vi_to_nom_offset: 127
 # Non-translation pages: 2,3,5,7,8,9 (modern cover, TOC stub, foreword);
 # 62,63 ("CHÚ THÍCH" glossary, no Nôm counterpart);
-# 117,118 (back-matter TOC divider and "Bản chữ Nôm" separator):
-inventory_misc: [2, 3, 5, 7, 8, 9, 62, 63, 117, 118]
+# 64 (pre-existing misc); 117,118 (back-matter TOC divider and "Bản chữ Nôm" separator):
+inventory_misc: [2, 3, 5, 7, 8, 9, 62, 63, 64, 117, 118]
 
 ocr:
   # API first for Nôm; local engines take over when the quota is reached.

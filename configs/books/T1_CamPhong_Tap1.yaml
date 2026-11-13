@@ -19,14 +19,17 @@ translation_end: 144
 # dividers and print index) and the glossary ("CHÚ THÍCH", PDF 143-144) carry
 # no Nôm translation; reported in the report and shipped in misc/.
 back_matter_is_toc: true
+# Printed cross-reference in every substantive QN page (header):
+# Nôm printed = Nôm PDF − 2; this book's offset: Nôm PDF = 289 − vi PDF.
+vi_to_nom_offset: 289
 # Declarative bin overrides (PDF pages).
 # The translation front matter pages carry parens cross-references to the
 # Nôm book (PDF 13=parens 274 → Nôm PDF 276, ..., PDF 20=parens 267 → PDF 269):
 inventory_vi: [13, 14, 15, 16, 17, 18, 19, 20]
 # Non-translation pages: 5,7-11 (modern reprint cover, giới thiệu, "BẢN QUỐC
 # NGỮ" divider); 277-282 (publisher back-matter dividers/indexes + two Vintern
-# prompt-spill pages); 143,144 ("CHÚ THÍCH" glossary):
-inventory_misc: [5, 7, 8, 9, 10, 11, 277, 278, 279, 280, 281, 282, 143, 144]
+# prompt-spill pages); 143,144 ("CHÚ THÍCH" glossary); 145 (pre-existing misc):
+inventory_misc: [5, 7, 8, 9, 10, 11, 277, 278, 279, 280, 281, 282, 143, 144, 145]
 
 ocr:
   # API first for Nôm; local engines take over when the quota is reached.

@@ -317,7 +317,8 @@ def classify_book(
         elif page.page_no < book.translation_start:
             section, folder, script = "front_matter", "intro", "qn"
             if f.toc_likely:
-                section, folder = "toc", "toc"
+                # Informational only: the ink-density TOC heuristic fires on
+                # essentially all prose, so it must never re-label pages.
                 flags.append("TOC_LIKELY_FRONT")
         elif page.page_no <= book.translation_end:
             section, folder, script = "translation", "vi", "qn"
@@ -329,17 +330,23 @@ def classify_book(
             section, folder, script = "other", "misc", "qn"
 
         # QN back-matter pages can be dense tables and satisfy the Nôm
-        # heuristic; location after the Nôm block wins.
-        if page.page_no >= back_start and book.back_matter_is_toc:
+        # heuristic; location after the Nôm block wins. A page that is
+        # blank-likely is never relabeled by this override; a Nôm-likely
+        # page inside the back-matter region is flagged for review instead
+        # of being silently swallowed (e.g. Tap2 p549).
+        if page.page_no >= back_start and book.back_matter_is_toc and folder not in ("blank", "ch", "nom"):
+            if f.nom_likely:
+                flags.append("NOM_AFTER_BACKMATTER")
             section, folder, script = "back_matter_toc", "toc", "qn"
 
         if f.nom_likely and folder == "vi" and 0.055 <= f.column_std < 0.075:
             flags.append("MIXED_PAGE_SUSPECT")
 
         # Declarative bin overrides (e.g. parens-marked translation front
-        # matter or declared misc book back matter). Never override a blank
-        # or Nôm page; overrides take effect deterministically on re-run.
-        if folder not in ("blank", "ch", "nom"):
+        # matter or declared misc book back matter). Deterministic on re-run:
+        # explicit lists win over heuristics except that Nôm-block pages and
+        # the forced cover are never re-binned.
+        if folder != "ch" and page.page_no != 1:
             if page.page_no in (book.inventory_vi or ()):
                 section, folder, script = "translation", "vi", "qn"
                 flags.append("BIN_OVERRIDE_VI")
@@ -351,7 +358,10 @@ def classify_book(
         page.folder = folder
         page.script = script
         page.review_flags = sorted(set(page.review_flags + flags))
-        page.status = "classified"
+        # Classification is deterministic, but re-running must never wipe a
+        # non-default status (e.g. ocr_done, adjudicated) set elsewhere.
+        prior_status = (page.status or "").strip()
+        page.status = prior_status if prior_status and prior_status != "classified" else "classified"
         state.update_page(
             book.book_id,
             page.page_no,

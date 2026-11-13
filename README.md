@@ -7,15 +7,21 @@ and submission packaging.
 
 **Deadline:** 2026-11-30  
 **Scope:** 3 books, 950 PDF pages, ≥95% similarity per book (not aggregate)  
-**Current status (2026-11-08):** deterministic stages (0-2) complete and
-verified; full local OCR pipeline runs. Book 3 ran end-to-end on all 110 OCR
-targets (labels/clean/align/textdiff/evaluate executed). Quốc ngữ QN OCR was
-then swapped to Vintern-1B-v2 (GPU; near-perfect benchmark on pages 11/41);
-the paddle reading was discarded. Nôm is served by the Kim Hán Nôm API
-(verified live end-to-end on a 24-page sample; confidences 0.945-0.989;
-2026-11-08) with a local paddle draft fallback. Books 1/2 are untouched.
-Final numbers for the gate are pending the Book 3 re-run and 26 Nôm pages
-pending manual verification.
+**Current status (2026-11-13):** deterministic stages (0–2) complete and re-verified.
+OCR: Tap1 (all 282 targets) and Tap3 (110) complete — Tap1 89.96%, Tap3 93.74%
+similarity (gates FAIL: coverage <0.9, unverified >0.05 and similarity <95 for
+both; closing requires human review, not code). Tap2 is only 6/550 pages OCR'd
+(Nôm section unblocked only by the Kim Hán Nôm API weekly quota rollover
+2026-11-16); its gate has 15 rows (85.71%), never empty anymore. Quốc ngữ OCR
+uses Vintern-1B-v2 locally; Nôm uses the Kim Hán Nôm API (api_first, quota
+ledger; local PaddleOCR fallback). **The T1 Nôm↔QN image maps are now built
+deterministically from the printed cross-reference markers** (every substantive
+QN page prints the Nôm *printed* page number in parentheses; Nôm PDF = marker
++ 2, e.g. vi013↔ch276 … vi142↔ch147 for Tap1): Tap1 130/130, Tap2 264/264,
+Tap3 50/50 pairs **verified** (`mapping_source=printed_marker`); marker-verified
+at packaging. The 2026-11-12 content-DP repair and its residual errors are
+superseded. Nothing is claimed final; errors/similarities are all human-review
+corrections away from final.
 
 ## Assigned books
 
@@ -100,7 +106,7 @@ Extraction fidelity after the final re-extraction:
 │   ├── benchmark_ocr.py
 │   ├── capture_screenshots.py
 │   └── validate_submission.py
-├── tests/                       # 57 tests, no OCR runtime required
+├── tests/                       # 307 tests, no OCR runtime required
 ├── docs/
 │   ├── decisions.md
 │   ├── pipeline.md
