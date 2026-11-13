@@ -10,6 +10,7 @@ import csv
 import hashlib
 import json
 import shutil
+import warnings
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,6 +180,17 @@ def build_book_folder(
     image_map_pairs: Sequence[Pair] | None = None,
 ) -> Path:
     root = output_root or project.output_dir
+    # Back up the state DB before any destructive packaging step
+    # (best-effort: warn, never mask the packaging itself).
+    db = project.data_dir / "state.sqlite3"
+    if db.exists():
+        try:
+            from .state import State
+
+            with State(db) as st:
+                st.backup("package")
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"state backup before packaging failed: {exc}", stacklevel=2)
     book_dir = root / book.book_name
     if book_dir.exists():
         shutil.rmtree(book_dir)
@@ -242,6 +254,32 @@ def build_book_folder(
     csv_path = book_dir / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
     write_alignment_xlsx(book_dir / f"{book.book_name}.xlsx", rows)
+
+    # Regenerate pages.jsonl from the final in-memory page state so the
+    # recorded artifact is no longer the stale Stage-1-time snapshot (the
+    # SQLite DB remains authoritative). Best-effort: warn, never fail.
+    try:
+        from .intake import sha256_file
+        from .pages import _write_pages_jsonl
+        from .state import State
+
+        manifest_path = project.data_dir / "pages" / book.book_id / "pages.jsonl"
+        _write_pages_jsonl(manifest_path, list(pages))
+        with State(project.data_dir / "state.sqlite3") as st:
+            st.set_artifact(
+                book.book_id,
+                "pages",
+                "native_jsonl",
+                manifest_path,
+                sha256=sha256_file(manifest_path),
+                meta={
+                    "page_count": len(pages),
+                    "kind": "packaging-snapshot",
+                    "native_size": sorted({(p.width, p.height) for p in pages}),
+                },
+            )
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"pages.jsonl regeneration at packaging time failed: {exc}", stacklevel=2)
     return book_dir
 
 
@@ -382,6 +420,26 @@ def validate_book_package(
     expected_pdf = book_dir / f"{book.book_name}.pdf"
     if not expected_pdf.exists():
         issues.append(PackageIssue("MISSING_PDF", "source PDF missing", path=str(expected_pdf)))
+    # The guideline requires <Book>_updated.pdf whenever any image changed
+    # (rotated pages). Enforced as an error gate, not a courtesy copy.
+    try:
+        from .updated_pdf import check_updated_pdf, load_pages_readonly
+
+        pages_ro = load_pages_readonly(project, book.book_id)
+        if pages_ro is None:
+            issues.append(
+                PackageIssue(
+                    "STATE_UNAVAILABLE",
+                    "state.sqlite3 missing/unreadable; _updated.pdf checks skipped",
+                    severity="warning",
+                )
+            )
+        else:
+            issues.extend(check_updated_pdf(project, book, book_dir, pages_ro))
+    except Exception as exc:  # noqa: BLE001
+        issues.append(
+            PackageIssue("UPDATED_PDF_CHECK_FAILED", str(exc), severity="warning")
+        )
     csv_path = book_dir / f"{book.book_name}.csv"
     xlsx_path = book_dir / f"{book.book_name}.xlsx"
     if not csv_path.exists():

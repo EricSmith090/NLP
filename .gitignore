@@ -35,3 +35,6 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local submission build (stale deliverable; never commit)
+/submission/

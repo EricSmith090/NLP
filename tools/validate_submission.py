@@ -33,6 +33,7 @@ from hannom.package import (  # noqa: E402
     validate_book_package,
     validate_source_zip,
 )
+from hannom.preflight import check_book_images  # noqa: E402
 
 IMAGE_RE = re.compile(r"^(?P<stem>.+)\.(?P<page>\d{3,})(?:_(?P<index>\d+))?\.jpg$")
 
@@ -106,6 +107,58 @@ def _duplicate_hashes(folder: Path) -> list[str]:
     return [" / ".join(names) for names in hashes.values() if len(names) > 1]
 
 
+def _load_state_maps(project, book_id: str):
+    """(sha_by_image, dims_by_image) from the DB, read-only; None if unavailable."""
+    db = Path(project.data_dir) / "state.sqlite3"
+    if not db.exists():
+        return None, None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT image_name, sha256, width, height FROM pages WHERE book_id=?",
+                (book_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None, None
+    return (
+        {r[0]: r[1] for r in rows},
+        {r[0]: (r[2], r[3]) for r in rows},
+    )
+
+
+def _rotated_pages_note(project) -> str | None:
+    """Final-block lines listing rotated pages; None when state is unavailable."""
+    db = Path(project.data_dir) / "state.sqlite3"
+    if not db.exists():
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            lines = []
+            for book in project.books:
+                rows = conn.execute(
+                    "SELECT page_no FROM pages WHERE book_id=? AND rotation <> 0 ORDER BY page_no",
+                    (book.book_id,),
+                ).fetchall()
+                pages = [r[0] for r in rows]
+                if pages:
+                    lines.append(f"  {book.book_id}: rotated pages {pages}")
+            if not lines:
+                return None
+            return "Books with rotated pages (require <Book>_updated.pdf):\n" + "\n".join(lines)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _validate_book_dir(project, book, book_dir: Path) -> list[PackageIssue]:
     issues = validate_book_package(project, book, book_dir, minimum_similarity=None)
     issues.extend(_validate_image_order(book_dir))
@@ -114,6 +167,16 @@ def _validate_book_dir(project, book, book_dir: Path) -> list[PackageIssue]:
         if folder.exists():
             for duplicate in _duplicate_hashes(folder):
                 issues.append(PackageIssue("DUPLICATE_IMAGE", f"{side}: {duplicate}", path=str(folder)))
+    sha_by_image, dims_by_image = _load_state_maps(project, book.book_id)
+    issues.extend(
+        check_book_images(
+            book_dir,
+            book.book_name,
+            book.expected_pages,
+            sha_by_image=sha_by_image,
+            dims_by_image=dims_by_image,
+        )
+    )
     pdf = book_dir / f"{book.book_name}.pdf"
     if pdf.exists():
         try:
@@ -140,6 +203,11 @@ def _validate_book_dir(project, book, book_dir: Path) -> list[PackageIssue]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
     parser = argparse.ArgumentParser()
     parser.add_argument("target", help="submission ZIP or directory containing book folders")
     parser.add_argument("--project", default=str(ROOT / "configs" / "project.yaml"))
@@ -175,6 +243,14 @@ def main(argv: list[str] | None = None) -> int:
         if temp_dir and not args.keep_extracted:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    rotated_note = _rotated_pages_note(project)
+    if rotated_note:
+        print(rotated_note)
+        print(
+            "  If any images changed after they were merged into <Book>_updated.pdf, rebuild "
+            "with `python tools/build_updated_pdf.py --all` and notify the handout person "
+            "before submitting."
+        )
     if issues:
         print(f"FAIL: {len(issues)} blocking issue(s)")
         for issue in issues:

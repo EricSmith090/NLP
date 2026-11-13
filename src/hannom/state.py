@@ -7,6 +7,7 @@ and human-review records. It intentionally stores paths, not image blobs.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -15,6 +16,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .models import PageRecord
+
+SCHEMA_VERSION = 1
+
+
+class StateError(RuntimeError):
+    """State database is corrupt, unreadable, or from an unsupported version."""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -103,11 +111,47 @@ def iso(dt: datetime | None = None) -> str:
 class State:
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        try:
+            self._conn = sqlite3.connect(str(self.path))
+        except sqlite3.OperationalError as exc:
+            raise StateError(
+                f"state DB cannot be opened at {self.path} ({exc}); "
+                f"create its parent directory or restore from a backup next to it"
+            ) from exc
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        try:
+            row = self._conn.execute("PRAGMA quick_check").fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._conn.close()
+            raise StateError(self._corruption_hint(f"PRAGMA quick_check failed ({exc})")) from exc
+        if row is None or str(row[0]) != "ok":
+            msg = "unknown" if row is None else str(row[0])
+            self._conn.close()
+            raise StateError(self._corruption_hint(f"PRAGMA quick_check returned {msg!r}"))
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        self._migrate(version)
+
+    def _corruption_hint(self, detail: str) -> str:
+        backups = sorted(self.path.parent.glob("state.sqlite3.bak-*")) if self.path.parent.exists() else []
+        if backups:
+            return (
+                f"state DB corrupt at {self.path}: {detail}; "
+                f"restore from newest of: {', '.join(str(b) for b in backups)}"
+            )
+        return f"state DB corrupt at {self.path}: {detail}; no state.sqlite3.bak-* backups found next to it"
+
+    def _migrate(self, version: int) -> None:
+        if version > SCHEMA_VERSION:
+            self.close()
+            raise StateError(
+                f"state DB at {self.path} has user_version={version}, newer than "
+                f"SCHEMA_VERSION={SCHEMA_VERSION}; upgrade the pipeline instead of opening it"
+            )
+        # CREATE TABLE IF NOT EXISTS keeps a valid v1 database untouched; a
+        # brand-new file (user_version=0) gets the schema stamped with v1.
+        with self.tx() as c:
+            c.executescript(SCHEMA)
+            c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
         self._conn.close()
@@ -126,6 +170,56 @@ class State:
         except Exception:
             self._conn.rollback()
             raise
+
+    def backup(self, tag: str | None = None) -> Path:
+        """Timestamped copy of the database for pre-destructive-op safety."""
+        stamp = utc_now().strftime("%Y%m%d-%H%M%S")
+        suffix = f".bak-{stamp}" + (f"-{tag}" if tag else "")
+        dest = self.path.with_name(self.path.name + suffix)
+        shutil.copy2(self.path, dest)
+        return dest
+
+    def stage1_update(
+        self,
+        book_id: str,
+        page_no: int,
+        *,
+        image_name: str,
+        pdf_page: int,
+        sha256: str,
+        width: int,
+        height: int,
+        path: str | Path,
+        extraction_method: str,
+        rotation: int,
+    ) -> None:
+        """Update only Stage-1 columns; never touch downstream state.
+
+        Used by re-extraction of unchanged files so `status`, `script`,
+        `section`, `folder`, OCR results, `review_flags`, and `features_json`
+        survive. Raises KeyError if the row is missing.
+        """
+        with self.tx() as c:
+            cur = c.execute(
+                """UPDATE pages SET image_name=?, pdf_page=?, sha256=?, width=?,
+                   height=?, path=?, extraction_method=?, rotation=?, updated_at=?
+                   WHERE book_id=? AND page_no=?""",
+                (
+                    image_name,
+                    pdf_page,
+                    sha256,
+                    width,
+                    height,
+                    str(path),
+                    extraction_method,
+                    rotation,
+                    iso(),
+                    book_id,
+                    page_no,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(f"no pages row for {book_id}:{page_no}")
 
     def upsert_page(self, page: PageRecord) -> None:
         with self.tx() as c:
@@ -199,9 +293,13 @@ class State:
         values: list[Any] = []
         for key, value in fields.items():
             if key == "review_flags":
+                if not isinstance(value, list) or not all(isinstance(f, str) for f in value):
+                    raise TypeError(f"review_flags must be list[str], got {value!r}")
                 value = json.dumps(value, ensure_ascii=False)
                 col = "review_flags"
             elif key == "features":
+                if not isinstance(value, dict):
+                    raise TypeError(f"features must be dict, got {type(value).__name__}")
                 value = json.dumps(value, ensure_ascii=False)
                 col = "features_json"
             else:
@@ -212,7 +310,9 @@ class State:
         values.append(iso())
         values.extend([book_id, page_no])
         with self.tx() as c:
-            c.execute(f"UPDATE pages SET {', '.join(sets)} WHERE book_id=? AND page_no=?", values)
+            cur = c.execute(f"UPDATE pages SET {', '.join(sets)} WHERE book_id=? AND page_no=?", values)
+            if cur.rowcount != 1:
+                raise KeyError(f"no pages row for {book_id}:{page_no}")
 
     def pages(self, book_id: str) -> list[PageRecord]:
         rows = self._conn.execute(
@@ -368,14 +468,12 @@ class State:
 
     def finish_run(self, run_id: str, status: str = "ok", note: str | None = None) -> None:
         with self.tx() as c:
-            c.execute(
+            cur = c.execute(
                 "UPDATE runs SET finished_at=?, status=?, note=? WHERE run_id=?",
                 (iso(), status, note, run_id),
             )
-
-
-def default_state(project_root: str | Path) -> State:
-    return State(Path(project_root) / "data" / "state.sqlite3")
+            if cur.rowcount != 1:
+                raise KeyError(f"no runs row for run_id={run_id!r}")
 
 
 def window_start(now: datetime, seconds: int) -> datetime:

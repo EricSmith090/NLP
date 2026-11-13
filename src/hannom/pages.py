@@ -4,13 +4,15 @@ Two pitfalls are handled explicitly:
 1. A PDF page can share an image resource dictionary with every other page
    (Book 3 does this). Taking the first xref from get_images() returns the
    cover for every page. We use get_image_info(), which reports the image
-   actually placed on that page. The xrefs=True variant returns the same
-   data but re-parses every image resource (~1 s/page on these scans), so
-   it is only a fallback when the fast call omits an xref.
+   actually placed on that page. The fast xrefs=False variant carries no
+   xref for the scans in this project (verified 0/950 pages), so the
+   xref-aware variant is called unconditionally; for these books it is the
+   mandatory path, not a rare fallback.
 2. A page may rotate or composite an image. A single embedded image is
-   rotated losslessly from its native pixels; only composite or
-   transformed placements are rendered, and rendering is capped at the
-   native scan width so nothing is upscaled.
+   rotated geometrically at native resolution (90-degree transpose, JPEG
+   re-encode q95, no resampling; not a DCT-domain lossless transform);
+   only composite or transformed placements are rendered, and rendering is
+   capped at the native scan size so nothing is upscaled.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import hashlib
 import io
 import json
 import shutil
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -53,13 +55,10 @@ def image_name(book_name: str, page_no: int, image_index: int | None = None) -> 
 
 
 def _placed_image_info(page: pymupdf.Page) -> list[dict[str, Any]]:
-    infos = page.get_image_info()
-    if not infos:
-        return []
-    if all(int(info.get("xref") or 0) > 0 for info in infos):
-        return infos
-    # Rare PDFs omit xref in the fast result; pay the slow-path cost only
-    # for those pages.
+    # The fast get_image_info() never carries an xref for the scanned books
+    # in this project (0/950 pages), so the xref-aware variant is always
+    # used; it costs ~1 s/page but is the only path that resolves the
+    # placed image to an extractable stream.
     return page.get_image_info(xrefs=True)
 
 
@@ -84,7 +83,10 @@ def _matrix_is_rotated(info: dict[str, Any]) -> bool:
         a, b, c, d, _e, _f = transform
     except (TypeError, ValueError):
         return False
-    return abs(b) > 1e-3 or abs(c) > 1e-3
+    # Sign-flipped scale encodes a flip (e.g. a<0/d<0 for 180-degree flips
+    # with b == c == 0); those pages must not be served from the verbatim
+    # path, otherwise the submitted image displays upside-down.
+    return abs(b) > 1e-3 or abs(c) > 1e-3 or a < -1e-3 or d < -1e-3
 
 
 def _save_rgb_jpeg(raw: bytes, dest: Path, rotation: int = 0) -> tuple[int, int]:
@@ -97,9 +99,11 @@ def _save_rgb_jpeg(raw: bytes, dest: Path, rotation: int = 0) -> tuple[int, int]
         if int(rotation) % 360 == 0 and im.format == "JPEG" and im.mode in {"RGB", "L"}:
             dest.write_bytes(raw)
             return width, height
-        im = im.convert("RGB")
-        # Applying a display rotation with a 90-degree transpose is exact:
-        # no resampling and no change to the underlying scan resolution.
+        if im.mode not in {"RGB", "L"}:
+            im = im.convert("RGB")
+        # A geometric 90-degree transpose re-quantizes the JPEG (q95,
+        # 4:4:4, no resampling, native resolution kept). It is not a
+        # DCT-domain lossless transform.
         transpose = {
             90: Image.Transpose.ROTATE_270,   # PDF /Rotate is clockwise
             180: Image.Transpose.ROTATE_180,
@@ -155,7 +159,13 @@ def extract_page(
     if candidates:
         target_width = max(int(c.get("width", 0)) for c in candidates) or page.rect.width
     else:
-        target_width = max(page.rect.width * 2.0, 1600.0)  # ~144 dpi fallback
+        # No full-page candidate: cap the render at the largest placed
+        # image's pixel width so a small placed image is never upscaled.
+        # Falls back to the ~144 dpi floor only when no image exists.
+        infos = _placed_image_info(page)
+        largest = max((int(i.get("width") or 0) for i in infos), default=0)
+        fallback = max(page.rect.width * 2.0, 1600.0)
+        target_width = min(fallback, float(largest)) if largest > 0 else fallback
     w, h = _render_page(page, dest, target_width)
     return w, h, "rendered", rotation
 
@@ -190,28 +200,72 @@ def extract_book(
     if not book.pdf.exists():
         raise PageExtractionError(f"Assigned PDF not found: {book.pdf}")
 
-    out_dir = project.data_dir / "pages" / book.book_id / "native"
-    if force and out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Validate the PDF *before* any destructive step: open it, check the
+    # page count, and touch page 1 before --force deletes anything.
+    try:
+        doc = pymupdf.open(book.pdf)
+    except Exception as exc:  # noqa: BLE001 - pymupdf raises many exception types
+        raise PageExtractionError(f"Cannot open assigned PDF {book.pdf}: {exc}") from exc
 
-    doc = pymupdf.open(book.pdf)
+    out_dir = project.data_dir / "pages" / book.book_id / "native"
     records: list[PageRecord] = []
     try:
         if doc.page_count != book.expected_pages:
             raise PageExtractionError(
                 f"{book.book_id}: expected {book.expected_pages}, got {doc.page_count}"
             )
+        _ = doc[0]  # first page must decode before any deletion
+        if force and out_dir.exists():
+            # Back up the state database before destroying native images.
+            if state.path.exists():
+                state.backup("extract-force")
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         for page_no in range(1, doc.page_count + 1):
             dest = out_dir / image_name(book.book_name, page_no)
+            digest: str | None = None
             if dest.exists() and not force:
                 with Image.open(dest) as im:
                     width, height = im.size
-                method = "existing"
                 rotation = int(doc[page_no - 1].rotation or 0)
+                digest = sha256_file(dest)
+                old = state.page(book.book_id, page_no)
+                if old is not None and old.sha256 == digest:
+                    # The file is unchanged: refresh only Stage-1 columns
+                    # so downstream state (status/OCR/flags/features) is
+                    # preserved instead of being reset to Stage-1 defaults.
+                    method = old.extraction_method or "existing"
+                    state.stage1_update(
+                        book.book_id,
+                        page_no,
+                        image_name=dest.name,
+                        pdf_page=page_no,
+                        sha256=digest,
+                        width=width,
+                        height=height,
+                        path=dest,
+                        extraction_method=method,
+                        rotation=rotation,
+                    )
+                    records.append(
+                        replace(
+                            old,
+                            width=width,
+                            height=height,
+                            path=dest,
+                            extraction_method=method,
+                            rotation=rotation,
+                            sha256=digest,
+                            image_name=dest.name,
+                        )
+                    )
+                    continue
+                method = "existing"
             else:
                 width, height, method, rotation = extract_page(doc, page_no, dest)
-            digest = sha256_file(dest)
+            if digest is None:
+                digest = sha256_file(dest)
             record = PageRecord(
                 book_id=book.book_id,
                 page_no=page_no,
@@ -231,13 +285,19 @@ def extract_book(
 
     # Duplicate-image detection is a warning, not an automatic deletion:
     # two blank pages can legitimately look identical after compression.
+    # Content-hash the decoded pixels so an identical scan extracted
+    # verbatim on one page and re-encoded after a 90-degree transpose on
+    # another is still flagged.
     by_hash: dict[str, list[int]] = {}
     for record in records:
-        by_hash.setdefault(record.sha256, []).append(record.page_no)
+        with Image.open(record.path) as im:
+            content = hashlib.sha256(im.convert("RGB").tobytes()).hexdigest()
+        by_hash.setdefault(content, []).append(record.page_no)
     duplicates = {h: pages for h, pages in by_hash.items() if len(pages) > 1}
+    by_page = {r.page_no: r for r in records}
     for pages in duplicates.values():
         for page_no in pages:
-            record = records[page_no - 1]
+            record = by_page[page_no]
             if "DUPLICATE_IMAGE" not in record.review_flags:
                 record.review_flags.append("DUPLICATE_IMAGE")
             state.update_page(book.book_id, page_no, review_flags=record.review_flags)
@@ -249,17 +309,11 @@ def extract_book(
         "pages",
         "native_jsonl",
         manifest_path,
+        sha256=sha256_file(manifest_path),
         meta={
             "page_count": len(records),
             "duplicate_hash_groups": len(duplicates),
-            "native_size": [records[0].width, records[0].height] if records else None,
+            "native_size": sorted({(r.width, r.height) for r in records}),
         },
     )
     return records
-
-
-def duplicate_report(records: list[PageRecord]) -> dict[str, list[int]]:
-    by_hash: dict[str, list[int]] = {}
-    for record in records:
-        by_hash.setdefault(record.sha256, []).append(record.page_no)
-    return {h: pages for h, pages in by_hash.items() if len(pages) > 1}

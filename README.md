@@ -49,7 +49,7 @@ Extraction fidelity after the final re-extraction:
 
 - 950 unique JPEGs, one per page, no duplicate hashes;
 - 923 pages copied byte-for-byte from the embedded JPEG stream;
-- 27 rotated pages transposed losslessly at their native resolution;
+- 27 rotated pages transposed at native resolution (90-degree transpose, JPEG re-encode q95 4:4:4; no resampling; not a DCT-domain lossless transform);
 - no page was upscaled or rendered at a larger size;
 - `<BookName>_updated.pdf` was generated for the two books with rotated
   pages (`data/output/<book_id>/<BookName>/`, built with
