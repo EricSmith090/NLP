@@ -71,12 +71,14 @@ UNVERIFIED_FLAGS = frozenset(
         "DIFF_UNVERIFIED_NO_BOOK_READINGS",
         "DIFF_UNVERIFIED_DIFFERENT_TEXT",
         "DIFF_AMBIGUOUS_READINGS",
-        "COSEGMENTED_UNANCHORED",
         "REVIEW_METADATA_MISSING",
         "REVIEW_METADATA_MISMATCH",
         "REVIEW_METADATA_UNRESOLVED",
         "TEXT_DIFF_INVALID",
         "ALIGN_EVIDENCE_INSUFFICIENT",
+        # Set when --force-recompute re-scores a row whose stored text_diff
+        # was null. Re-scored rows are never auto-verified through recompute.
+        "ALIGN_FORCE_RECOMPUTED_FROM_NULL",
         "REVIEW_DECISION_STALE",
         "REVIEW_DECISION_MISMATCH",
         "REVIEW_DECISION_INVALID",

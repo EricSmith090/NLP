@@ -359,15 +359,21 @@ def recompute_text_diff(
             out.append(row)
             continue
         if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
+            # Non-1-1 rows are forced null FIRST, unconditionally — before any
+            # force_recompute is applied. Such rows can never be re-scored.
             row.text_diff = None
             out.append(row)
             continue
-        if row.text_diff is None and not force_recompute:
+        recomputed_from_null = row.text_diff is None
+        if recomputed_from_null and not force_recompute:
             # The align stage deliberately left this row unscored
             # (non-1-1 / n-m grouping), and CSV round-trips lose the
             # NON_ONE_TO_ONE flag that marks it. Keep the null unless the
-            # caller explicitly force-recomputes (--force-recompute), in
-            # which case the row is treated as a 1-1 candidate again.
+            # caller explicitly force-recomputes (--force-recompute). When it
+            # does, the row is re-scored as a 1-1 candidate but is flagged
+            # ALIGN_FORCE_RECOMPUTED_FROM_NULL so the evaluator classifies it
+            # "unverified", never "verified", regardless of what the re-score
+            # finds.
             out.append(row)
             continue
         diff = auto_text_diff(
@@ -384,6 +390,8 @@ def recompute_text_diff(
         )
         row.text_diff = diff.elements
         row.flags = sorted(set(row.flags + diff.flags + [f"REVIEW:{r}" for r in diff.review_reasons]))
+        if recomputed_from_null:
+            row.flags = sorted(set(row.flags + ["ALIGN_FORCE_RECOMPUTED_FROM_NULL"]))
         if diff.elements is not None:
             problems = validate_text_diff(row.ch_txt, row.vi_txt, diff.elements)
             if problems:
@@ -438,6 +446,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         revocation = reconcile_for_book(project, book, lexicon)
     else:
         revocation = {"skipped_no_previous_csv": True, "changed": False}
+    align_stats: dict[str, Any] = {}
     rows, warnings = align_book(
         book.book_id,
         pairs,
@@ -445,7 +454,20 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         config=project.alignment_config,
         lexicon=lexicon,
         dictionary=dictionary,
+        stats=align_stats,
     )
+    if align_stats.get("qn_tokens_stream") is not None:
+        # Fail-closed stream-vs-emitted token parity: any sentence the
+        # aligner lost must be a hard error, never a silent success.
+        stream_tokens = align_stats["qn_tokens_stream"]
+        emitted_tokens = align_stats.get("qn_tokens_emitted")
+        dropped = align_stats.get("segments_dropped") or 0
+        if dropped != 0 or emitted_tokens != stream_tokens:
+            raise PipelineError(
+                f"{book.book_id}: alignment lost QN content: "
+                f"stream_tokens={stream_tokens} emitted_tokens={emitted_tokens} "
+                f"sentences_skipped={align_stats.get('sentences_skipped') or []}"
+            )
     # Human patches are applied BEFORE learning and BEFORE recomputation so
     # that active learning never consumes unreviewed machine output. Lexicon
     # learning itself is restricted to rows whose decision history is sound
@@ -473,6 +495,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         "lexicon_revocation": revocation,
         "review_decision_issues": review_issues,
         "review_decision_audit": review_audit,
+        "stats": align_stats or None,
         "flags": {
             flag: sum(1 for row in rows if flag in row.flags)
             for flag in sorted({flag for row in rows for flag in row.flags})

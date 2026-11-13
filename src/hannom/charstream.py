@@ -124,15 +124,18 @@ def stream_segments_by_charalign(
             text = "\n".join(lines)
         return text
 
+    missing_pages: list[str] = []
     for pair in pairs:
         for name in pair.ch:
             page = cleaned_by_name.get(name)
             if page is None:
+                missing_pages.append(name)
                 continue
             ch_pages.append(PageImage(name, _page_number(name), cleaned_text(page)))
         for name in pair.vi:
             page = cleaned_by_name.get(name)
             if page is None:
+                missing_pages.append(name)
                 continue
             vi_pages.append(PageImage(name, _page_number(name), cleaned_text(page)))
 
@@ -141,7 +144,7 @@ def stream_segments_by_charalign(
     if not nom_text.strip() or not qn_text.strip():
         return None
 
-    # QN sentence spans from the shared, abbreviation-aware splitter.
+    # QN sentence spans from the shared sentence splitter (hannom.cosegment.qn_sentence_spans).
     sentences = qn_sentence_spans(qn_text)
     if len(sentences) < 2:
         return None
@@ -242,7 +245,7 @@ def stream_segments_by_charalign(
 
     nom_segments: list[Any] = []
     qn_segments: list[Any] = []
-    warnings: list[str] = []
+    warnings: list[str] = [f"MISSING_CLEAN_PAGE:{name}" for name in missing_pages]
     order = 0
     for sidx, (a, b, _tok) in enumerate(sentences):
         sentence_ops = by_sentence.get(sidx, [])

@@ -93,7 +93,7 @@ def test_unmatched_rows_are_counted_separately():
 
 def test_unverified_difference_is_not_scored():
     error = make_element("字字", "x", [[0, 2]], [[0, 1]], "error")
-    row = _row("Book.001.1", "字字", "x", [error], ("COSEGMENTED_UNANCHORED",))
+    row = _row("Book.001.1", "字字", "x", [error], ("ALIGN_EVIDENCE_INSUFFICIENT",))
     metrics = evaluate_rows("b", [row])
     assert metrics.unverified_rows == 1
     assert metrics.scored_rows == 0

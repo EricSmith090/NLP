@@ -68,6 +68,9 @@ Extraction fidelity after the final re-extraction:
 
 - `.jpg` only; native resolution; page numbering starts at 1; one PDF
   page = one image; two-page spreads are never split.
+- Alignment never silently drops a sentence: a collapsed co-cut is emitted
+  as an `UNMATCHED_QN`/`UNMATCHED_NOM` row, and `stage_align` asserts
+  stream-vs-emitted QN token parity fail-closed.
 - Every submitted image has a `Label.txt` row and a `fileState.txt` line;
   every `fileState.txt` value is `1`; boxes have exactly four points.
 - T1 reading order: QN increasing page numbers, Nôm decreasing page
@@ -106,7 +109,7 @@ Extraction fidelity after the final re-extraction:
 │   ├── benchmark_ocr.py
 │   ├── capture_screenshots.py
 │   └── validate_submission.py
-├── tests/                       # 307 tests, no OCR runtime required
+├── tests/                       # 352 tests, no OCR runtime required
 ├── docs/
 │   ├── decisions.md
 │   ├── pipeline.md

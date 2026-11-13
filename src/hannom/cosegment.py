@@ -3,11 +3,7 @@
 T1 books are sentence-aligned 1-1 at the reading level. The Quốc ngữ text
 carries real sentence punctuation; the Nôm side does not (hoặc rarely does).
 
-Two modes:
-
-- ``cosegment_pair`` — pair-wise splitting, used as a fallback when the
-  global stream mode cannot be applied.
-- ``stream_cosegment`` — the primary mode: build one reading stream per
+``stream_cosegment`` — the primary mode: build one reading stream per
   script, split the QN stream at sentence punctuation and assign the same
   cut points to the Nôm stream. Cuts are derived from reliable local
   reading anchors (see ``hannom.anchors``) when anchor evidence exists,
@@ -17,8 +13,17 @@ Two modes:
   as verified evidence. Chunks spanning a page boundary are attributed to
   every page they cover and carry SPANS_PAGES.
   The result is a list of ``Segment`` covering every page exactly once, in
-  reading order, with the same boundaries on both scripts.
+  reading order, with the same boundaries on both scripts. A sentence whose
+  co-cut collapses to zero width is never silently dropped: the Nôm side is
+  emitted as an empty ``UNMATCHED_QN`` segment (a whole-sentence gap, to be
+  resolved by human review) and a token-level parity budget in ``stats``
+  makes any loss detectable fail-closed by the caller.
+
+The per-page fallback (``split_nom_page`` / ``split_qn_page`` in Stage 6,
+``hannom.align``) is used only when the stream cannot be built (too little
+material) — see ``build_segments``.
 """
+
 
 from __future__ import annotations
 
@@ -26,11 +31,22 @@ import re
 from typing import Any
 
 from .anchors import MAX_ANCHOR_GAP_TOKENS, find_reading_anchors, gather_readings, token_items
-from .clean import is_nom_char, nfc
+from .clean import QN_ABBREVIATIONS, VIETNAMESE_UPPER_CLASS, is_nom_char, nfc
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 SENTENCE_STOP_RE = re.compile(r"[.!?;:]")
-SENTENCE_UPPER_RE = re.compile(r"[A-ZÀ-Ỹ0-9\"“(\[]")
+SENTENCE_UPPER_RE = re.compile("[" + VIETNAMESE_UPPER_CLASS + r"0-9\"“(\[]")
+
+# Abbreviations that end with a full stop but are not sentence boundaries.
+# The set lives in ``hannom.clean`` so the stream splitter and the Stage-6
+# per-page fallback stay in lockstep.
+TRAILING_ABBREV_RE = re.compile(r"([^\W\d_]+)\.$", re.UNICODE)
+
+
+def is_abbreviation_stop(text: str, stop_end: int) -> bool:
+    """True when the stop right before ``stop_end`` closes a known abbreviation."""
+    m = TRAILING_ABBREV_RE.search(text[:stop_end])
+    return bool(m and m.group(1).casefold() in QN_ABBREVIATIONS)
 
 
 def qn_sentence_spans(text: str) -> list[tuple[int, int, int]]:
@@ -39,7 +55,9 @@ def qn_sentence_spans(text: str) -> list[tuple[int, int, int]]:
     for m in SENTENCE_STOP_RE.finditer(text):
         end = m.end()
         rest = text[end:].lstrip()
-        if not rest or SENTENCE_UPPER_RE.match(rest):
+        if not rest:
+            stops.append(end)
+        elif SENTENCE_UPPER_RE.match(rest) and not is_abbreviation_stop(text, end):
             stops.append(end)
 
     starts = [0] + stops
@@ -53,64 +71,6 @@ def qn_sentence_spans(text: str) -> list[tuple[int, int, int]]:
         real_start = a + text[a:b].find(seg)
         spans.append((real_start, real_start + len(seg), tcount))
     return spans
-
-
-def cosegment_pair(
-    nom_text: str,
-    vi_text: str,
-) -> list[tuple[str, str]] | None:
-    """Pair Nôm and QN text of the same image-map pair.
-
-    Returns a list of (nom_chunk, vi_chunk) in reading order, or None when
-    co-segmentation cannot be applied (too little material, no QN
-    sentence boundaries, or wildly mismatched lengths).
-    """
-    nom_idx = [i for i, c in enumerate(nom_text) if is_nom_char(c)]
-    if len(nom_idx) < 8:
-        return None
-    spans = qn_sentence_spans(vi_text)
-    if len(spans) < 2:
-        return None
-
-    total_tok = sum(t for _, _, t in spans)
-    if total_tok == 0:
-        return None
-    total_nom = len(nom_idx)
-
-    out: list[tuple[int, int, int, int]] = []
-    tok_acc = 0
-    for a, b, tcount in spans:
-        tok_acc += tcount
-        # The translation expands 1 Nôm char into ~1 QN syllable on average;
-        # assign the proportional share of Nôm characters to this sentence.
-        end_char = round(total_nom * tok_acc / total_tok)
-        out.append((a, b, end_char, tcount))
-
-    # Convert cumulative indices into (nom_slice, vi_slice)
-    result: list[tuple[str, str]] = []
-    prev_nom = 0
-    for a, b, end_char, _t in out:
-        end_char = max(prev_nom, min(total_nom, end_char))
-        # nom slice keeps the raw text span between nom_idx positions
-        n0 = nom_idx[prev_nom] if prev_nom < len(nom_idx) else len(nom_text)
-        n1 = nom_idx[end_char - 1] + 1 if end_char > prev_nom else n0
-        nom_part = nom_text[n0:n1].strip()
-        vi_part = vi_text[a:b].strip()
-        if nom_part and vi_part:
-            result.append((nfc(nom_part), nfc(vi_part)))
-        prev_nom = end_char
-
-    # Attach any leftover Nôm chars to the last chunk (never drop content).
-    if prev_nom < total_nom and result:
-        n0 = nom_idx[prev_nom]
-        nom_part, vi_part = result[-1]
-        merged = nom_text[n0:].strip()
-        if merged:
-            result[-1] = (nfc(nom_part + merged), vi_part)
-
-    if len(result) < 2:
-        return None
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -173,26 +133,31 @@ def _anchor_cuts(
     sentence_token_ranges: list[tuple[int, int]],
     total_nom: int,
     total_tok: int,
-    window: int,
+    window: int | None,
     max_gap_tokens: int,
+    sentence_window_factor: float = 1.5,
 ) -> tuple[list[tuple[int, int]], set[int]]:
     """Return (per-sentence CJK cuts, boundary indices without anchor evidence).
 
     Each boundary is estimated from the bracketing reliable anchors inside a
-    ±``window`` neighborhood of the proportional estimate. When a boundary is
-    not bracketed by at least one anchor on each side, it falls back to the
-    proportional cut and its index is added to the unanchored set.
+    ±``window`` neighborhood of the proportional estimate. ``window`` may be
+    ``None`` for a sentence-relative window of ``max(30, round(factor *
+    sentence_tokens))``. When a boundary is not bracketed by at least one
+    anchor on each side, it falls back to the proportional cut and its
+    index is added to the unanchored set.
     """
     toks_at = [token[0] for token in qn_tokens]
     boundaries: list[int | None] = [0]  # one cut per sentence boundary (0..len(sentences))
     unanchored: set[int] = set()
     for boundary in range(1, len(sentences)):
         est = round(sentence_token_ranges[boundary][0] * total_nom / total_tok)
-        lo = max(0, est - window)
-        hi = min(total_nom, est + window)
+        tcount = sentences[boundary][2]
+        w = window if window is not None else max(30, int(round(sentence_window_factor * tcount)))
+        lo = max(0, est - w)
+        hi = min(total_nom, est + w)
         tok_mid = sentence_token_ranges[boundary][0]
-        k_lo = max(0, tok_mid - window)
-        k_hi = min(len(qn_tokens), tok_mid + window)
+        k_lo = max(0, tok_mid - w)
+        k_hi = min(len(qn_tokens), tok_mid + w)
         sub_anchors = find_reading_anchors(nom_items[lo:hi], qn_tokens[k_lo:k_hi])
         anchors = [(i + lo, k + k_lo) for i, k in sub_anchors]
         boundary_char = sentences[boundary][0]
@@ -214,7 +179,10 @@ def _anchor_cuts(
             unanchored.add(boundary)
         boundaries.append(cut)
     boundaries.append(total_nom)
-    # Keep cuts monotone, clamped to the Nôm stream.
+    # Keep cuts monotone, clamped to the Nôm stream. Every non-empty sentence
+    # is guaranteed at least a 1-ideograph span when the stream has enough
+    # ideographs for it; only the tail can still collapse (and is emitted as
+    # UNMATCHED_QN by the caller instead of being dropped silently).
     cuts: list[tuple[int, int]] = []
     prev_end = 0
     for index in range(len(sentences)):
@@ -222,6 +190,8 @@ def _anchor_cuts(
         end_cut = boundaries[index + 1]
         start_cut = max(prev_end, min(total_nom, start_cut))
         end_cut = max(start_cut, min(total_nom, end_cut))
+        if end_cut == start_cut and start_cut < total_nom:
+            end_cut = start_cut + 1
         cuts.append((start_cut, end_cut))
         prev_end = end_cut
     # Boundary indices are sentence boundaries (1..len(sentences) - 1); the
@@ -236,7 +206,9 @@ def stream_cosegment(
     lexicon: Any | None = None,
     dictionary: Any | None = None,
     max_anchor_gap_tokens: int = MAX_ANCHOR_GAP_TOKENS,
-    anchor_window: int = 20,
+    anchor_window: int | None = None,
+    sentence_window_factor: float = 1.5,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[list[StreamSegment], list[StreamSegment]] | None:
     """Segment the reading stream of both scripts at QN sentence boundaries.
 
@@ -246,6 +218,13 @@ def stream_cosegment(
     reading anchors) or ``COSEGMENTED_UNANCHORED`` (proportional-fallback
     segmentation; never trusted as verified evidence or scoring). Returns
     None when the stream is too small to split.
+
+    A sentence whose co-cut collapses to zero width is never silently
+    dropped: the empty Nôm side is emitted with ``UNMATCHED_QN`` so the gap
+    becomes a reviewable row. When ``stats`` is provided it is filled with
+    token-level accounting (``stream_sentences``, ``qn_tokens_stream``,
+    ``qn_tokens_emitted``, ``segments_dropped``, ``sentence_coverage``,
+    ``sentences_isolated``) so the caller can assert parity fail-closed.
     """
     qn_text, qn_spans = _concat_with_offsets(qn_units, separator=" ")
     if not qn_text.strip():
@@ -290,6 +269,7 @@ def stream_cosegment(
         total_tok=total_tok,
         window=anchor_window,
         max_gap_tokens=max_anchor_gap_tokens,
+        sentence_window_factor=sentence_window_factor,
     )
 
     # For the QN side, ranges are character-index ranges; for the Nôm side,
@@ -322,6 +302,8 @@ def stream_cosegment(
 
     nom_segments: list[StreamSegment] = []
     qn_segments: list[StreamSegment] = []
+    sentences_isolated: list[int] = []
+    sentences_skipped: list[int] = []
     order = 0
     for idx, (a, b, _tcount) in enumerate(sentences):
         n_start_cum, n_end_cum = nom_cuts[idx]
@@ -330,12 +312,71 @@ def stream_cosegment(
         n1 = nom_idx[n_end_cum - 1] + 1 if n_end_cum > n_start_cum else n0
         nom_chunk = nom_text[n0:n1].strip()
         qn_chunk = qn_text[a:b].strip()
-        if not nom_chunk or not qn_chunk:
-            continue
-        p_nom, pns_nom, pimgs_nom = nom_chunk_pages(n_start_cum, n_end_cum)
         p_qn, pns_qn, pimgs_qn = chunk_pages(qn_spans, a, b)
         anchored = (idx not in unanchored_cuts) and ((idx + 1) not in unanchored_cuts)
         anchor_flag = "COSEGMENTED_ANCHORED" if anchored else "COSEGMENTED_UNANCHORED"
+        if not nom_chunk or not qn_chunk:
+            # Never silently drop a sentence: the empty side is emitted as a
+            # whole-sentence gap (UNMATCHED_*), to be resolved by human
+            # review. The parity accounting in ``stats`` makes any remaining
+            # loss fail-closed in the caller.
+            if qn_chunk and not nom_chunk:
+                sentences_isolated.append(idx)
+                nom_segments.append(
+                    StreamSegment(
+                        text="",
+                        image_names=(),
+                        image_name=p_qn,
+                        page_numbers=(),
+                        page_no=pns_qn[0] if pns_qn else 0,
+                        order_no=order,
+                        flags=["COSEGMENTED", "COSEGMENTED_UNANCHORED", "UNMATCHED_QN"],
+                    )
+                )
+                qn_segments.append(
+                    StreamSegment(
+                        text=nfc(qn_chunk),
+                        image_names=pimgs_qn,
+                        image_name=p_qn,
+                        page_numbers=pns_qn,
+                        page_no=pns_qn[0] if pns_qn else 0,
+                        order_no=order,
+                        flags=["COSEGMENTED", "COSEGMENTED_UNANCHORED", "UNMATCHED_QN"],
+                    )
+                )
+                order += 1
+                continue
+            if nom_chunk and not qn_chunk:
+                sentences_isolated.append(idx)
+                p_nom, pns_nom, pimgs_nom = nom_chunk_pages(n_start_cum, n_end_cum)
+                nom_segments.append(
+                    StreamSegment(
+                        text=nfc(nom_chunk),
+                        image_names=pimgs_nom,
+                        image_name=p_nom,
+                        page_numbers=pns_nom,
+                        page_no=pns_nom[0],
+                        order_no=order,
+                        flags=["COSEGMENTED", "COSEGMENTED_UNANCHORED", "UNMATCHED_NOM"],
+                    )
+                )
+                qn_segments.append(
+                    StreamSegment(
+                        text="",
+                        image_names=(),
+                        image_name=p_nom,
+                        page_numbers=(),
+                        page_no=pns_nom[0],
+                        order_no=order,
+                        flags=["COSEGMENTED", "COSEGMENTED_UNANCHORED", "UNMATCHED_NOM"],
+                    )
+                )
+                order += 1
+                continue
+            # Both sides empty — should not happen (spans are non-empty); count it.
+            sentences_skipped.append(idx)
+            continue
+        p_nom, pns_nom, pimgs_nom = nom_chunk_pages(n_start_cum, n_end_cum)
         flags_nom = ["COSEGMENTED", anchor_flag]
         flags_qn = ["COSEGMENTED", anchor_flag]
         if len(pimgs_nom) > 1:
@@ -366,9 +407,20 @@ def stream_cosegment(
         )
         order += 1
 
-    # Reindex order_no sequentially (some sentences yield no chunk).
+    # Reindex order_no sequentially.
     for i, seg in enumerate(nom_segments):
         seg.order_no = i
     for i, seg in enumerate(qn_segments):
         seg.order_no = i
+    if stats is not None:
+        qn_tokens_emitted = sum(len(QN_TOKEN_RE.findall(seg.text)) for seg in qn_segments)
+        stats.update(
+            stream_sentences=len(sentences),
+            qn_tokens_stream=total_tok,
+            qn_tokens_emitted=qn_tokens_emitted,
+            segments_dropped=len(sentences_skipped),
+            sentence_coverage=(len(qn_segments) / len(sentences)) if sentences else 1.0,
+            sentences_isolated=list(sentences_isolated),
+            sentences_skipped=list(sentences_skipped),
+        )
     return nom_segments, qn_segments

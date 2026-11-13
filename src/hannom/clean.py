@@ -45,8 +45,38 @@ NOM_PUNCT_MAP = {
     "\uFF0C": "\u3001",  # ，→、 (fullwidth comma is the Nôm equivalent of 、)
 }
 
+# Abbreviations ending with a full stop that never open a new sentence.
+# (tp./tr. are Vietnamese: "Tp. Hồ Chí Minh", "tr. 3" — both mid-sentence.)
+QN_ABBREVIATIONS = frozenset(
+    {"mr", "mrs", "ms", "dr", "st", "no", "v", "p", "fig", "tp", "tr", "vnd"}
+)
+
 TERMINAL_NOM = set("\u3002\uFF01\uFF1F\uFF1B\uFF1A")
-TERMINAL_QN = set(".!?\u2026")
+
+
+def _uppercase_class(ranges: tuple[tuple[int, int], ...]) -> str:
+    """Uppercase (general-category ``Lu``) chars found in ``ranges``.
+
+    Used to build sentence-splitting lookahead classes. The hand-written
+    range ``À-Ỹ`` (U+00C0–U+1EF8) matched lowercase letters as well as
+    Greek, Cyrillic, Hebrew, Arabic, Armenian and unassigned code points;
+    restricting to Unicode's ``Lu`` category inside the Latin blocks keeps
+    every Latin uppercase letter and drops everything else.
+    """
+    seen: set[str] = set()
+    for lo, hi in ranges:
+        for cp in range(lo, hi + 1):
+            ch = chr(cp)
+            if unicodedata.category(ch) == "Lu":
+                seen.add(ch)
+    return "".join(sorted(seen))
+
+
+# Latin blocks carrying Vietnamese (and other Latin) uppercase letters:
+# Latin-1 Supplement, Latin Extended-A, Latin Extended-B, Latin Extended Additional.
+VIETNAMESE_UPPER_CLASS = _uppercase_class(
+    ((0x0041, 0x005A), (0x00A1, 0x00FF), (0x0100, 0x017F), (0x0180, 0x024F), (0x1E00, 0x1EFF))
+)
 
 PAGE_NUMBER_RE = re.compile(
     r"^\s*(?:[-–—–]\s*)?(?:\d{1,4}|[ivxlcdmIVXLCDM]{1,8})(?:\s*[-–—–])?\s*$"

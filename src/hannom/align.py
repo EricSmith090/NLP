@@ -21,15 +21,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .clean import MASK, TERMINAL_NOM, count_nom_chars, is_nom_char, nfc
+from .clean import MASK, QN_ABBREVIATIONS, VIETNAMESE_UPPER_CLASS, TERMINAL_NOM, count_nom_chars, is_nom_char, nfc
 from .dictionary.book_lexicon import qn_syllables
 from .models import AlignmentRow, DiffElement
 from .review_metadata import write_review_metadata
 from .t1_map import Pair
 from .textdiff import auto_text_diff, validate_text_diff
 
-QN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+(?=[A-ZÀ-Ỹ\"“(\[]|\d)")
-_QN_ABBREV_RE = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|St|No|v|p|fig)\.$", re.IGNORECASE)
+QN_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?;:\u2026])\s+(?=[" + VIETNAMESE_UPPER_CLASS + r"\"“(\[\d])"
+)
+_QN_ABBREV_RE = re.compile(
+    r"\b(?:" + "|".join(sorted(QN_ABBREVIATIONS, key=len, reverse=True)) + r")\.$",
+    re.IGNORECASE,
+)
 NOM_TERMINAL_RE = re.compile(r"(?<=[\u3002\uFF01\uFF1F\uFF1B\uFF1A])")
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -67,8 +72,15 @@ class AlignConfig:
     max_nom_chars: int = 80
     join_cross_page: bool = True
     # Cost per explicitly unmatched segment. Chosen on the same scale as the
-    # Needleman-Wunsch gap penalty (1.2) so that two unmatched segments lose
-    # to a decent 1-1 group but beat a badly-forced correspondence.
+    # Needleman-Wunsch gap penalty (1.2). The true decision band: an explicit
+    # unmatched transition beats a forced 1-1 group only when the group cost
+    # exceeds 2 x 1.2 = 2.4, i.e. when |log(observed/expected)| > 2.4 for a
+    # single 1-1 group (observed syllables/Nôm chars outside roughly
+    # (0.09, 11.05)); inside that band a forced (possibly wrong) 1-1 match is
+    # cheaper than declaring both sides unmatched. Two unmatched segments lose
+    # to a decent 1-1 group but beat a badly-forced correspondence. Rows with
+    # no reading evidence in that band surface as ALIGN_EVIDENCE_INSUFFICIENT
+    # and block the gate — they are not trusted on structure alone.
     unmatched_nom_penalty: float = 1.2
     unmatched_qn_penalty: float = 1.2
     # Segmentation strategy for this project. "cosegment" is the original
@@ -110,12 +122,23 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
         return [text]
     pieces: list[str] = []
     remaining = text
+    # Note: when clamping to a clause boundary, pieces may exceed max_chars
+    # (bounded by the 2x lookahead) — mid-word hard cuts are the last resort.
+    marks = (" ", ";", ",", "\u3001", "\u3002", "\uFF0C", "\uFF1B", "\uFF01", "\uFF1F", "\uFF1A")
     while len(remaining) > max_chars:
         window = remaining[:max_chars]
         # Prefer a punctuation or whitespace boundary near the limit.
-        cut = max(window.rfind(mark) for mark in (" ", ";", ",", "\u3001", "\uFF0C", "\uFF1B"))
+        cut = max(window.rfind(mark) for mark in marks)
         if cut < max_chars // 2:
-            cut = max_chars
+            # Clamp to a clause boundary instead of cutting mid-word: take the
+            # earliest clause boundary in a bounded lookahead after the halfway
+            # point (at most 2x max_chars); hard-cut at max_chars is the last resort.
+            best = -1
+            for mark in marks:
+                pos = remaining.find(mark, max_chars // 2, 2 * max_chars)
+                if pos >= 0 and (best < 0 or pos + 1 < best):
+                    best = pos + 1
+            cut = best if best >= 0 else max_chars
         pieces.append(remaining[:cut].strip())
         remaining = remaining[cut:].strip()
     if remaining:
@@ -184,26 +207,36 @@ def _stream_segments(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[TextSegment] | None:
     """Global reading-stream co-segmentation (both scripts get the same cuts)."""
     from .cosegment import PageUnit, stream_cosegment
 
     nom_units: list[PageUnit] = []
     qn_units: list[PageUnit] = []
+    missing_pages: list[str] = []
     for pair in pairs:
         for name in pair.ch:
             page = cleaned_by_name.get(name)
             if page is None:
+                missing_pages.append(name)
                 continue
             nom_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
         for name in pair.vi:
             page = cleaned_by_name.get(name)
             if page is None:
+                missing_pages.append(name)
                 continue
             qn_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
-    stream = stream_cosegment(nom_units, qn_units, lexicon=lexicon, dictionary=dictionary)
+    if stats is not None and missing_pages:
+        merged = set(stats.get("missing_clean_pages") or [])
+        merged.update(missing_pages)
+        stats["missing_clean_pages"] = sorted(merged)
+    stream = stream_cosegment(nom_units, qn_units, lexicon=lexicon, dictionary=dictionary, stats=stats)
     if stream is None:
         return None
+    if stats is not None:
+        stats["segmenter"] = "cosegment-stream"
     nom_segs, qn_segs = stream
     source = nom_segs if script == "nom" else qn_segs
     out: list[TextSegment] = []
@@ -231,6 +264,7 @@ def build_segments(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[list[TextSegment], list[str]]:
     """Build reading-order segments from image-map pairs.
 
@@ -239,8 +273,11 @@ def build_segments(
     """
     warnings: list[str] = []
     if script in ("nom", "qn"):
-        stream = _stream_segments(pairs, cleaned_by_name, script, lexicon=lexicon, dictionary=dictionary)
+        stream = _stream_segments(pairs, cleaned_by_name, script, lexicon=lexicon, dictionary=dictionary, stats=stats)
         if stream is not None:
+            if stats is not None:
+                warnings += [f"MISSING_CLEAN_PAGE:{name}" for name in stats.get("missing_clean_pages") or []]
+                warnings += [f"QN_SENTENCE_NO_NOM:{i}" for i in stats.get("sentences_isolated") or []]
             return stream, warnings
 
     segments: list[TextSegment] = []
@@ -477,6 +514,20 @@ def _emit_rows(
         vi_txt = nfc(" ".join(s.text for s in qn_group).strip()) if qn_group else ""
         if not ch_txt and not vi_txt:
             continue
+        if kind == "group":
+            # A grouped row with an empty side is semantically an unmatched
+            # row (the stream carried a whole-sentence gap on one side);
+            # normalise here so every downstream path treats it as one.
+            if not ch_txt and vi_txt:
+                kind = "skip_qn"
+                normalized_skip = True
+            elif ch_txt and not vi_txt:
+                kind = "skip_nom"
+                normalized_skip = True
+            else:
+                normalized_skip = False
+        else:
+            normalized_skip = False
         img_id = nom_group[0].image_name if nom_group else qn_group[0].image_name
         base = img_id[:-4] if img_id.lower().endswith(".jpg") else img_id
         counters[base] = counters.get(base, 0) + 1
@@ -491,6 +542,11 @@ def _emit_rows(
             )
         else:
             structural_cost = cost
+        if normalized_skip:
+            # Keep the structural confidence honest for normalised gap rows:
+            # never vouch for a correspondence the stream never supplied.
+            penalty = config.unmatched_qn_penalty if kind == "skip_qn" else config.unmatched_nom_penalty
+            structural_cost = max(structural_cost, penalty)
         confidence = 1.0 / (1.0 + max(0.0, structural_cost))
         semantic_confidence, _anchored, _known = semantic_evidence(ch_txt, vi_txt, lexicon, dictionary)
         if kind in ("skip_nom", "skip_qn"):
@@ -522,6 +578,8 @@ def _emit_rows(
             flags.append("ALIGN_LOW_CONF")
         if any(len(s.page_numbers) > 1 for s in nom_group + qn_group):
             flags.append("SPANS_PAGES")
+        if count_nom_chars(ch_txt) > 160:
+            flags.append("LONG_SEGMENT")
 
         text_diff: list[DiffElement] | None
         if len(nom_group) == 1 and len(qn_group) == 1 and ch_txt and vi_txt:
@@ -567,6 +625,7 @@ def align_book(
     config: dict[str, Any] | None = None,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
     per_book = cfg.per_book.get(book_id, {}) if isinstance(cfg.per_book, dict) else {}
@@ -589,6 +648,9 @@ def align_book(
         else:
             nom_segments, qn_segments, stream_warnings = stream
             warnings += stream_warnings
+            if stats is not None:
+                stats.setdefault("segmentation", "charalign")
+                stats.setdefault("stream_sentences", len(nom_segments))
             if not nom_segments or not qn_segments:
                 return [], warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
             # Segments are index-aligned one per QN sentence; force a 1-1 row
@@ -610,8 +672,11 @@ def align_book(
             )
             return rows, sorted(set(warnings))
 
-    nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary)
-    qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary)
+    nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary, stats=stats)
+    qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary, stats=stats)
+    if stats is not None:
+        stats.setdefault("segmentation", "cosegment")
+        stats.setdefault("segmenter", "per-page-fallback")
     if not nom_segments or not qn_segments:
         return [], nom_warnings + qn_warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
     rows = align_segments(
