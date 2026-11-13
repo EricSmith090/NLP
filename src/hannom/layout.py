@@ -336,6 +336,17 @@ def classify_book(
         if f.nom_likely and folder == "vi" and 0.055 <= f.column_std < 0.075:
             flags.append("MIXED_PAGE_SUSPECT")
 
+        # Declarative bin overrides (e.g. parens-marked translation front
+        # matter or declared misc book back matter). Never override a blank
+        # or Nôm page; overrides take effect deterministically on re-run.
+        if folder not in ("blank", "ch", "nom"):
+            if page.page_no in (book.inventory_vi or ()):
+                section, folder, script = "translation", "vi", "qn"
+                flags.append("BIN_OVERRIDE_VI")
+            elif page.page_no in (book.inventory_misc or ()):
+                section, folder, script = "other", "misc", "qn"
+                flags.append("BIN_OVERRIDE_MISC")
+
         page.section = section
         page.folder = folder
         page.script = script

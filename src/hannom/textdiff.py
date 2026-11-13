@@ -24,6 +24,7 @@ from typing import Any, Iterable, Sequence
 
 from .clean import MASK, count_nom_chars, is_nom_char, nfc
 from .anchors import gather_readings
+from .charalign import fold as variant_fold
 from .models import DiffElement
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -290,20 +291,24 @@ def _reading_match(
     for index in range(start_index, len(tokens)):
         if tokens[index][2] in exact:
             return index
-    if not allow_flat:
-        return None
-    flat = {
-        "".join(ch for ch in unicodedata.normalize("NFD", r) if unicodedata.category(ch) != "Mn")
-        for r in exact
-    }
-    for index in range(start_index, len(tokens)):
-        token_flat = "".join(
-            ch
-            for ch in unicodedata.normalize("NFD", tokens[index][2])
-            if unicodedata.category(ch) != "Mn"
-        )
-        if token_flat in flat:
-            return index
+    if allow_flat:
+        flat = {
+            "".join(ch for ch in unicodedata.normalize("NFD", r) if unicodedata.category(ch) != "Mn")
+            for r in exact
+        }
+        for index in range(start_index, len(tokens)):
+            token_flat = "".join(
+                ch
+                for ch in unicodedata.normalize("NFD", tokens[index][2])
+                if unicodedata.category(ch) != "Mn"
+            )
+            if token_flat in flat:
+                return index
+    fold_variants = {variant_fold(r) for r in exact}
+    if fold_variants:
+        for index in range(start_index, len(tokens)):
+            if variant_fold(tokens[index][2]) in fold_variants:
+                return index
     return None
 
 
@@ -316,6 +321,7 @@ def auto_text_diff(
     strict_reading_mismatch: bool = False,
     proper_name: bool = False,
     allow_flat_match: bool = False,
+    allow_variant_fold: bool = True,
 ) -> DiffResult:
     """Conservative automatic diff.
 
@@ -323,6 +329,12 @@ def auto_text_diff(
     when that reading cannot be matched anywhere in the QN sentence. Unknown
     characters never become red solely because a dictionary is incomplete.
     Yellow is never generated automatically.
+
+    Matching is exact (NFC, casefold) first; a weak variant fold
+    (quỷ/quỉ/quĩ -> qui, d/gi and đ/d alternation) is accepted as a weak
+    reading match (score 1.0, like the flat tone-folded match), never as a
+    stronger signal. The fold applies to comparisons only, never to stored
+    text.
     """
     nom = nfc(nom)
     vi = nfc(vi)
@@ -401,15 +413,18 @@ def auto_text_diff(
         exact = {r.strip().casefold() for r in rs if r.strip()}
         if tok in exact:
             return 2.0
-        if not allow_flat_match:
-            return -1.0
-        flat = {
-            "".join(c for c in unicodedata.normalize("NFD", r) if unicodedata.category(c) != "Mn")
-            for r in exact
-        }
-        tok_flat = "".join(c for c in unicodedata.normalize("NFD", tok) if unicodedata.category(c) != "Mn")
-        if tok_flat in flat:
-            return 1.0
+        if allow_flat_match:
+            flat = {
+                "".join(c for c in unicodedata.normalize("NFD", r) if unicodedata.category(c) != "Mn")
+                for r in exact
+            }
+            tok_flat = "".join(c for c in unicodedata.normalize("NFD", tok) if unicodedata.category(c) != "Mn")
+            if tok_flat in flat:
+                return 1.0
+        if allow_variant_fold:
+            fold_variants = {variant_fold(r) for r in exact}
+            if variant_fold(tok) in fold_variants:
+                return 1.0
         return -1.0
 
     n, m_ = len(chars), len(tokens)

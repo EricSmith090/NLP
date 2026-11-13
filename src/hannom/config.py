@@ -41,6 +41,11 @@ class BookConfig:
     translation_start: int = 1
     translation_end: int = 0
     back_matter_is_toc: bool = True
+    # Optional per-page bin overrides (page numbers), applied after layout
+    # classification: the parens cross-references the translation pages
+    # carry identify them; the rest are declarative misc/ policy.
+    inventory_vi: tuple[int, ...] = ()
+    inventory_misc: tuple[int, ...] = ()
     ocr: OCRSettings = field(default_factory=OCRSettings)
     review_profile: str = "strict"
 
@@ -155,6 +160,8 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
                 translation_start=int(b.get("translation_start", 1)),
                 translation_end=int(b.get("translation_end", 0)),
                 back_matter_is_toc=bool(b.get("back_matter_is_toc", True)),
+                inventory_vi=tuple(int(x) for x in (b.get("inventory_vi", []) or [])),
+                inventory_misc=tuple(int(x) for x in (b.get("inventory_misc", []) or [])),
                 ocr=OCRSettings(
                     nom=tuple(ocr_raw.get("nom", ["paddleocr_vl", "kimhannom"])),
                     # quoc_ngu is Vintern-1B-v2 full-page transcription since 2026-11-08

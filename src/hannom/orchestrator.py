@@ -166,7 +166,7 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
     for page in pages:
         by_folder.setdefault(str(page.folder), []).append(page)
     counts: dict[str, Any] = {}
-    for folder in ("ch", "vi", "intro", "ref", "toc"):
+    for folder in ("ch", "vi", "intro", "ref", "toc", "misc"):
         folder_pages = sorted(by_folder.get(folder, []), key=lambda p: p.page_no)
         if not folder_pages:
             continue

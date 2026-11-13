@@ -71,6 +71,14 @@ class AlignConfig:
     # to a decent 1-1 group but beat a badly-forced correspondence.
     unmatched_nom_penalty: float = 1.2
     unmatched_qn_penalty: float = 1.2
+    # Segmentation strategy for this project. "cosegment" is the original
+    # anchor-interpolated cut heuristic; "charalign" projects the global
+    # reading-stream alignment onto the QN sentence boundaries (see
+    # hannom.charstream). Per-book overrides (segmentation, strip_texts)
+    # live in ``per_book``.
+    segmentation: str = "cosegment"
+    strip_texts: list[str] = field(default_factory=list)
+    per_book: dict[str, Any] = field(default_factory=dict)
 
 
 def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
@@ -91,6 +99,9 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
         join_cross_page=bool(raw.get("join_cross_page", defaults.join_cross_page)),
         unmatched_nom_penalty=float(raw.get("unmatched_nom_penalty", defaults.unmatched_nom_penalty)),
         unmatched_qn_penalty=float(raw.get("unmatched_qn_penalty", defaults.unmatched_qn_penalty)),
+        segmentation=str(raw.get("segmentation", defaults.segmentation)),
+        strip_texts=[str(item) for item in (raw.get("strip_texts", []) or [])],
+        per_book=dict(raw.get("per_book", {}) or {}),
     )
 
 
@@ -433,7 +444,27 @@ def align_segments(
         i -= a
         j -= b
     groups.reverse()
+    return _emit_rows(
+        groups,
+        nom_segments,
+        qn_segments,
+        config=config,
+        lexicon=lexicon,
+        dictionary=dictionary,
+        minimum_confidence=minimum_confidence,
+    )
 
+
+def _emit_rows(
+    groups: Sequence[tuple[int, int, int, int, float, str, int, int]],
+    nom_segments: Sequence[TextSegment],
+    qn_segments: Sequence[TextSegment],
+    *,
+    config: AlignConfig,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    minimum_confidence: float | None = None,
+) -> list[AlignmentRow]:
     rows: list[AlignmentRow] = []
     counters: dict[str, int] = {}
     threshold = minimum_confidence if minimum_confidence is not None else config.low_confidence_threshold
@@ -538,6 +569,47 @@ def align_book(
     dictionary: Any | None = None,
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
+    per_book = cfg.per_book.get(book_id, {}) if isinstance(cfg.per_book, dict) else {}
+    segmentation = str(per_book.get("segmentation") or cfg.segmentation or "cosegment")
+    strip_texts = tuple(per_book.get("strip_texts") or cfg.strip_texts or ())
+    if segmentation == "charalign":
+        from .charstream import stream_segments_by_charalign
+        warnings: list[str] = []
+        try:
+            stream = stream_segments_by_charalign(
+                pairs, cleaned_by_name,
+                lexicon=lexicon, dictionary=dictionary,
+                strip_texts=strip_texts,
+            )
+        except Exception as exc:  # fall back loudly, never crash the stage silently
+            stream = None
+            warnings.append(f"CHARALIGN_SEGMENTS_FAILED:{type(exc).__name__}:{exc}")
+        if stream is None:
+            warnings.append("CHARALIGN_SEGMENTS_FAILED: falling back to cosegment")
+        else:
+            nom_segments, qn_segments, stream_warnings = stream
+            warnings += stream_warnings
+            if not nom_segments or not qn_segments:
+                return [], warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
+            # Segments are index-aligned one per QN sentence; force a 1-1 row
+            # per sentence. The DP is bypassed entirely for this book class.
+            groups: list[tuple[int, int, int, int, float, str, int, int]] = []
+            for i in range(len(nom_segments)):
+                nom = nom_segments[i]
+                qn = qn_segments[i]
+                kind = "group"
+                if not nom.text and qn.text:
+                    kind = "skip_qn"   # QN side has content the Nôm stream could not supply
+                elif nom.text and not qn.text:
+                    kind = "skip_nom"
+                groups.append((i, i + 1, i, i + 1, 0.0, kind, 1, 1))
+            rows = _emit_rows(
+                groups, nom_segments, qn_segments,
+                config=cfg, lexicon=lexicon, dictionary=dictionary,
+                minimum_confidence=None,
+            )
+            return rows, sorted(set(warnings))
+
     nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary)
     qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary)
     if not nom_segments or not qn_segments:

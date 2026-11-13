@@ -1,4 +1,18 @@
 alignment:
+  # Cosegmentation strategy for sentence cuts. "cosegment" is the original
+  # anchor-interpolated cut heuristic. "charalign" aligns the two reading
+  # streams globally and projects QN punctuation cuts onto the Nôm stream
+  # (see hannom.charstream). Per-book overrides live under per_book.
+  segmentation: cosegment
+  per_book:
+    T1_SuaLoiQuyen:
+      segmentation: charalign
+      # Margin running-head boxes printed on Nôm pages (title of the book).
+      strip_texts: ["所𥚇卷"]
+    T1_CamPhong_Tap1:
+      segmentation: charalign
+    T1_CamPhong_Tap2:
+      segmentation: cosegment
   # Length ratio is a weak but cheap prior for phonetic translation.
   expected_syllables_per_nom_char: 1.0
   max_group: 4
@@ -20,6 +34,12 @@ text_diff:
   unknown_policy: review
   require_dictionary_for_black: false
   strip_diacritics_for_reading_match: false
+  # Weak orthographic variant fold (quỷ/quỉ/quĩ -> qui, d/gi and đ/d
+  # alternation) is accepted as a *weak* reading match inside the NW
+  # matcher (same weight as the flat tone-stripped match). Comparison-only;
+  # never red-generating evidence, never edits stored text. Report coverage
+  # in the metrics so reviewers can audit how often it fires.
+  variant_fold: true
   proper_name_max_chars: 12
   proper_name_max_syllables: 12
 
