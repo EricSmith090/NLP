@@ -419,6 +419,7 @@ def validate_book_package(
     *,
     minimum_similarity: float | None = None,
     require_labels: bool = True,
+    allow_empty_labels: bool = False,
 ) -> list[PackageIssue]:
     issues: list[PackageIssue] = []
     if not book_dir.exists():
@@ -512,6 +513,26 @@ def validate_book_package(
                 issues.append(PackageIssue("MISSING_LABELS", f"{folder}/Label.txt missing"))
             if not (folder_dir / "fileState.txt").exists():
                 issues.append(PackageIssue("MISSING_FILESTATE", f"{folder}/fileState.txt missing"))
+            if not allow_empty_labels and (folder_dir / "Label.txt").exists():
+                empty_images = 0
+                try:
+                    from .labels import read_label_txt
+
+                    rows = read_label_txt(folder_dir / "Label.txt")
+                    empty_images = sum(1 for boxes in rows.values() if not boxes)
+                except ValueError:
+                    # Already reported as LABEL_INVALID above.
+                    pass
+                if empty_images:
+                    issues.append(
+                        PackageIssue(
+                            "EMPTY_LABELS",
+                            f"{folder}/Label.txt: {empty_images} images have no boxes; "
+                            "re-run OCR + labels, or pass --allow-empty-labels to ship an "
+                            "explicitly incomplete book",
+                            path=str(folder_dir / "Label.txt"),
+                        )
+                    )
 
     # CSV must be readable and internally consistent.
     if csv_path.exists():

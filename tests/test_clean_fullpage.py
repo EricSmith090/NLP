@@ -15,20 +15,32 @@ def test_full_page_leading_mark_dash_only():
     assert "PAGE_MARK_REMOVED" in page.flags
 
 
-def test_full_page_leading_mark_dash_with_parens():
-    page = clean_quoc_ngu_page("b", 32, "Book.032.jpg", ["-30 - (93) Sửa Lưới"])
-    # Leading mark removed; the lone footer is kept (page never blanked).
-    assert page.text == "Sửa Lưới"
+def test_full_page_leading_mark_dash_only():
+    page = clean_quoc_ngu_page("b", 16, "Book.016.jpg", ["-14- ( 109 )"])
+    assert page.text == ""
     assert "PAGE_MARK_REMOVED" in page.flags
 
 
-def test_full_page_trailing_title_footer_is_stripped():
+def test_full_page_leading_mark_dash_with_parens():
+    # v2.1 fix set: the lone title colophon after a page marker is removed
+    # line-by-line (verify-D fix #5/#8; the whole page is flagged empty).
+    page = clean_quoc_ngu_page("b", 32, "Book.032.jpg", ["-30 - (93) Sửa Lưới"])
+    assert page.text == ""
+    assert "PAGE_MARK_REMOVED" in page.flags
+    assert "FOOTER_TITLE_REMOVED" in page.flags
+    assert "EMPTY_AFTER_CLEAN" in page.flags
+
+
+def test_full_page_trailing_title_footer_is_suspect():
+    # v2.1 fix set: a body line ending in the book's theme words is kept and
+    # flagged for review, never silently deleted (verify-D fix #5).
     page = clean_quoc_ngu_page(
         "b", 12, "Book.012.jpg",
         ["ho nó trả của ta thì nên hay là Sửa Lứỡi"],
     )
-    assert page.text == "ho nó trả của ta thì nên hay là"
-    assert "FOOTER_TITLE_REMOVED" in page.flags
+    assert page.text == "ho nó trả của ta thì nên hay là Sửa Lứỡi"
+    assert "FOOTER_TITLE_SUSPECT" in page.flags
+    assert "FOOTER_TITLE_REMOVED" not in page.flags
 
 
 def test_full_page_trailing_title_uppercase_qui():
@@ -36,14 +48,19 @@ def test_full_page_trailing_title_uppercase_qui():
         "b", 9, "Book.009.jpg",
         ["-7 BẢN QUỐC NGỮ SỬA LƯỚI QUYỀN"],
     )
-    assert page.text == "-7 BẢN QUỐC NGỮ"
-    assert "FOOTER_TITLE_REMOVED" in page.flags
+    # The remainder is body text ending in a letter: kept, flagged suspect.
+    assert page.text == "-7 BẢN QUỐC NGỮ SỬA LƯỚI QUYỀN"
+    assert "FOOTER_TITLE_SUSPECT" in page.flags
 
 
-def test_full_page_title_like_content_is_kept():
-    # A page whose text legitimately contains the phrase must keep it.
+def test_full_page_title_like_content_is_removed():
+    # A page whose only line is the colophon itself is removed and flagged
+    # empty (verify-D §6 fix #5/#8: page never blanked is no longer a rule;
+    # an apparatus-only page must be reported as EMPTY_AFTER_CLEAN).
     page = clean_quoc_ngu_page("b", 2, "Book.002.jpg", ["SỬA LUỘI QUYỀN"])
-    assert page.text == "SỬA LUỘI QUYỀN"
+    assert page.text == ""
+    assert "FOOTER_TITLE_REMOVED" in page.flags
+    assert "EMPTY_AFTER_CLEAN" in page.flags
 
 
 def test_full_page_lowercase_title_is_kept():

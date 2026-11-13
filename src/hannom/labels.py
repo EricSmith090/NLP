@@ -76,7 +76,7 @@ def clamp_quad(
 ) -> tuple[tuple[float, float], ...]:
     out: list[tuple[float, float]] = []
     for x, y in points:
-        out.append((min(max(0.0, x), float(max(1, width - 1))), min(max(0.0, y), float(max(1, height - 1)))))
+        out.append((min(max(0.0, x), float(max(1, width))), min(max(0.0, y), float(max(1, height)))))
     return tuple(out)
 
 

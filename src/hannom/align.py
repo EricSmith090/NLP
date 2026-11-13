@@ -113,7 +113,7 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
     while len(remaining) > max_chars:
         window = remaining[:max_chars]
         # Prefer a punctuation or whitespace boundary near the limit.
-        cut = max(window.rfind(mark) for mark in (" ", ";", ",", "\u3001", "\uFF1B"))
+        cut = max(window.rfind(mark) for mark in (" ", ";", ",", "\u3001", "\uFF0C", "\uFF1B"))
         if cut < max_chars // 2:
             cut = max_chars
         pieces.append(remaining[:cut].strip())

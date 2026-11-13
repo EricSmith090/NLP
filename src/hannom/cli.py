@@ -285,12 +285,13 @@ def package(
     config: str = "configs/project.yaml",
     book: Optional[str] = None,
     strict_gate: bool = True,
+    allow_empty_labels: bool = False,
 ):
     """Build per-book folders after the quality gate passes."""
     project = _project(config)
     with open_state(project) as state:
         for item in _books(project, book):
-            book_dir, _ = stage_package(project, item, state, strict_gate=strict_gate)
+            book_dir, _ = stage_package(project, item, state, strict_gate=strict_gate, allow_empty_labels=allow_empty_labels)
             console.print(f"[green]{item.book_id}[/]: {book_dir}")
 
 
@@ -320,11 +321,12 @@ def package_all(
     config: str = "configs/project.yaml",
     strict_gate: bool = True,
     strict_report: bool = True,
+    allow_empty_labels: bool = False,
 ):
     """Build the full ZIP with three sibling book folders, report, and source."""
     project = _project(config)
     with open_state(project) as state:
-        result = stage_package_all(project, state, strict_gate=strict_gate, strict_report=strict_report)
+        result = stage_package_all(project, state, strict_gate=strict_gate, strict_report=strict_report, allow_empty_labels=allow_empty_labels)
     console.print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -341,13 +343,14 @@ def validate(
     config: str = "configs/project.yaml",
     book: Optional[str] = None,
     source_zip: Optional[Path] = None,
+    allow_empty_labels: bool = False,
 ):
     """Mirror the acceptance checklist; exit non-zero on blockers."""
     project = _project(config)
     issues = []
     for item in _books(project, book):
         book_dir = project.output_dir / item.book_name
-        issues.extend(validate_book_package(project, item, book_dir))
+        issues.extend(validate_book_package(project, item, book_dir, allow_empty_labels=allow_empty_labels))
     if source_zip and source_zip.exists():
         issues.extend(validate_source_zip(source_zip))
     warnings = [i for i in issues if i.severity == "warning"]

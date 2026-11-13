@@ -15,7 +15,7 @@ from .align import (
     align_book,
     write_alignment_csv,
 )
-from .clean import CleanedPage, clean_page_lines, detect_running_lines
+from .clean import CleanedPage, clean_page_lines, detect_running_lines, validate_clean_text
 from .config import BookConfig, ProjectConfig, load_config
 from .dictionary.book_lexicon import BookLexicon
 from .dictionary.index import build_dictionary_index
@@ -160,11 +160,23 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
                 )
             if _lines_by_page:
                 running[_script] = _detect(_lines_by_page)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print(f"[hannom] labels: running-lines detection disabled for {book.book_id}: {exc}")
         running = {}
     by_folder: dict[str, list[PageRecord]] = {}
     for page in pages:
         by_folder.setdefault(str(page.folder), []).append(page)
+    # Prune label folders from bins that no longer have pages in the DB
+    # (e.g. after the 2026-11-12 re-bin, SLQ's intro/toc went to zero while
+    # their stale label files remained on disk). Stages are write-only by
+    # design, so pruning stale bins must happen here, explicitly.
+    label_root = project.data_dir / "labels" / book.book_id
+    for folder in ("ch", "vi", "intro", "ref", "toc", "misc"):
+        if folder not in by_folder:
+            stale = label_root / folder
+            if stale.exists():
+                shutil.rmtree(stale)
+                print(f"[hannom] labels: pruned stale {folder}/ for {book.book_id} (bin has no pages in the DB)")
     counts: dict[str, Any] = {}
     for folder in ("ch", "vi", "intro", "ref", "toc", "misc"):
         folder_pages = sorted(by_folder.get(folder, []), key=lambda p: p.page_no)
@@ -209,12 +221,30 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
         state_path = _book_stage(project, book, state, "labels") / folder / "fileState.txt"
         write_label_txt(image_names, boxes_by_image, label_path, folder)
         write_file_state(image_names, state_path, folder, 1)
+        no_result = {p.image_name for p in folder_pages if p.image_name in empty}
+        with_boxes = {name for name in boxes_by_image if boxes_by_image[name]}
+        all_noise = {
+            p.image_name
+            for p in folder_pages
+            if p.image_name not in no_result and p.image_name not in with_boxes
+        }
+        # Reconcile the label flags on every regenerated page: drop stale
+        # empty flags from pages that now carry boxes, and raise exactly one
+        # flag for each empty page (LABEL_EMPTY_OCR = OCR missing; OCR_ALL_NOISE
+        # = OCR ran but every line was cleaned away). An in-scope page must
+        # never leave a regeneration unflagged.
+        for page in folder_pages:
+            image = page.image_name
+            before = set(page.review_flags)
+            if image in no_result:
+                new_flags = (before | {"LABEL_EMPTY_OCR"}) - {"OCR_ALL_NOISE"}
+            elif image in all_noise:
+                new_flags = (before | {"OCR_ALL_NOISE"}) - {"LABEL_EMPTY_OCR"}
+            else:
+                new_flags = before - {"LABEL_EMPTY_OCR", "OCR_ALL_NOISE"}
+            if new_flags != before:
+                state.update_page(book.book_id, page.page_no, review_flags=sorted(new_flags))
         counts[folder] = {"images": len(image_names), "boxes": sum(len(v) for v in boxes_by_image.values()), "empty": empty}
-        if empty:
-            for page in folder_pages:
-                if page.image_name in empty:
-                    flags = sorted(set(page.review_flags + ["LABEL_EMPTY_OCR"]))
-                    state.update_page(book.book_id, page.page_no, review_flags=flags)
     return counts
 
 
@@ -243,7 +273,7 @@ def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[
     count = 0
     flags: dict[str, int] = {}
     for page in pages:
-        if page.folder not in {"ch", "vi", "intro", "toc", "ref"}:
+        if page.folder not in {"ch", "vi", "intro", "toc", "ref", "misc"}:
             continue
         result = router.load_result(page)
         if result is None:
@@ -257,6 +287,10 @@ def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[
             [line.text for line in result.lines],
             running_lines=running.get("ch" if script == "nom" else "vi"),
         )
+        text_issues = validate_clean_text(cleaned.text, script)
+        if text_issues:
+            if "CLEAN_TEXT_INVALID" not in cleaned.flags:
+                cleaned.flags.append("CLEAN_TEXT_INVALID")
         dest = out_dir / f"{page.page_no:04d}.json"
         dest.write_text(json.dumps(cleaned.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         count += 1
@@ -508,6 +542,7 @@ def stage_package(
     state: State,
     *,
     strict_gate: bool = True,
+    allow_empty_labels: bool = False,
 ) -> tuple[Path, list]:
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
@@ -527,6 +562,7 @@ def stage_package(
         book,
         book_dir,
         minimum_similarity=float(project.quality.get("minimum_similarity", 95.0)),
+        allow_empty_labels=allow_empty_labels,
     )
     blockers = [i for i in issues if i.severity != "warning"]
     if blockers:
@@ -562,11 +598,12 @@ def stage_package_all(
     *,
     strict_gate: bool = True,
     strict_report: bool = True,
+    allow_empty_labels: bool = False,
 ) -> dict[str, Any]:
     book_dirs: list[Path] = []
     metrics: list[BookMetrics] = []
     for book in project.books:
-        book_dir, _ = stage_package(project, book, state, strict_gate=strict_gate)
+        book_dir, _ = stage_package(project, book, state, strict_gate=strict_gate, allow_empty_labels=allow_empty_labels)
         book_dirs.append(book_dir)
         metrics.append(stage_evaluate(project, book, state))
     report_path, report_issues, _ = build_report(project, metrics, strict=strict_report)

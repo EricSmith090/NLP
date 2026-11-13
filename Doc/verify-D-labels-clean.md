@@ -352,3 +352,35 @@ Scratch probes (already written, re-runnable): `C:\Users\MSI VN\AppData\Local\Te
 17. **§9 caveats**: counts re-measured 2026-11-12; added Tap3/Tap2 desync caveat; `fileState≡1` caveat extended (uniformly true incl. stale files → membership must be checked misc-aware against DB); 291 → 282.
 
 *Evidence appendix: `C:\Users\MSI VN\AppData\Local\Temp\opencode\verify-D\` (probes + outputs) and `C:\Users\MSI VN\AppData\Local\Temp\opencode\verify-revise-D\` (this revision's re-measurement probes). Full long-form narrative also at `REPORT.md` there — this document is the handoff version.*
+
+---
+
+## Addendum 2026-11-13 (fixes implemented and re-verified)
+
+All fixes from §6 (fix list) landed on 2026-11-13, with the replication's additions. No Tap2 decision was taken (OCR untouched). Tests: **333 passed**. Backups: `data/archive/verify-D-fix-backup-2026-11-13T185732/` (DB + labels + clean snapshot).
+
+**Landed:**
+1. **C2** — `clean_nom_lines` now applies the sanitizer (per-line, merged counts); `text == join(lines)` re-verified; `U+3013` count = **765** in clean outputs and **765** in Label.txt; Co/Cn/Cs = **0** everywhere.
+2. **C3** — `validate_clean_text` extended to reject all `Co/Cf/Cs/Cc/Cn` code points (except 〓/`[MASK]` chars), now called from `stage_clean` (violations → `CLEAN_TEXT_INVALID`); dead `MASK_LEN` branch replaced with a live bracketed-token check; current corpus: **0** `CLEAN_TEXT_INVALID`.
+3. **H2** — `stage_labels` reconciles flags truthfully on every regeneration (stale `LABEL_EMPTY_OCR` removed from pages that carry boxes; OCR-exists-but-silent pages get `OCR_ALL_NOISE`; nothing unflagged): Tap1 `LABEL_EMPTY_OCR` 269 → **2** (never-OCR'd NULL-engine `.001`/`.009`); `OCR_ALL_NOISE` = Tap1 2 (`.083`, `.145`), SLQ 2 (`.002`, `.003`); every on-disk empty row (545) is now flagged.
+4. **H1** — `_FULLPAGE_LEADING_MARK` rewritten: mandatory leading `-`, terminator required (`-N -`, `-N
+(P` or `-N (P)`); bare years cannot split (`'1802…'`, `'1913 …'`, `'1975 30 …'`, `'15 20 25 …'`); synthetic suite added; all recorded corpus drops still match (110/110).
+5. **M1** — `_strip_trailing_title` now returns a disposition: `removed` (title-only or remainder ending in sentence/dash punctuation) → `FOOTER_TITLE_REMOVED`; ambiguous body-ish remainders → kept + `FOOTER_TITLE_SUSPECT` (SLQ `0048`/`0051`-class are now kept and flagged).
+6. **M2** — `_join_hyphenated_lines`: artifact joins are `prev-… + " " + rest` (guideline: one space); keep-hyphen rule reduced to `[A-Z]` prior token; hyphen+space third branch removed; `HYPHEN_JOINED` flag emitted.
+7. **M5** — `clamp_quad` caps at `width`/`height` (not `width-1`); QN whole-page coverage ≈ 1.000 on 800×1135 pages possible again (previous min 0.9979).
+8. **M3** — QN path loops a final page-number drop pass after footer stripping; `EMPTY_AFTER_CLEAN` emitted when text becomes empty (Tap1 `0083`/`0009`, SLQ `0003`); Nôm margin-noise page-number drops are now flagged `PAGE_NUMBER_REMOVED` (was unflagged).
+9. **H3** (partial) — Vintern giant pages are split on embedded newlines at input, so the existing marginal rule actually works on QN pages at all (marker-only apparatus pages now clean to empty correctly instead of silently keeping junk). `detect_running_lines` output is still 0 everywhere (no false removals); the bare `except Exception: running = {}` in `stage_labels` now logs the exception instead of swallowing it. `stage_clean` also skips nothing relevant anymore (`misc` included).
+   **Caveat:** misc pages (colophon/TOC/glossary) that were stale now regenerate; 0003-class residue (e.g. the `Lưu Hành Nội Bộ` colophon fragment in SLQ `0005`) survives as content and is flagged — auto-removal still needs human review.
+10. **M4** — documented in `USER_GUIDE.md` §8: `difficult` = the OCR tool's own field; `confidence` = passthrough from the Kim Hán Nôm API line payload (not an annotation-quality filter).
+    **M6** — `_split_long_text` now prefers fullwidth `，` (U+FF0C) too; `NOM_PUNCT_MAP` maps `，→、`; `NOM_TERMINAL_RE` unchanged (correct — `，` never ends a sentence). Stray `data/labels/T1_SuaLoiQuyen/image_map.json` moved to `data/archive/.../stray_labels_T1_SuaLoiQuyen_image_map.json`.
+11. **Stale-file pruning** — `stage_labels` now prunes folders whose bin has no pages in the DB (SLQ stale `intro/`/`toc/` removed; Tap1/Tap2 consistent 15/15 on the misc-aware membership audit). The pruning is deletion-to-zero-page-scope only; no other deletion.
+12. **Packaging** — `validate_book_package` + `EMPTY_LABELS` blocker (any `ch/`/`vi/` Label.txt row with zero boxes refuses packaging; `--allow-empty-labels` override on `package`/`package-all`/`validate`). Packaging gate remains blind to intro/toc/misc membership by design (DB vs folder parity is 15/15 today but enforced nowhere in-pipeline).
+
+**Re-verified 2026-11-13:** 0 validator issues on 11 existing folders; 931 rows / 2,487 boxes (545 empty — +2 from SLQ `.002`/`.003` marker-only apparatus pages, now flagged `OCR_ALL_NOISE`); membership audit 15/15; fileState ≡1; prefix 0 violations; Nôm order 0/444; `summary.json` pages == DB ocr_done exactly (274+6+110=390).
+
+**Not done / outstanding:**
+- Tap2 OCR untouched (explicit exclusion). Tap2 remains a 537-empty-row book; `package-all` now **refuses** it unless `--allow-empty-labels` is passed (intended).
+- `align`/`evaluate`/`report` were **not** re-run after the 〓 regeneration; `data/align`, `data/evaluation` contain pre-fix texts (scores unchanged in aggregate but artifact text differs). Re-run before any packaging/report step.
+- `FOOTER_TITLE_SUSPECT` and `OCR_ALL_NOISE` pages still need human review (see `docs/review_guide.md`).
+- Flags merged by clean/labels remain merge-only (never retracted) — truthful for current runs but revisit flag GC separately.
+- Nothing committed; all changes are in the working tree.
