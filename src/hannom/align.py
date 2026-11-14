@@ -26,7 +26,7 @@ from .dictionary.book_lexicon import qn_syllables
 from .models import AlignmentRow, DiffElement
 from .review_metadata import write_review_metadata
 from .t1_map import Pair
-from .textdiff import auto_text_diff, validate_text_diff
+from .textdiff import auto_text_diff, validate_text_diff, variant_fold_from_config
 
 QN_SENTENCE_SPLIT_RE = re.compile(
     r"(?<=[.!?;:\u2026])\s+(?=[" + VIETNAMESE_UPPER_CLASS + r"\"“(\[\d])"
@@ -91,10 +91,16 @@ class AlignConfig:
     segmentation: str = "cosegment"
     strip_texts: list[str] = field(default_factory=list)
     per_book: dict[str, Any] = field(default_factory=dict)
+    # Weak orthographic variant fold inside the text_diff NW matcher
+    # (quỷ/quĩ/quy -> qui). Consumed from ``text_diff.variant_fold`` in the
+    # same file via ``variant_fold_from_config``; kept here so both the
+    # align-time call site and the caller-facing plumb can share it.
+    variant_fold: bool = True
 
 
 def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
-    raw = (raw or {}).get("alignment", raw or {})
+    raw_config = raw or {}
+    raw = raw_config.get("alignment", raw_config) or {}
     defaults = AlignConfig()
     return AlignConfig(
         expected_syllables_per_nom_char=float(
@@ -114,6 +120,7 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
         segmentation=str(raw.get("segmentation", defaults.segmentation)),
         strip_texts=[str(item) for item in (raw.get("strip_texts", []) or [])],
         per_book=dict(raw.get("per_book", {}) or {}),
+        variant_fold=variant_fold_from_config(raw_config),
     )
 
 
@@ -589,6 +596,7 @@ def _emit_rows(
                 lexicon=lexicon,
                 dictionary=dictionary,
                 strict_reading_mismatch=False,
+                allow_variant_fold=config.variant_fold,
             )
             text_diff = diff.elements
             flags.extend(diff.flags)

@@ -166,6 +166,14 @@ class BookMetrics:
     # Historical decision diagnostics that are NOT active blockers (all
     # superseded or otherwise non-attributable events from the log).
     decision_audit_diagnostics: list[str] = field(default_factory=list)
+    # Spec (Quy_định_đồ_án_v2.1, "Đánh giá dữ liệu") formula computed over
+    # ALL rows with text_diff ≠ null (including unverified/null-flagged rows),
+    # not only verified ones: similarity = (1 − red_penalty / denom) × 100.
+    # Informational; gate uses `similarity`/`denominator`/`coverage_ratio`.
+    spec_formula_similarity: float | None = None
+    spec_formula_red_chars: int = 0
+    spec_formula_denominator: int = 0
+    spec_formula_scored_rows: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         from dataclasses import asdict

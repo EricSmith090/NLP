@@ -341,15 +341,43 @@ def learn_for_book(lexicon, rows, dictionary, failures):
     return lexicon.learn_from_rows(rows, dictionary)
 
 
+def _rederivable_text_diff_flag(flag: str) -> bool:
+    """Return True for flags fully re-derived from the recomputed text_diff.
+
+    ``recompute_text_diff`` re-derives every ``DIFF_*`` flag (and the matching
+    ``REVIEW:DIFF_*`` pairs) from the row’s text; keeping the align-time
+    originals alongside the recompute-time ones produced contradictory pairs
+    like ``DIFF_READING_MISMATCH`` + ``DIFF_NO_READING_MISMATCH`` on the same
+    row (verify-F sec.5.A). Re-derived flags are therefore replaced, never
+    unioned. Human-facing flags that survive: ``IMAGE_REC_*``, ``OCR_*``,
+    ``ALIGN_*``, ``COSEGMENTED_*``, ``SPANS_PAGES``, ``UNMATCHED_*``.
+    ``DICT_UNAVAILABLE`` and ``MASK_ONLY_DIFFERENCE`` are also re-derived
+    (dictionary empty-flag branch and the [MASK] difference check), so they
+    are replaced rather than unioned — the same metadata-hygiene reason.
+    """
+    if flag.startswith("DIFF_"):
+        return True
+    if flag == "TEXT_DIFF_INVALID":
+        return True
+    if flag in {"DICT_UNAVAILABLE", "MASK_ONLY_DIFFERENCE"}:
+        return True
+    if flag.startswith("REVIEW:"):
+        rest = flag[len("REVIEW:"):]
+        return rest.startswith("DIFF_") or rest == "DICT_MISS"
+    return False
+
+
 def recompute_text_diff(
     rows: Iterable[AlignmentRow],
     *,
     lexicon: BookLexicon | None = None,
     dictionary: Any | None = None,
     force_recompute: bool = False,
+    alignment_config: dict | None = None,
 ) -> list[AlignmentRow]:
-    from .textdiff import auto_text_diff, validate_text_diff
+    from .textdiff import auto_text_diff, validate_text_diff, variant_fold_from_config
 
+    single_fold = variant_fold_from_config(alignment_config)
     out: list[AlignmentRow] = []
     for row in rows:
         if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
@@ -387,15 +415,20 @@ def recompute_text_diff(
             # matching under-rejects. Flat matching is still a 1-1 phonetic
             # claim — it does not invent readings.
             allow_flat_match=True,
+            allow_variant_fold=single_fold,
         )
         row.text_diff = diff.elements
-        row.flags = sorted(set(row.flags + diff.flags + [f"REVIEW:{r}" for r in diff.review_reasons]))
+        row.flags = sorted(
+            {flag for flag in row.flags if not _rederivable_text_diff_flag(flag)}
+            | set(diff.flags)
+            | {f"REVIEW:{r}" for r in diff.review_reasons}
+        )
         if recomputed_from_null:
             row.flags = sorted(set(row.flags + ["ALIGN_FORCE_RECOMPUTED_FROM_NULL"]))
         if diff.elements is not None:
             problems = validate_text_diff(row.ch_txt, row.vi_txt, diff.elements)
             if problems:
-                row.flags.append("TEXT_DIFF_INVALID")
+                row.flags = sorted(set(row.flags) | {"TEXT_DIFF_INVALID"})
         out.append(row)
     return out
 
@@ -479,7 +512,12 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     rows, review_issues, review_audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
     learned = learn_for_book(lexicon, rows, dictionary, failures)
     lexicon.save()
-    rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
+    rows = recompute_text_diff(
+        rows,
+        lexicon=lexicon,
+        dictionary=dictionary,
+        alignment_config=project.alignment_config,
+    )
     # Apply patches and decisions again so human content and review
     # decisions always win over the automatic recomputation.
     rows = apply_patches(rows, patches)

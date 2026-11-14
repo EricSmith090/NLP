@@ -252,7 +252,13 @@ def textdiff(
                 console.print(f"[yellow]integrity issues: {len(blocking_issues)}[/] {blocking_issues[:3]}")
             dictionary = build_dictionary_index(project.root, project.dictionary_config, book_id=item.book_id)
             lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{item.book_id}.json")
-            rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary, force_recompute=force_recompute)
+            rows = recompute_text_diff(
+                rows,
+                lexicon=lexicon,
+                dictionary=dictionary,
+                force_recompute=force_recompute,
+                alignment_config=project.alignment_config,
+            )
             write_alignment_csv(csv_path, rows)
             console.print(f"[green]{item.book_id}[/]: {len(rows)} rows")
 

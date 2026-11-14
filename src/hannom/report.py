@@ -274,6 +274,15 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                         "N/A" if metrics.similarity is None else f"{metrics.similarity:.2f}%",
                     ),
                     (
+                        "Similarity (spec formula, all non-null rows)",
+                        "N/A" if metrics.spec_formula_similarity is None
+                        else f"{metrics.spec_formula_similarity:.2f}%",
+                    ),
+                    (
+                        "Spec formula red/denom",
+                        f"{metrics.spec_formula_red_chars} / {metrics.spec_formula_denominator}",
+                    ),
+                    (
                         "Yellow ratio",
                         "N/A" if metrics.yellow_ratio is None else f"{metrics.yellow_ratio:.2%}",
                     ),

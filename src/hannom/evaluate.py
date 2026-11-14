@@ -213,12 +213,20 @@ def evaluate_rows(
     structural_values: list[float] = []
     semantic_evidence_rows = 0
     evidence_insufficient_rows = 0
+    spec_red = 0
+    spec_denom = 0
+    spec_scored = 0
     for row in rows:
         img_id = str(_row_value(row, "img_id", ""))
         sentence_id = str(_row_value(row, "sentence_id", ""))
         ch_txt = nfc(str(_row_value(row, "ch_txt", "")))
         vi_txt = nfc(str(_row_value(row, "vi_txt", "")))
         elements = _elements(row)
+        if elements is not None:
+            # Spec ("Đánh giá dữ liệu") scoring over every compared row.
+            spec_scored += 1
+            spec_denom += scoreable_nom_chars(ch_txt, elements)
+            spec_red += red_penalty(elements)
         flags = {str(flag) for flag in (_row_value(row, "flags", []) or [])}
         review_status = _row_value(row, "review_status", None)
         review_status = str(review_status) if review_status else None
@@ -287,6 +295,12 @@ def evaluate_rows(
             unverified_different += 1
 
     verified = metrics.verified_match_rows + metrics.verified_difference_rows
+    metrics.spec_formula_red_chars = spec_red
+    metrics.spec_formula_denominator = spec_denom
+    metrics.spec_formula_scored_rows = spec_scored
+    metrics.spec_formula_similarity = (
+        (1.0 - spec_red / spec_denom) * 100.0 if spec_denom else None
+    )
     if metrics.total_rows:
         metrics.coverage_ratio = verified / metrics.total_rows
         metrics.null_ratio = metrics.null_rows / metrics.total_rows
