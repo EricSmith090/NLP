@@ -96,6 +96,15 @@ class AlignConfig:
     # same file via ``variant_fold_from_config``; kept here so both the
     # align-time call site and the caller-facing plumb can share it.
     variant_fold: bool = True
+    # OPT-IN weak fold tier for the align DP reading bonus (verify-G M4/R3).
+    # Exact-only anchors keep full weight; a fold-only anchor counts at
+    # half weight (the 2.0/1.0 tier weights are the textdiff NW matcher's
+    # scale — charalign's Matcher uses 3.0/2.0 for the same distinction),
+    # i.e. ×0.5 in this 1.0-per-anchor unit. Default off: the DP
+    # bonus stays byte-identical to the pre-fix behaviour. Turn on only
+    # with ``alignment.dp_fold_bonus: true`` after re-baselining gates —
+    # a fold bonus further blunts ALIGN_EVIDENCE_INSUFFICIENT.
+    dp_fold_bonus: bool = False
 
 
 def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
@@ -121,6 +130,7 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
         strip_texts=[str(item) for item in (raw.get("strip_texts", []) or [])],
         per_book=dict(raw.get("per_book", {}) or {}),
         variant_fold=variant_fold_from_config(raw_config),
+        dp_fold_bonus=bool(raw.get("dp_fold_bonus", defaults.dp_fold_bonus)),
     )
 
 
@@ -214,6 +224,7 @@ def _stream_segments(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     stats: dict[str, Any] | None = None,
 ) -> list[TextSegment] | None:
     """Global reading-stream co-segmentation (both scripts get the same cuts)."""
@@ -239,7 +250,10 @@ def _stream_segments(
         merged = set(stats.get("missing_clean_pages") or [])
         merged.update(missing_pages)
         stats["missing_clean_pages"] = sorted(merged)
-    stream = stream_cosegment(nom_units, qn_units, lexicon=lexicon, dictionary=dictionary, stats=stats)
+    stream = stream_cosegment(
+        nom_units, qn_units, lexicon=lexicon, dictionary=dictionary,
+        readings_cache=readings_cache, stats=stats,
+    )
     if stream is None:
         return None
     if stats is not None:
@@ -271,6 +285,7 @@ def build_segments(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     stats: dict[str, Any] | None = None,
 ) -> tuple[list[TextSegment], list[str]]:
     """Build reading-order segments from image-map pairs.
@@ -280,7 +295,10 @@ def build_segments(
     """
     warnings: list[str] = []
     if script in ("nom", "qn"):
-        stream = _stream_segments(pairs, cleaned_by_name, script, lexicon=lexicon, dictionary=dictionary, stats=stats)
+        stream = _stream_segments(
+            pairs, cleaned_by_name, script, lexicon=lexicon, dictionary=dictionary,
+            readings_cache=readings_cache, stats=stats,
+        )
         if stream is not None:
             if stats is not None:
                 warnings += [f"MISSING_CLEAN_PAGE:{name}" for name in stats.get("missing_clean_pages") or []]
@@ -349,33 +367,51 @@ def _reading_matches(
     vi_text: str,
     lexicon: Any | None,
     dictionary: Any | None = None,
-) -> tuple[int, int]:
-    """Return (anchored known characters, known characters) for a group.
+    *,
+    readings_cache: Any | None = None,
+    dp_fold: bool = False,
+) -> tuple[float, int]:
+    """Return (anchored weight, known characters) for a group.
 
-    Uses the union of lexicon and dictionary readings. Anchoring requires
-    the same strict local-uniqueness policy as ``hannom.anchors``, so the
-    DP bonus cannot reward repeated, ununique readings.
+    Uses the union of lexicon, dictionary JSONL and (optionally) the compact
+    readings cache. Anchoring requires the same strict local-uniqueness
+    policy as ``hannom.anchors``, so the DP bonus cannot reward repeated,
+    ununique readings.
+
+    ``dp_fold=True`` (opt-in) additionally credits fold-only anchors at half
+    weight: exact anchor = 1.0, fold-only anchor = 0.5 (half of exact; the
+    2.0/1.0 tier weights are the textdiff NW matcher's scale; charalign's
+    Matcher uses 3.0/2.0 for the same distinction). The default keeps the
+    historical exact-only behaviour byte-identical.
     """
-    from .anchors import find_reading_anchors, gather_readings
+    from .anchors import find_reading_anchors, gather_readings, normalize_reading
+    from .charalign import fold
 
     nom_chars = [c for c in nom_text if is_nom_char(c)]
-    if not nom_chars or (lexicon is None and dictionary is None):
-        return 0, 0
+    if not nom_chars or (lexicon is None and dictionary is None and readings_cache is None):
+        return 0.0, 0
     vi_folded = nfc(vi_text).casefold()
     token_items_ = [
         (m.start(), m.end(), m.group(0)) for m in QN_TOKEN_RE.finditer(vi_folded)
     ]
     if not token_items_:
-        return 0, 0
+        return 0.0, 0
     items = [
-        gather_readings(char, lexicon=lexicon, dictionary=dictionary)[0]
+        gather_readings(char, lexicon=lexicon, dictionary=dictionary, readings=readings_cache)[0]
         for char in nom_chars
     ]
     known = sum(1 for readings in items if readings)
     if known == 0:
-        return 0, 0
-    anchors = find_reading_anchors(items, token_items_)
-    return len(anchors), known
+        return 0.0, 0
+    exact_anchors = find_reading_anchors(items, token_items_)
+    if not dp_fold:
+        return float(len(exact_anchors)), known
+    fold_items = [[normalize_reading(fold(r)) for r in readings] for readings in items]
+    fold_tokens = [(s, e, fold(t)) for s, e, t in token_items_]
+    fold_anchors = find_reading_anchors(fold_items, fold_tokens)
+    exact_set = set(exact_anchors)
+    fold_only = len({pair for pair in fold_anchors} - exact_set)
+    return float(len(exact_anchors)) + 0.5 * float(fold_only), known
 
 
 def semantic_evidence(
@@ -383,15 +419,22 @@ def semantic_evidence(
     vi_txt: str,
     lexicon: Any | None,
     dictionary: Any | None = None,
-) -> tuple[float | None, int, int]:
+    *,
+    readings_cache: Any | None = None,
+    dp_fold: bool = False,
+) -> tuple[float | None, float, int]:
     """Return (semantic_confidence, anchored_count, known_count).
 
     ``semantic_confidence`` is ``anchored / known`` when reading evidence
-    exists, else ``None`` (no evidence either way).
+    exists, else ``None`` (no evidence either way). ``anchored_count`` is
+    fractional only when ``dp_fold`` credits a fold-only anchor at half
+    weight (opt-in).
     """
-    matched, known = _reading_matches(ch_txt, vi_txt, lexicon, dictionary)
+    matched, known = _reading_matches(
+        ch_txt, vi_txt, lexicon, dictionary, readings_cache=readings_cache, dp_fold=dp_fold
+    )
     if known == 0:
-        return None, 0, 0
+        return None, 0.0, 0
     return (matched / known), matched, known
 
 
@@ -404,6 +447,7 @@ def _group_cost(
     lexicon: Any | None,
     dictionary: Any | None = None,
     *,
+    readings_cache: Any | None = None,
     apply_reading_bonus: bool = True,
 ) -> float:
     nom_count = max(1, count_nom_chars(nom_text))
@@ -421,7 +465,10 @@ def _group_cost(
         group_cost = config.many_to_many_penalty * (a + b - 2)
     if not apply_reading_bonus:
         return ratio_cost + group_cost
-    matched, known = _reading_matches(nom_text, vi_text, lexicon, dictionary)
+    matched, known = _reading_matches(
+        nom_text, vi_text, lexicon, dictionary,
+        readings_cache=readings_cache, dp_fold=config.dp_fold_bonus,
+    )
     reading_bonus = 0.0
     if known:
         reading_bonus = 1.2 * (matched / known)
@@ -435,6 +482,7 @@ def align_segments(
     config: AlignConfig | None = None,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     minimum_confidence: float | None = None,
 ) -> list[AlignmentRow]:
     config = config or AlignConfig()
@@ -470,7 +518,10 @@ def align_segments(
                         continue
                     nom_text = "".join(s.text for s in nom_segments[i : i + a])
                     vi_text = " ".join(s.text for s in qn_segments[j : j + b])
-                    cost = dp[i][j] + _group_cost(nom_text, vi_text, a, b, config, lexicon, dictionary)
+                    cost = dp[i][j] + _group_cost(
+                        nom_text, vi_text, a, b, config, lexicon, dictionary,
+                        readings_cache=readings_cache,
+                    )
                     if cost < dp[i + a][j + b] - 1e-12:
                         dp[i + a][j + b] = cost
                         back[i + a][j + b] = ("group", a, b)
@@ -495,6 +546,7 @@ def align_segments(
         config=config,
         lexicon=lexicon,
         dictionary=dictionary,
+        readings_cache=readings_cache,
         minimum_confidence=minimum_confidence,
     )
 
@@ -507,6 +559,7 @@ def _emit_rows(
     config: AlignConfig,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     minimum_confidence: float | None = None,
 ) -> list[AlignmentRow]:
     rows: list[AlignmentRow] = []
@@ -545,7 +598,9 @@ def _emit_rows(
         # support is reported separately as ``semantic_confidence``.
         if kind == "group":
             structural_cost = _group_cost(
-                ch_txt, vi_txt, a, b, config, lexicon, dictionary, apply_reading_bonus=False
+                ch_txt, vi_txt, a, b, config, lexicon, dictionary,
+                readings_cache=readings_cache,
+                apply_reading_bonus=False,
             )
         else:
             structural_cost = cost
@@ -555,7 +610,10 @@ def _emit_rows(
             penalty = config.unmatched_qn_penalty if kind == "skip_qn" else config.unmatched_nom_penalty
             structural_cost = max(structural_cost, penalty)
         confidence = 1.0 / (1.0 + max(0.0, structural_cost))
-        semantic_confidence, _anchored, _known = semantic_evidence(ch_txt, vi_txt, lexicon, dictionary)
+        semantic_confidence, _anchored, _known = semantic_evidence(
+            ch_txt, vi_txt, lexicon, dictionary,
+            readings_cache=readings_cache, dp_fold=config.dp_fold_bonus,
+        )
         if kind in ("skip_nom", "skip_qn"):
             semantic_confidence = 0.0
         if kind == "group" and (semantic_confidence is None or semantic_confidence < 0.5):
@@ -595,6 +653,7 @@ def _emit_rows(
                 vi_txt,
                 lexicon=lexicon,
                 dictionary=dictionary,
+                readings_cache=readings_cache,
                 strict_reading_mismatch=False,
                 allow_variant_fold=config.variant_fold,
             )
@@ -633,6 +692,7 @@ def align_book(
     config: dict[str, Any] | None = None,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     stats: dict[str, Any] | None = None,
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
@@ -646,6 +706,7 @@ def align_book(
             stream = stream_segments_by_charalign(
                 pairs, cleaned_by_name,
                 lexicon=lexicon, dictionary=dictionary,
+                readings_cache=readings_cache,
                 strip_texts=strip_texts,
             )
         except Exception as exc:  # fall back loudly, never crash the stage silently
@@ -676,12 +737,19 @@ def align_book(
             rows = _emit_rows(
                 groups, nom_segments, qn_segments,
                 config=cfg, lexicon=lexicon, dictionary=dictionary,
+                readings_cache=readings_cache,
                 minimum_confidence=None,
             )
             return rows, sorted(set(warnings))
 
-    nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary, stats=stats)
-    qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary, stats=stats)
+    nom_segments, nom_warnings = build_segments(
+        pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary,
+        readings_cache=readings_cache, stats=stats,
+    )
+    qn_segments, qn_warnings = build_segments(
+        pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary,
+        readings_cache=readings_cache, stats=stats,
+    )
     if stats is not None:
         stats.setdefault("segmentation", "cosegment")
         stats.setdefault("segmenter", "per-page-fallback")
@@ -693,6 +761,7 @@ def align_book(
         config=cfg,
         lexicon=lexicon,
         dictionary=dictionary,
+        readings_cache=readings_cache,
     )
     return rows, sorted(set(nom_warnings + qn_warnings))
 

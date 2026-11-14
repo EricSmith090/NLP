@@ -1,0 +1,33 @@
+# Human-curated PUA → standard Nôm mapping for the assigned books.
+#
+# Keys: hex code point of the Kim Hán Nôm PUA glyph (as printed in the
+# scan). Values: the single standard Nôm character it stands for.
+#
+# Rules (see hannom.pua_map):
+#   * Only mappings with explicit source evidence may be added.
+#   * Unmapped PUA code points are NEVER guessed. They stay unmatchable,
+#     unlearnable and unflagged (exactly the pre-fix behaviour) and are
+#     replaced by 〓 at clean time, as before.
+#   * Every entry must be verified visually against the scan by the
+#     reviewer who adds it. The citation belongs in the comment.
+#
+# Evidence in this file:
+#   F021D  𡃕  — dv:giupdoc:𡃕|gùng (entries drop, dv.jsonl): the dv record
+#              for the reading "gùng" lists the standard head 𡃕 and a
+#              *form* spelling U+F021D — the two are the same glyph, one
+#              encoded in Unicode and one in the Kim Hán Nôm font.
+#              Book-side, U+F021D appears in the Tap1 OCR
+#              (T1_CamPhong_Tap1/0185.json; one occurrence recorded in the
+#              2026-11-13 clean tally).
+#
+# Everything else the books print in the PUA planes stays unmapped until
+# a reviewer identifies the glyphs: 765 PUA substitutions recorded by the
+# 2026-11-13 clean run (Tap1 674 / Tap2 14 / SLQ 77), of which one is the
+# single mapped code point F021D and 764 stay unencodable. The raw
+# counts: F047C ×427, F07EF ×87, F070B ×35, F000B ×22, F0272 ×17,
+# F0607 ×12, F082E ×12, F0284 ×4, F12D3 ×4, F0887 ×1, F0815 ×1,
+# F01EE ×1, F03D9 ×32, F0152 ×44, F0087 ×31, F0742 ×7, F0761 ×5,
+# F0803 ×2, F07F1 ×2, F07BA ×16, F0810 ×1, F027A ×1 — 764 unmapped +
+# F021D ×1 = 765. The dictionary drop has none of these code points
+# (only dv carries F021D, as the dv form of 𡃕).
+F021D: "𡃕"

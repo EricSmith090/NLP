@@ -28,6 +28,14 @@ alignment:
   # If a sentence is predicted rather than read, mark text_diff warn only
   # for the guideline-approved cases; never use yellow to inflate scores.
   mark_cross_page_joins: true
+  # OPT-IN weak fold tier for the align DP reading bonus (verify-G M4/R3).
+  # OFF by default: the DP bonus stays exact-only (byte-identical to the
+  # pre-fix behaviour). When true, a fold-only anchor counts at half
+  # weight against exact anchors (the 1.0-vs-2.0 tier weights are the
+  # textdiff NW matcher's scale; charalign's Matcher uses 3.0/2.0 for the
+  # same distinction; i.e. 0.5× in the 1.0-per-anchor bonus unit). Expect
+  # ALIGN_EVIDENCE_INSUFFICIENT to drop; turn on only after re-baselining.
+  dp_fold_bonus: false
 
 text_diff:
   # Unknown readings are routed to review, never auto-red.

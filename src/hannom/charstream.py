@@ -65,17 +65,20 @@ def _concat(pages: Sequence[PageImage], separator: str) -> tuple[str, list[tuple
 
 
 class _EntryReadingsAdapter:
-    """Adapts (lexicon, dictionary) to the ``Matcher`` readings interface."""
+    """Adapts (lexicon, dictionary[, readings_cache]) to the ``Matcher`` readings interface."""
 
-    def __init__(self, lexicon: Any | None, dictionary: Any | None):
+    def __init__(self, lexicon: Any | None, dictionary: Any | None, readings_cache: Any | None = None):
         self.lexicon = lexicon
         self.dictionary = dictionary
+        self.readings_cache = readings_cache
         self._cache: dict[str, frozenset[str]] = {}
 
     def of(self, ch: str) -> frozenset[str]:
         cached = self._cache.get(ch)
         if cached is None:
-            readings, _source = gather_readings(ch, lexicon=self.lexicon, dictionary=self.dictionary)
+            readings, _source = gather_readings(
+                ch, lexicon=self.lexicon, dictionary=self.dictionary, readings=self.readings_cache
+            )
             cached = frozenset(norm_reading(r) for r in readings)
             self._cache[ch] = cached
         return cached
@@ -102,6 +105,7 @@ def stream_segments_by_charalign(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     strip_texts: Sequence[str] = (),
     band: int = 400,
 ) -> tuple[list[Any], list[Any], list[str]] | None:
@@ -191,7 +195,7 @@ def stream_segments_by_charalign(
             if readings:
                 confirmed[ch] = {norm_reading(str(r)) for r in readings}
 
-    adapter = _EntryReadingsAdapter(lexicon, dictionary)
+    adapter = _EntryReadingsAdapter(lexicon, dictionary, readings_cache)
     matcher = Matcher(adapter, {c: set(v) for c, v in confirmed.items()})
     nom_chars = [NomChar(nom_text[pos], "", 0) for pos in nom_positions]
     # Fill page attribution for review rendering.

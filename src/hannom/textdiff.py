@@ -299,6 +299,7 @@ def auto_text_diff(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     strict_reading_mismatch: bool = False,
     proper_name: bool = False,
     allow_flat_match: bool = False,
@@ -350,7 +351,9 @@ def auto_text_diff(
     readings_by_index: dict[int, list[str]] = {}
     sources: dict[int, str] = {}
     for index, char in chars:
-        readings, source = gather_readings(char, lexicon=lexicon, dictionary=dictionary)
+        readings, source = gather_readings(
+            char, lexicon=lexicon, dictionary=dictionary, readings=readings_cache
+        )
         if readings:
             readings_by_index[index] = readings
             sources[index] = source

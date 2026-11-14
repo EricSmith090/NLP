@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import warnings
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -323,6 +324,33 @@ def _load_pairs(project: ProjectConfig, book: BookConfig, state: State) -> list[
     return load_image_map(path)
 
 
+def load_readings_cache(project: ProjectConfig) -> Any | None:
+    """Load (or rebuild) the compact readings cache once; None when unavailable.
+
+    Honours ``dictionary.skip_sources`` from the dictionary config (default:
+    nothing skipped). The cache contributes char ∪ word reading evidence to
+    the in-pipeline matchers alongside the JSONL dictionary adapters; absence
+    of the drop or the cache simply yields no cache evidence (identical to
+    the pre-cache behaviour).
+    """
+    try:
+        from .dictionary.readings import load_readings
+
+        dictionary_cfg = project.dictionary_config or {}
+        cfg = (dictionary_cfg or {}).get("dictionary", dictionary_cfg or {})
+        entries_dir = project.root / str(cfg.get("entries_dir", "dictionaries/entries"))
+        cache = project.data_dir / "dictionary" / "char_readings.json"
+        skip = cfg.get("skip_sources") or None
+        if isinstance(skip, str):
+            skip = [skip]
+        return load_readings(entries_dir, cache, skip_sources=skip)
+    except Exception as exc:
+        # Evidence degradation must never be silent: the pipeline runs with
+        # no cache evidence (unlike pre-2026-11-14 consumers) — say so.
+        warnings.warn(f"readings cache unavailable ({type(exc).__name__}: {exc}); continuing without cache evidence")
+        return None
+
+
 def learn_for_book(lexicon, rows, dictionary, failures):
     """Fail-closed learning gate shared by ``stage_align`` and tests.
 
@@ -372,6 +400,7 @@ def recompute_text_diff(
     *,
     lexicon: BookLexicon | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     force_recompute: bool = False,
     alignment_config: dict | None = None,
 ) -> list[AlignmentRow]:
@@ -409,6 +438,7 @@ def recompute_text_diff(
             row.vi_txt,
             lexicon=lexicon,
             dictionary=dictionary,
+            readings_cache=readings_cache,
             strict_reading_mismatch=False,
             # Book 3's Quốc ngữ translation is transcribed in modern/mixed
             # orthography; hvdic readings are recorded archaically, so exact
@@ -468,6 +498,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         raise PipelineError(f"{book.book_id}: no cleaned pages; run clean first")
     dictionary_cfg = project.dictionary_config or {}
     dictionary = build_dictionary_index(project.root, dictionary_cfg, book_id=book.book_id)
+    readings_cache = load_readings_cache(project)
     lexicon_path = project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"
     lexicon = BookLexicon(lexicon_path)
     csv_path_prev = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
@@ -487,6 +518,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         config=project.alignment_config,
         lexicon=lexicon,
         dictionary=dictionary,
+        readings_cache=readings_cache,
         stats=align_stats,
     )
     if align_stats.get("qn_tokens_stream") is not None:
@@ -516,6 +548,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         rows,
         lexicon=lexicon,
         dictionary=dictionary,
+        readings_cache=readings_cache,
         alignment_config=project.alignment_config,
     )
     # Apply patches and decisions again so human content and review

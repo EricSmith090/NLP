@@ -14,6 +14,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
+from . import pua_map
+
 MASK = "[MASK]"
 MASK_LEN = 6
 REPLACEMENT = "\u3013"  # 〓, the guideline's unencodable-character marker
@@ -130,7 +132,11 @@ def is_nom_char(ch: str) -> bool:
     if len(ch) != 1:
         return False
     code = ord(ch)
-    return any(lo <= code <= hi for lo, hi in CJK_RANGES)
+    if any(lo <= code <= hi for lo, hi in CJK_RANGES):
+        return True
+    # Kim Hán Nôm PUA code points (verify-G H1): only when a human operator
+    # explicitly enabled PUA handling. Default off — byte-identical behaviour.
+    return pua_map.is_enabled() and pua_map.is_khn_pua_char(ch)
 
 
 def count_nom_chars(text: str) -> int:
@@ -145,6 +151,9 @@ def is_cjk_punctuation(ch: str) -> bool:
 def is_safe_codepoint(ch: str) -> bool:
     if ch == REPLACEMENT or ch in "[]MASK":
         return True
+    if pua_map.mapped_pua(ch) is not None:
+        # Mapped to a standard Nôm character by the human-curated table.
+        return True
     category = unicodedata.category(ch)
     # Guideline: chars not in any Hán Nôm font must become 〓. Private-use
     # (Co) and unassigned (Cn) code points render as tofu in the reference
@@ -153,18 +162,33 @@ def is_safe_codepoint(ch: str) -> bool:
 
 
 def sanitize_nom_text(text: str) -> tuple[str, dict[str, int], list[str]]:
-    """Replace unencodable/unsafe characters with 〓 and report them."""
+    """Replace unencodable/unsafe characters with 〓 and report them.
+
+    Kim Hán Nôm PUA code points with a human-curated mapping (see
+    ``hannom.pua_map``) are re-encoded to the standard Nôm character
+    instead of 〓 and reported under the ``NOM_PUA_MAPPED`` flag.
+    Unmapped PUA code points are indistinguishable from any other
+    unencodable code point: 〓, as before.
+    """
     out: list[str] = []
     counts: dict[str, int] = {}
     flags: list[str] = []
+    pua_mapped = False
     for ch in nfc(text):
         if ch.isspace():
+            continue
+        mapped = pua_map.mapped_pua(ch) if pua_map.is_enabled() else None
+        if mapped is not None:
+            out.append(mapped)
+            pua_mapped = True
             continue
         if is_safe_codepoint(ch):
             out.append(ch)
         else:
             out.append(REPLACEMENT)
             counts[ch] = counts.get(ch, 0) + 1
+    if pua_mapped:
+        flags.append("NOM_PUA_MAPPED")
     if counts:
         flags.append("NOM_UNENCODABLE_REPLACED")
     return "".join(out), counts, flags

@@ -32,6 +32,7 @@ from .orchestrator import (
     stage_package,
     stage_package_all,
     recompute_text_diff,
+    load_readings_cache,
     build_source_zip,
 )
 from .align import write_alignment_csv
@@ -177,7 +178,7 @@ def charalign_cmd(
     entries_dir = project.root / str(cfg.get("entries_dir", "dictionaries/entries"))
     cache = project.data_dir / "dictionary" / "char_readings.json"
     console.print(f"Dictionary readings: {cache} (source {entries_dir})")
-    readings = load_readings(entries_dir, cache, rebuild=rebuild_readings)
+    readings = load_readings(entries_dir, cache, rebuild=rebuild_readings, skip_sources=cfg.get("skip_sources"))
     console.print(f"  characters with readings: {len(readings)}")
 
     folder = Path(label_dir)
@@ -252,10 +253,12 @@ def textdiff(
                 console.print(f"[yellow]integrity issues: {len(blocking_issues)}[/] {blocking_issues[:3]}")
             dictionary = build_dictionary_index(project.root, project.dictionary_config, book_id=item.book_id)
             lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{item.book_id}.json")
+            readings_cache = load_readings_cache(project)
             rows = recompute_text_diff(
                 rows,
                 lexicon=lexicon,
                 dictionary=dictionary,
+                readings_cache=readings_cache,
                 force_recompute=force_recompute,
                 alignment_config=project.alignment_config,
             )
@@ -428,6 +431,11 @@ def source_zip(config: str = "configs/project.yaml"):
 
 
 def main() -> None:
+    # Opt-in KHN PUA handling (verify-G H1): KHN_PUA_ENABLED=1 plus
+    # KHN_PUA_MAP=<yaml> (default configs/khn_pua_map.yaml). Default off.
+    from .pua_map import enable_from_env
+
+    enable_from_env()
     app()
 
 

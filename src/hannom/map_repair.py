@@ -20,7 +20,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from .charalign import fold
 from .clean import count_nom_chars
@@ -421,8 +421,8 @@ def write_triage_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-def load_readings_for(entries_dir: Path, cache_path: Path) -> Any:
-    return load_readings(str(entries_dir), str(cache_path))
+def load_readings_for(entries_dir: Path, cache_path: Path, skip_sources: Iterable[str] | None = None) -> Any:
+    return load_readings(str(entries_dir), str(cache_path), skip_sources=skip_sources)
 
 
 def read_clean_text(clean_dir: Path, page_number: int) -> str:

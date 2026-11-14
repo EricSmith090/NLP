@@ -101,10 +101,6 @@ def _qn_token_spans(text: str) -> list[tuple[int, int, str]]:
     return [(m.start(), m.end(), m.group(0)) for m in QN_TOKEN_RE.finditer(unicodedata.normalize("NFC", text).casefold())]
 
 
-def _nom_char_positions(text: str) -> list[int]:
-    return [i for i, ch in enumerate(text) if is_nom_char(ch)]
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -254,14 +250,16 @@ class BookLexicon:
         import shutil
 
         current_bytes = self.path.read_bytes()
-        today = _now().replace("-", "").replace(":", "")[:14]  # YYYYMMDDTHHMMSS
+        # Full "YYYYMMDDTHHMMSS" (15 chars) so backups within a minute still
+        # get distinct names; uniqueness is additionally guaranteed by the
+        # suffix counter below.
+        stamp = _now().replace("-", "").replace(":", "")[:15]
         for existing in sorted(self.path.parent.glob(self.path.name + ".bak-reconcile-*")):
             try:
                 if existing.read_bytes() == current_bytes:
                     return existing
             except OSError:
                 continue
-        stamp = _now().replace("-", "").replace(":", "")[:14]
         dest = self.path.with_name(self.path.name + f".bak-reconcile-{stamp}")
         counter = 2
         while dest.exists():
@@ -292,7 +290,7 @@ class BookLexicon:
             nom_pos,
             token_pos,
             unicodedata.normalize("NFC", str(char)),
-            str(reading).strip().casefold(),
+            unicodedata.normalize("NFC", str(reading).strip().casefold()),
         )
 
     @staticmethod
@@ -306,6 +304,10 @@ class BookLexicon:
             sid = str(_row_field(row, "sentence_id", "") or "")
             if not sid:
                 continue
+            # Path A (explicit reviewer character↔token mappings) is
+            # deliberately flag-agnostic — exactly like learn_from_rows
+            # path A, where an explicit, verified mapping is binding even
+            # on a flagged row.
             mappings = _mapping_items(row)
             if mappings:
                 for mapping in mappings:
@@ -318,6 +320,12 @@ class BookLexicon:
                     )
                     if granule:
                         authorized.add(granule)
+                continue
+            # Path B (single-token) mirrors learn_from_rows path B: a row
+            # carrying any blocking flag is never authorized, even when its
+            # decision is verifying and integrity-valid (verify-G M2).
+            flag_set = {str(f) for f in (_row_field(row, "flags", []) or [])}
+            if flag_set & BLOCKING_FLAGS:
                 continue
             chars = [c for c in str(_row_field(row, "ch_txt", "") or "") if is_nom_char(c)]
             tokens = _qn_token_spans(str(_row_field(row, "vi_txt", "") or ""))
@@ -355,6 +363,7 @@ class BookLexicon:
             "unknown_evidence_revoked": 0,
             "pairs_removed": 0,
             "pairs_kept": 0,
+            "counts_rewritten": 0,
             "changed": False,
         }
         new_provenance: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -404,7 +413,23 @@ class BookLexicon:
                 if kept:
                     new_provenance.setdefault(char, {})[reading] = kept
                     bucket = new_data.setdefault(char, {})
-                    bucket[reading] = len(kept)
+                    # Count-faithful rebuild (verify-G M1): a manual restore
+                    # record carries its original weight in ``count``; automated
+                    # records carry no count and therefore count as 1 each.
+                    new_count = 0
+                    for record in kept:
+                        try:
+                            new_count += int(record.get("count", 1))
+                        except (TypeError, ValueError):
+                            new_count += 1
+                    bucket[reading] = new_count
+                    if self.data.get(char, {}).get(reading) != new_count:
+                        # Evidence weights changed even if the pair set did
+                        # not. The reconcile summary MUST report that so the
+                        # orchestrator takes a backup before persisting (an
+                        # on-disk file is the pre-mutation snapshot).
+                        summary["changed"] = True
+                        summary["counts_rewritten"] = summary.get("counts_rewritten", 0) + 1
         # Unreferenced data entries (no surviving provenance) are not
         # trusted evidence: move them to legacy quarantine, never delete.
         for char in list(self.data.keys()):
@@ -554,6 +579,7 @@ class BookLexicon:
         skipped_invalid_mapping = 0
         skipped_conflicted = 0
         skipped_duplicate = 0
+        skipped_unlearnable = 0
         for row in rows:
             ch_text, vi_text, sentence_id, image_name, flags = _row_tuple(row)
             flag_set = set(flags)
@@ -610,8 +636,12 @@ class BookLexicon:
                     ):
                         skipped_duplicate += 1
                         continue
-                    self.add(item.nom_char, token_text, provenance=record)
-                    learned_here += 1
+                    if self.add(item.nom_char, token_text, provenance=record):
+                        learned_here += 1
+                    else:
+                        # The lexicon refused the pair (e.g. unsupported
+                        # code point / gate). Never counted as learned.
+                        skipped_unlearnable += 1
                 learned += learned_here
                 continue
 
@@ -639,7 +669,7 @@ class BookLexicon:
             ):
                 skipped_duplicate += 1
                 continue
-            self.add(
+            if self.add(
                 char,
                 token_text,
                 provenance={
@@ -654,8 +684,13 @@ class BookLexicon:
                     "nom_position": 0,
                     "qn_token_position": 0,
                 },
-            )
-            learned += 1
+            ):
+                learned += 1
+            else:
+                # Symmetric with path A: only pairs the lexicon stored count
+                # as learned. Can't currently fail (is_nom_char pre-filtered),
+                # keep the accounting honest anyway.
+                skipped_unlearnable += 1
         self.meta["learned_pairs"] = int(self.meta.get("learned_pairs", 0)) + learned
         return {
             "learned_pairs": learned,
@@ -668,6 +703,7 @@ class BookLexicon:
             "skipped_invalid_mapping": skipped_invalid_mapping,
             "skipped_conflicted": skipped_conflicted,
             "skipped_duplicate_evidence": skipped_duplicate,
+            "skipped_unlearnable": skipped_unlearnable,
             "quarantine": self.quarantine_summary(),
         }
 

@@ -139,6 +139,11 @@ def score_pairs_with_anchors(
             ch_text = str(cleaned_by_name.get(name, "") or "")
             for char in ch_text:
                 if is_nom_char(char):
+                    # Deliberately no readings_cache kwarg: this is the
+                    # superseded heuristic mass-DP scorer (the marker formula
+                    # in build_marker_map is authoritative for the assigned
+                    # books); keeping its evidence set unchanged avoids
+                    # reshuffling any fallback pairing.
                     readings, _source = gather_readings(char, lexicon=lexicon, dictionary=dictionary)
                     nom_items.append(readings)
         for name in pair.vi:

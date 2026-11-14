@@ -25,7 +25,14 @@ QN_SYSTEMS = {"qn", "hv", "nom"}
 _VS_RE = re.compile("[︀-️\U000e0100-\U000e01ef]")
 _SYLLABLE_RE = re.compile(r"[^\W\d_]+")
 _SPLIT_RE = re.compile(r"[,;/|]")
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+# Sources whose ``kind=word script=qn`` records carry their Nom spelling in
+# ``forms`` and the Quốc ngữ head itself as the reading, with
+# ``readings: null`` (hannom-rcv.org chuẩn bảng). For these one validated
+# positional spread is applied: the qn head is used as the reading value and
+# distributed over the form's characters (syllables == characters required,
+# via ``_spread_word``). No other source is spread this way.
+SPREAD_QN_HEAD_SOURCES = frozenset({"hannom_rcv.jsonl"})
 
 
 def is_ideograph(ch: str) -> bool:
@@ -46,6 +53,34 @@ def norm_reading(value: str) -> str:
     return unicodedata.normalize("NFC", value.strip()).casefold()
 
 
+def split_reading_tokens(value: str) -> list[str]:
+    """Split a reading string into per-part tokens.
+
+    Splits on the separators found in the official drop (comma, semicolon,
+    slash, pipe), normalises NFC/casefold and drops empty fragments — the
+    same splitting used for the cache build (verify-G M3). Bare ``/``
+    fragments yield no token, never a glued one.
+    """
+    out: list[str] = []
+    for part in _SPLIT_RE.split(value):
+        part = norm_reading(part)
+        if part:
+            out.append(part)
+    return out
+
+
+def syllable_tokens(value: str) -> list[str]:
+    """Extract every plain QN syllable from a reading string.
+
+    Used by the JSONL-adapter ``LookupResult`` path so matchers see the
+    same syllable granularity as the compact cache: NFC/casefold, then
+    collect runs of QN syllable characters. Slash-glued (``bạ/bộ``) and
+    comma-joined (``nhật, nhựt``) values decompose into exactly the
+    syllables a Quốc ngữ token can match (verify-G M3).
+    """
+    return _SYLLABLE_RE.findall(unicodedata.normalize("NFC", value).casefold())
+
+
 def _qn_readings(record: dict) -> list[str]:
     out: list[str] = []
     for item in record.get("readings") or []:
@@ -56,19 +91,52 @@ def _qn_readings(record: dict) -> list[str]:
             value, system = item, "qn"
         if system not in QN_SYSTEMS or not isinstance(value, str):
             continue
-        for part in _SPLIT_RE.split(value):
-            part = norm_reading(part)
-            if part:
-                out.append(part)
+        out.extend(split_reading_tokens(value))
     return out
+
+
+def _qn_head_as_reading(record: dict) -> str | None:
+    """Treat a qn word head itself as the phonetic reading (chuẩn bảng).
+
+    Only for ``SPREAD_QN_HEAD_SOURCES`` records with ``readings`` missing:
+    the head is a Quốc ngữ word (``"ái ngại"``) whose syllables align
+    positionally with the Nom form (``愛懝``). Returns the normalised
+    reading string, or None when the record is not a spread candidate
+    (wrong kind/script, single syllable or no qn glyphs at all).
+    """
+    if record.get("unencoded"):
+        return None
+    if str(record.get("kind", "")).strip().casefold() != "word":
+        return None
+    script = str(record.get("script", "qn")).strip().casefold()
+    if script not in {"qn", "other"}:
+        return None
+    head = unicodedata.normalize("NFC", str(record.get("head") or "")).strip()
+    syllables = _SYLLABLE_RE.findall(norm_reading(head))
+    if len(syllables) < 2:
+        return None
+    return " ".join(syllables)
 
 
 def _add(table: dict[str, set[str]], char: str, reading: str) -> None:
     table.setdefault(char, set()).add(reading)
 
 
+def _map_pua_str(text: str) -> str:
+    """Re-encode Kim Hán Nôm PUA code points to their standard Nôm glyph.
+
+    Only active when a human operator enabled the PUA map (default off).
+    Unmapped PUA code points pass through unchanged.
+    """
+    from ..pua_map import is_enabled, mapped_pua
+
+    if not is_enabled():
+        return text
+    return "".join(mapped_pua(ch) or ch for ch in text)
+
+
 def _spread_word(table: dict[str, set[str]], text: str, reading: str) -> None:
-    chars = [c for c in _VS_RE.sub("", unicodedata.normalize("NFC", text)) if not c.isspace()]
+    chars = [c for c in _VS_RE.sub("", _map_pua_str(unicodedata.normalize("NFC", text))) if not c.isspace()]
     if len(chars) < 2 or not all(is_ideograph(c) for c in chars):
         return
     syllables = _SYLLABLE_RE.findall(reading)
@@ -78,16 +146,37 @@ def _spread_word(table: dict[str, set[str]], text: str, reading: str) -> None:
         _add(table, char, syllable)
 
 
-def build_readings(entries_dir: Path, sources: Iterable[Path] | None = None) -> dict:
+def build_readings(
+    entries_dir: Path,
+    sources: Iterable[Path] | None = None,
+    *,
+    skip_sources: Iterable[str] | None = None,
+) -> dict:
+    """Build the compact readings index from the Entry/v1 drop.
+
+    ``sources=None`` discovers ``entries_dir/*.jsonl``; names listed in
+    ``skip_sources`` are dropped (the official drop ships the full catusf
+    dump — 3,541,369 records with no ``readings`` key at all — which costs
+    a full parse per rebuild and contributes zero entries; see verify-G H3).
+    Callers passing ``sources`` explicitly control the list themselves.
+    """
     char_table: dict[str, set[str]] = {}
     word_table: dict[str, set[str]] = {}
-    files = sorted(sources) if sources is not None else sorted(Path(entries_dir).glob("*.jsonl"))
+    if sources is not None:
+        files = sorted(sources)
+    else:
+        skip = {str(name) for name in (skip_sources or [])}
+        files = [path for path in sorted(Path(entries_dir).glob("*.jsonl")) if path.name not in skip]
     used: list[str] = []
     for path in files:
         used.append(path.name)
+        path_name = path.name.lower()
+        is_spread_source = path_name in SPREAD_QN_HEAD_SOURCES
         with path.open(encoding="utf-8") as handle:
             for line in handle:
-                if '"readings"' not in line:
+                # Regexes deliberately broad: the prefilter must never reject
+                # a record that the structured parse below would accept.
+                if '"readings"' not in line and not is_spread_source:
                     continue
                 try:
                     record = json.loads(line)
@@ -96,9 +185,14 @@ def build_readings(entries_dir: Path, sources: Iterable[Path] | None = None) -> 
                 if record.get("unencoded"):
                     continue
                 readings = _qn_readings(record)
+                if not readings and is_spread_source:
+                    # chuẩn bảng: readings=null; the qn head IS the reading.
+                    head_reading = _qn_head_as_reading(record)
+                    if head_reading is not None:
+                        readings = [head_reading]
                 if not readings:
                     continue
-                head = _VS_RE.sub("", unicodedata.normalize("NFC", str(record.get("head") or "")))
+                head = _map_pua_str(_VS_RE.sub("", unicodedata.normalize("NFC", str(record.get("head") or ""))))
                 if record.get("kind") == "char" and len(head) == 1 and is_ideograph(head):
                     for reading in readings:
                         for syllable in _SYLLABLE_RE.findall(reading) or [reading]:
@@ -136,7 +230,13 @@ class Readings:
         return len(set(self.char) | set(self.word))
 
 
-def load_readings(entries_dir: Path, cache_path: Path, rebuild: bool = False) -> Readings:
+def load_readings(
+    entries_dir: Path,
+    cache_path: Path,
+    rebuild: bool = False,
+    *,
+    skip_sources: Iterable[str] | None = None,
+) -> Readings:
     """Load the cached index, building it from ``entries_dir`` when missing."""
     cache_path = Path(cache_path)
     if cache_path.exists() and not rebuild:
@@ -146,7 +246,7 @@ def load_readings(entries_dir: Path, cache_path: Path, rebuild: bool = False) ->
     entries_dir = Path(entries_dir)
     if not entries_dir.exists():
         return Readings({})
-    data = build_readings(entries_dir)
+    data = build_readings(entries_dir, skip_sources=skip_sources)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")

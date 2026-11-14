@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol, runtime_checkable
 
+from .readings import syllable_tokens
+
 
 @dataclass(frozen=True)
 class Sense:
@@ -62,7 +64,7 @@ class LookupResult:
     def readings(self) -> list[str]:
         out: list[str] = []
         for reading in self.book_readings + [s.reading for s in self.senses]:
-            for token in reading.replace(",", " ").split():
+            for token in syllable_tokens(reading):
                 if token and token not in out:
                     out.append(token)
         return out

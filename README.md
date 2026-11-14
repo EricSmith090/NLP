@@ -109,7 +109,7 @@ Extraction fidelity after the final re-extraction:
 │   ├── benchmark_ocr.py
 │   ├── capture_screenshots.py
 │   └── validate_submission.py
-├── tests/                       # 352 tests, no OCR runtime required
+├── tests/                       # 395 tests, no OCR runtime required
 ├── docs/
 │   ├── decisions.md
 │   ├── pipeline.md

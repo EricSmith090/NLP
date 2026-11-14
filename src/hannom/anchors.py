@@ -51,11 +51,20 @@ def gather_readings(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings: Any | None = None,
 ) -> tuple[list[str], str]:
     """Return (readings, source) for one Nôm character.
 
-    ``source`` is ``"lexicon+dictionary"``, ``"lexicon"``, ``"dictionary"``
-    or ``"none"``. Readings are NFC/casefold-normalised and de-duplicated.
+    ``readings`` is an optional compact-cache ``Readings`` instance (or any
+    object with ``of(ch) -> iterable[str]``). When supplied, its char ∪ word
+    evidence is merged with the lexicon/dictionary JSONL evidence so that the
+    in-pipeline matchers and the diagnostic/map-repair paths consume the same
+    token source (verify-G M4). Local-uniqueness semantics of the anchor
+    builders are unchanged.
+
+    ``source`` is ``"lexicon+dictionary"``, ``"lexicon"``, ``"dictionary"``,
+    ``"readings-cache"`` (compounds with the others, ``+``-joined) or
+    ``"none"``. Readings are NFC/casefold-normalised and de-duplicated.
     """
     lexicon_readings = (
         list(lexicon.readings(char))
@@ -69,20 +78,25 @@ def gather_readings(
             dictionary_readings = [str(r) for r in getattr(result, "readings", []) or []]
         except Exception:
             dictionary_readings = []
+    cache_readings: list[str] = []
+    if readings is not None and hasattr(readings, "of"):
+        try:
+            cache_readings = [str(r) for r in readings.of(char)]
+        except Exception:
+            cache_readings = []
     merged: list[str] = []
-    for reading in lexicon_readings + dictionary_readings:
+    for reading in lexicon_readings + dictionary_readings + cache_readings:
         normalized = normalize_reading(reading)
         if normalized and normalized not in merged:
             merged.append(normalized)
-    if lexicon_readings and dictionary_readings:
-        source = "lexicon+dictionary"
-    elif lexicon_readings:
-        source = "lexicon"
-    elif dictionary_readings:
-        source = "dictionary"
-    else:
-        source = "none"
-    return merged, source
+    source_parts = []
+    if lexicon_readings:
+        source_parts.append("lexicon")
+    if dictionary_readings:
+        source_parts.append("dictionary")
+    if cache_readings:
+        source_parts.append("readings-cache")
+    return merged, "+".join(source_parts) if source_parts else "none"
 
 
 def _candidate_tables(

@@ -205,6 +205,7 @@ def stream_cosegment(
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     max_anchor_gap_tokens: int = MAX_ANCHOR_GAP_TOKENS,
     anchor_window: int | None = None,
     sentence_window_factor: float = 1.5,
@@ -248,7 +249,9 @@ def stream_cosegment(
     # ------------------------------------------------------------------
     nom_items: list[list[str]] = []
     for pos, index in enumerate(nom_idx):
-        readings, _source = gather_readings(nom_text[index], lexicon=lexicon, dictionary=dictionary)
+        readings, _source = gather_readings(
+            nom_text[index], lexicon=lexicon, dictionary=dictionary, readings=readings_cache
+        )
         nom_items.append(readings)
     qn_tokens = token_items(qn_text)
 

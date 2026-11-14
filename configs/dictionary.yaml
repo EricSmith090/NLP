@@ -6,6 +6,15 @@
 dictionary:
   entries_dir: "dictionaries-04-11-2026/entries"
   sources: []  # discovery is by glob; this list is only a label fallback
+  # The 2026-11-04 drop ships the full catusf dump (3,541,369 records,
+  # zero `"readings"` keys, ~2.04M English-Vietnamese) — a parse that costs
+  # seconds per stage/book and contributes exactly zero reading evidence
+  # (verify-G H3). Until the provider re-declares the 5-dict subset
+  # (22,030 / 9,897 / 78,573 / 3,189 / 139,043 = 252,732), skip catusf at
+  # ingest. Remove this list only after the provider trims the file
+  # Upstream. Verified: rebuilding the cache without catusf reproduces the
+  # shipped cache exactly.
+  skip_sources: ["catusf.jsonl"]
   unihan_dir: "dictionaries/unihan"
   cedict_path: "dictionaries/cc_cedict.txt"
   makemeahanzi_path: "dictionaries/makemeahanzi.txt"
