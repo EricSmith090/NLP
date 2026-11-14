@@ -5,19 +5,22 @@ from hannom.models import AlignmentRow
 from hannom.textdiff import make_element
 
 
-def row(sentence_id: str, ch: str, vi: str, elements=None) -> AlignmentRow:
+def row(sentence_id: str, ch: str, vi: str, elements=None, flags=()) -> AlignmentRow:
+    """Verified-match rows carry comparison evidence by default."""
     return AlignmentRow(
         img_id="Book.001.jpg",
         sentence_id=sentence_id,
         ch_txt=ch,
         vi_txt=vi,
         text_diff=elements,
+        flags=list(flags) or (["DIFF_NO_READING_MISMATCH"] if elements == [] else []),
     )
 
 
 def test_identical_row_scores_full_marks():
     metrics = evaluate_rows("b", [row("Book.001.1", "字字", "hai chữ", [])])
     assert metrics.similarity == 100.0
+    assert metrics.verified_match_rows == 1
     assert metrics.passed
 
 
@@ -27,6 +30,7 @@ def test_red_penalty_uses_max_of_nom_chars_and_qn_syllables():
     assert metrics.red_mismatch_chars == 2
     assert metrics.denominator == 2
     assert metrics.similarity == 0.0
+    assert metrics.verified_difference_rows == 1
     assert not metrics.passed
 
 

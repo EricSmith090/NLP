@@ -97,8 +97,36 @@ class AlignmentRow:
     ch_txt: str
     vi_txt: str
     text_diff: list[DiffElement] | None = None
+    # ``confidence`` is the *structural* confidence: how plausible the
+    # segment grouping is (length, penalties, segmentation). It is not
+    # semantic correspondence evidence. Semantic support lives in
+    # ``semantic_confidence``; rows with no reading evidence carry
+    # ``ALIGN_EVIDENCE_INSUFFICIENT`` and are never verified on structure
+    # alone. See ``semantic_confidence`` below.
     confidence: float | None = None
     flags: list[str] = field(default_factory=list)
+    # Semantic evidence confidence: fraction of reading-carrying Nôm
+    # characters with a reliable reading anchor in the paired QN text.
+    # ``None`` means no reading evidence either way.
+    semantic_confidence: float | None = None
+    # Set by ``review_decisions.apply_decisions``: explicit human review
+    # status ("accepted_match", "accepted_difference", ...) or None when
+    # there is no valid, non-stale decision for the row.
+    review_status: str | None = None
+    # Reviewer identity attached to the effective decision (empty when
+    # absent). Used for lexicon provenance.
+    review_reviewer: str | None = None
+    # Effective decision integrity: "valid" | "stale" | "invalid" |
+    # "conflict" | None (no review events, or attributable history). Only a
+    # non-stale, conflict-free, valid decision authorizes learning.
+    decision_integrity: str | None = None
+    # Stable fingerprint of the effective decision (``ReviewDecision.
+    # fingerprint()``); recorded in lexicon provenance for revocation.
+    decision_id: str | None = None
+    # Reviewer-confirmed character-to-token mappings attached to the
+    # effective decision (empty when absent). Used by lexicon learning;
+    # never inferred from sentence-level dictionary membership.
+    character_token_mappings: list[dict] = field(default_factory=list)
 
     def text_diff_json(self) -> str:
         if self.text_diff is None:
@@ -124,6 +152,28 @@ class BookMetrics:
     passed: bool = False
     issues: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    verified_match_rows: int = 0
+    verified_difference_rows: int = 0
+    unverified_rows: int = 0
+    unmatched_rows: int = 0
+    coverage_ratio: float | None = None
+    # Structural grouping confidence aggregates (NOT semantic evidence).
+    structural_confidence_mean: float | None = None
+    # Rows with at least one reading anchor tying them to their counterpart.
+    semantic_evidence_rows: int = 0
+    # Rows explicitly flagged as lacking reading evidence.
+    evidence_insufficient_rows: int = 0
+    # Historical decision diagnostics that are NOT active blockers (all
+    # superseded or otherwise non-attributable events from the log).
+    decision_audit_diagnostics: list[str] = field(default_factory=list)
+    # Spec (Quy_định_đồ_án_v2.1, "Đánh giá dữ liệu") formula computed over
+    # ALL rows with text_diff ≠ null (including unverified/null-flagged rows),
+    # not only verified ones: similarity = (1 − red_penalty / denom) × 100.
+    # Informational; gate uses `similarity`/`denominator`/`coverage_ratio`.
+    spec_formula_similarity: float | None = None
+    spec_formula_red_chars: int = 0
+    spec_formula_denominator: int = 0
+    spec_formula_scored_rows: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         from dataclasses import asdict

@@ -7,10 +7,21 @@ and submission packaging.
 
 **Deadline:** 2026-11-30  
 **Scope:** 3 books, 950 PDF pages, ≥95% similarity per book (not aggregate)  
-**Current status (2026-11-08):** deterministic stages complete and verified;
-the pipeline is correctly blocked at OCR because no local OCR runtime or
-Kim Hán Nôm token is installed. Final labels, alignment, report, and ZIP
-cannot be produced until OCR + human review are done.
+**Current status (2026-11-13):** deterministic stages (0–2) complete and re-verified.
+OCR: Tap1 (all 282 targets) and Tap3 (110) complete — Tap1 89.96%, Tap3 93.74%
+similarity (gates FAIL: coverage <0.9, unverified >0.05 and similarity <95 for
+both; closing requires human review, not code). Tap2 is only 6/550 pages OCR'd
+(Nôm section unblocked only by the Kim Hán Nôm API weekly quota rollover
+2026-11-16); its gate has 15 rows (85.71%), never empty anymore. Quốc ngữ OCR
+uses Vintern-1B-v2 locally; Nôm uses the Kim Hán Nôm API (api_first, quota
+ledger; local PaddleOCR fallback). **The T1 Nôm↔QN image maps are now built
+deterministically from the printed cross-reference markers** (every substantive
+QN page prints the Nôm *printed* page number in parentheses; Nôm PDF = marker
++ 2, e.g. vi013↔ch276 … vi142↔ch147 for Tap1): Tap1 130/130, Tap2 264/264,
+Tap3 50/50 pairs **verified** (`mapping_source=printed_marker`); marker-verified
+at packaging. The 2026-11-12 content-DP repair and its residual errors are
+superseded. Nothing is claimed final; errors/similarities are all human-review
+corrections away from final.
 
 ## Assigned books
 
@@ -44,13 +55,22 @@ Extraction fidelity after the final re-extraction:
 
 - 950 unique JPEGs, one per page, no duplicate hashes;
 - 923 pages copied byte-for-byte from the embedded JPEG stream;
-- 27 rotated pages transposed losslessly at their native resolution;
-- no page was upscaled or rendered at a larger size.
+- 27 rotated pages transposed at native resolution (90-degree transpose, JPEG re-encode q95 4:4:4; no resampling; not a DCT-domain lossless transform);
+- no page was upscaled or rendered at a larger size;
+- `<BookName>_updated.pdf` was generated for the two books with rotated
+  pages (`data/output/<book_id>/<BookName>/`, built with
+  `python tools/build_updated_pdf.py --all`): one native image per page,
+  page count identical to the assigned PDF, embedded bytes identical to the
+  extracted JPEGs. Book 3 needed none. Merging them into the submission and
+  notifying the handout person is a mandatory human step before hand-in.
 
 ## Non-negotiable rules enforced by the code
 
 - `.jpg` only; native resolution; page numbering starts at 1; one PDF
   page = one image; two-page spreads are never split.
+- Alignment never silently drops a sentence: a collapsed co-cut is emitted
+  as an `UNMATCHED_QN`/`UNMATCHED_NOM` row, and `stage_align` asserts
+  stream-vs-emitted QN token parity fail-closed.
 - Every submitted image has a `Label.txt` row and a `fileState.txt` line;
   every `fileState.txt` value is `1`; boxes have exactly four points.
 - T1 reading order: QN increasing page numbers, Nôm decreasing page
@@ -89,7 +109,7 @@ Extraction fidelity after the final re-extraction:
 │   ├── benchmark_ocr.py
 │   ├── capture_screenshots.py
 │   └── validate_submission.py
-├── tests/                       # 44 tests, no OCR runtime required
+├── tests/                       # 395 tests, no OCR runtime required
 ├── docs/
 │   ├── decisions.md
 │   ├── pipeline.md
@@ -126,7 +146,7 @@ python -m hannom.cli intake
 python -m hannom.cli extract
 python -m hannom.cli classify
 python -m hannom.cli map
-python -m hannom.cli ocr                 # currently blocked: no engine
+python -m hannom.cli ocr                 # Nôm: Kim Hán Nôm API first (quota-gated), local fallback on quota; QN: Vintern
 python -m hannom.cli labels
 python -m hannom.cli clean
 python -m hannom.cli align
@@ -146,6 +166,7 @@ python -m hannom.cli ocr --book T1_SuaLoiQuyen --limit 3
 python -m hannom.cli extract --book T1_CamPhong_Tap2 --force
 python -m hannom.cli source-zip
 python -m hannom.cli split
+python tools/build_updated_pdf.py --all   # rebuild <Book>_updated.pdf if images changed
 ```
 
 `pilot` stops with `status=blocked_ocr` when no OCR engine is available
@@ -154,14 +175,30 @@ stages, hashes, and metrics so a rerun resumes rather than redoing work.
 
 ## OCR policy
 
-- Local OCR is the primary path; Kim Hán Nôm API is a measured second
-  opinion for low-confidence Nôm pages.
+- Nôm OCR: the Kim Hán Nôm API is used first (`api_mode: api_first`, the
+  guideline's ưu tiên). Once the quota (25/min, 50/h, 200/day, 600/week) is
+  exhausted or the API cannot serve a page, the pipeline switches to the
+  local PP-OCRv5/PaddleOCR-VL models; those results are written to
+  `data/ocr/<book>/local_fallback/<page>.json` so they never clash with the
+  API-handled files in `data/ocr/<book>/`. `load_result` prefers the
+  API-handled file and falls back to the local fallback file. Local-only
+  runs remain available via `api_mode: local_only`.
+- QN OCR: Vintern-1B-v2 (Vietnamese-native VLM) is primary. benchmark on
+  pages 11/41 gave near-perfect transcription of the archaic spelling,
+  ~35 s/page, peak 2.3 GB VRAM (RTX 4060, 8 GB). Forces 1 full-page box
+  per image (guideline p.12 allows one box per page). The Kim Hán Nôm API
+  is Hán/Nôm-only and must not receive QN pages.
+- PaddleOCR's latin/ch models are not used for QN anymore; they drop
+  Vietnamese tone marks systematically (128 distinct affected tokens in
+  Book 3, e.g. `dēn` for `đến`, `muōn` for `muốn`).
 - The API token is read from `KIMHANNOM_TOKEN` (`.env` is supported and is
   never packaged).
 - The API client is single-threaded, caches by image SHA-256, applies
   exponential backoff, and records a quota ledger for the documented
   25/minute, 50/hour, 200/day, 600/week limits.
-- Multiple accounts are not used to bypass quota.
+- Multiple accounts are not used to bypass quota. When the quota is reached,
+  the pipeline falls back to local models for the remaining Nôm pages
+  instead of stalling or exceeding the limits.
 - No token, model weight, confidential PDF, `data/`, or `artifacts/`
   directory enters `source.zip`.
 
@@ -197,14 +234,24 @@ are missing.
 ## Quality gate
 
 ```text
-similarity (%) = (1 - mismatched_red_characters / scored_nom_characters) × 100
+accuracy (similarity %, verified rows only) =
+  (1 - mismatched_red_characters / scored_nom_characters) × 100
+
+coverage = (verified_match_rows + verified_difference_rows) / total_rows
 ```
 
-- Denominator: Nôm characters in rows with `text_diff != null`; excludes
-  QN text, punctuation, `[MASK]`, and yellow characters.
+- Denominator: Nôm characters in rows with comparison evidence and a
+  valid `text_diff`; excludes QN text, punctuation, `[MASK]`, yellow
+  characters. Accuracy is never computed over unverified rows.
 - Numerator: for each `error` element, `max(Nôm characters, QN syllables)`.
-- Gate: ≥95% for each of the three books.
-- The report also records yellow-character ratio and null-row ratio.
+- Coverage/unverified/null gates (configurable in `configs/project.yaml`
+  `quality`): `minimum_coverage: 0.9`, `max_unverified_ratio: 0.05`, and
+  `null_ratio_warn: 0.05` now blocks under `EXCESSIVE_NULL_ROWS`.
+- Gate: accuracy ≥95% plus coverage ≥0.9, unverified ≤0.05 and null ≤0.05
+  for each of the three books. Insufficient evidence yields a failing,
+  inconclusive evaluation, never a pass.
+- The report records yellow-character ratio, null-row ratio, coverage, and
+  per-class row counts (verified/unverified/unmatched).
 
 No final similarity is claimed yet. It will be measured after OCR and
 review; drafts are never used as evidence.
@@ -220,7 +267,18 @@ review; drafts are never used as evidence.
 ## Environment used for verification
 
 - Windows 11, Python 3.13.9 (`D:\anaconda3\python.exe`), 15.7 GB RAM.
-- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (OCR stack not installed yet).
+- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (used by Vintern-1B-v2 for QN OCR).
+- Local OCR (Nôm draft + geometry): paddlepaddle 3.3.1, paddleocr 3.7.0
+  (+ opencv-contrib-python 4.10.0.84). paddlex defaults to oneDNN run mode,
+  which crashes on this host (`pir::ArrayAttribute<pir::DoubleAttribute>` on
+  the PIR path); the local adapter forces `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false`
+  and uses PP-OCRv5 mobile det/rec. PyYAML stays at the pinned 6.0.3
+  (paddlex 3.7.2 requests 6.0.2).
+- Vintern-1B-v2 (QN primary): torch 2.14.1+cu126, torchvision 0.29.1+cu126
+  (install via `--index-url https://download.pytorch.org/whl/cu126`),
+  transformers 4.46.3 (5.x incompatible), einops 0.8.2, timm 1.0.31,
+  accelerate 1.15.0. A no-op `flash_attn` shim exists in site-packages; the
+  stock model config sets `use_flash_attn=False`.
 - PyMuPDF 1.28.2, NumPy 2.2.6, SciPy 1.16.3, Pillow 12.3.0,
   pandas 2.3.3, openpyxl 3.1.5, PyYAML 6.0.3, pydantic 2.12.4,
   Typer 0.20.0, Rich 14.2.0, Streamlit 1.51.0, pytest 8.4.2.

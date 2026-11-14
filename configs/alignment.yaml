@@ -1,4 +1,18 @@
 alignment:
+  # Cosegmentation strategy for sentence cuts. "cosegment" is the original
+  # anchor-interpolated cut heuristic. "charalign" aligns the two reading
+  # streams globally and projects QN punctuation cuts onto the Nôm stream
+  # (see hannom.charstream). Per-book overrides live under per_book.
+  segmentation: cosegment
+  per_book:
+    T1_SuaLoiQuyen:
+      segmentation: charalign
+      # Margin running-head boxes printed on Nôm pages (title of the book).
+      strip_texts: ["所𥚇卷"]
+    T1_CamPhong_Tap1:
+      segmentation: charalign
+    T1_CamPhong_Tap2:
+      segmentation: cosegment
   # Length ratio is a weak but cheap prior for phonetic translation.
   expected_syllables_per_nom_char: 1.0
   max_group: 4
@@ -7,19 +21,52 @@ alignment:
   many_to_one_penalty: 0.35
   many_to_many_penalty: 0.90
   low_confidence_threshold: 0.55
+  # Explicit unmatched-segment costs: prefer a truthful UNMATCHED_* row over
+  # a forced correspondence. Same scale as the text_diff gap penalty.
+  unmatched_nom_penalty: 1.2
+  unmatched_qn_penalty: 1.2
   # If a sentence is predicted rather than read, mark text_diff warn only
   # for the guideline-approved cases; never use yellow to inflate scores.
   mark_cross_page_joins: true
+  # OPT-IN weak fold tier for the align DP reading bonus (verify-G M4/R3).
+  # OFF by default: the DP bonus stays exact-only (byte-identical to the
+  # pre-fix behaviour). When true, a fold-only anchor counts at half
+  # weight against exact anchors (the 1.0-vs-2.0 tier weights are the
+  # textdiff NW matcher's scale; charalign's Matcher uses 3.0/2.0 for the
+  # same distinction; i.e. 0.5× in the 1.0-per-anchor bonus unit). Expect
+  # ALIGN_EVIDENCE_INSUFFICIENT to drop; turn on only after re-baselining.
+  dp_fold_bonus: false
 
 text_diff:
   # Unknown readings are routed to review, never auto-red.
   unknown_policy: review
   require_dictionary_for_black: false
-  strip_diacritics_for_reading_match: true
+  strip_diacritics_for_reading_match: false
+  # Weak orthographic variant fold (quỷ/quỉ/quĩ -> qui, d/gi and đ/d
+  # alternation) is accepted as a *weak* reading match inside the NW
+  # matcher (same weight as the flat tone-stripped match, never exact).
+  # Comparison-only; never red-generating evidence, never edits stored
+  # text. This key IS consumed: align-time (`hannom.align._emit_rows` via
+  # `hannom.textdiff.variant_fold_from_config`) and recompute-time
+  # (`hannom.orchestrator.recompute_text_diff`) both read it. Rows whose NW
+  # run anchored at least one character through the fold carry the
+  # non-blocking flag DIFF_VARIANT_FOLD_APPLIED (counted per row in
+  # summary.json's `flags` histogram, rewritten only by the align stage;
+  # a bare `hannom textdiff` re-run does not rewrite that file). The flag
+  # also rides in the review-metadata sidecar. DiffResult additionally
+  # exposes matched_fold_readings for unit tests.
+  variant_fold: true
   proper_name_max_chars: 12
   proper_name_max_syllables: 12
 
 evaluation:
+  # NOTE: the authoritative gate config lives in configs/project.yaml
+  # `quality` (minimum_similarity, minimum_coverage, max_unverified_ratio,
+  # null_ratio_warn, yellow_ratio_warn); it is enforced by
+  # hannom.evaluate.evaluate_rows. This block is documentation parity.
   minimum_similarity: 95.0
+  minimum_coverage: 0.9
+  max_unverified_ratio: 0.05
+  max_null_ratio: 0.05
   exclude_mask_from_denominator: true
   exclude_yellow_from_denominator: true

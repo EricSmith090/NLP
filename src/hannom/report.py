@@ -274,6 +274,15 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                         "N/A" if metrics.similarity is None else f"{metrics.similarity:.2f}%",
                     ),
                     (
+                        "Similarity (spec formula, all non-null rows)",
+                        "N/A" if metrics.spec_formula_similarity is None
+                        else f"{metrics.spec_formula_similarity:.2f}%",
+                    ),
+                    (
+                        "Spec formula red/denom",
+                        f"{metrics.spec_formula_red_chars} / {metrics.spec_formula_denominator}",
+                    ),
+                    (
                         "Yellow ratio",
                         "N/A" if metrics.yellow_ratio is None else f"{metrics.yellow_ratio:.2%}",
                     ),
@@ -281,6 +290,17 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                         "Null-row ratio",
                         "N/A" if metrics.null_ratio is None else f"{metrics.null_ratio:.2%}",
                     ),
+                    (
+                        "Coverage",
+                        "N/A" if metrics.coverage_ratio is None else f"{metrics.coverage_ratio:.2%}",
+                    ),
+                    (
+                        "Structural confidence (grouping)",
+                        "N/A" if metrics.structural_confidence_mean is None else f"{metrics.structural_confidence_mean:.2f}",
+                    ),
+                    ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
+                    ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
+                    ("Decision diagnostics (superseded)", str(len(metrics.decision_audit_diagnostics))),
                     ("Gate ≥95%", "PASS" if metrics.passed else "FAIL"),
                 ]
             )
@@ -303,6 +323,15 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                 ("Ký tự yellow", f"{metrics.yellow_chars} ({metrics.yellow_ratio:.2%})" if metrics.yellow_ratio is not None else str(metrics.yellow_chars)),
                 ("Ký tự red (penalty)", str(metrics.red_mismatch_chars)),
                 ("Mẫu số scored", str(metrics.denominator)),
+                ("Dòng verified match", str(metrics.verified_match_rows)),
+                ("Dòng verified difference", str(metrics.verified_difference_rows)),
+                ("Dòng chưa xác minh", str(metrics.unverified_rows)),
+                ("Dòng unmatched", str(metrics.unmatched_rows)),
+                ("Coverage", "N/A" if metrics.coverage_ratio is None else f"{metrics.coverage_ratio:.2%}"),
+                ("Structural confidence (grouping)", "N/A" if metrics.structural_confidence_mean is None else f"{metrics.structural_confidence_mean:.4f}"),
+                ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
+                ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
+                ("Decision diagnostics (superseded)", str(len(metrics.decision_audit_diagnostics))),
                 ("Similarity", "N/A" if metrics.similarity is None else f"{metrics.similarity:.4f}%"),
                 ("Kết luận", "PASS" if metrics.passed else "FAIL"),
             ]
@@ -340,7 +369,7 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
         "Quy_định_đồ_án_v2.1.pdf — quy định đồ án (nguồn chuẩn).",
         "Hướng dẫn sử dụng API Kim Hán Nôm.",
         "Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ.",
-        "PyMuPDF, PaddleOCR, Vintern-1B-v2, PPOCRLabel, Streamlit, openpyxl.",
+        "PyMuPDF, Vintern-1B-v2, PaddleOCR, PPOCRLabel, Streamlit, openpyxl.",
     ]:
         writer.paragraph(f"- {citation}")
 

@@ -3,6 +3,12 @@
 The aligner produces draft CSV rows. It deliberately does not pretend that
 length similarity is semantic understanding: low-confidence rows are flagged
 for review, and ``text_diff`` is null for every non-1-1 group.
+
+``AlignmentRow.confidence`` is a *structural* grouping confidence. Reading
+evidence is reported separately as ``semantic_confidence`` (fraction of
+reading-carrying Nôm characters anchored to the paired Quốc ngữ text by a
+unique local reading match). Rows without adequate reading evidence carry
+``ALIGN_EVIDENCE_INSUFFICIENT`` and are never verified on structure alone.
 """
 
 from __future__ import annotations
@@ -15,13 +21,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .clean import MASK, TERMINAL_NOM, count_nom_chars, nfc
-from .dictionary.book_lexicon import qn_syllables, strip_diacritics
+from .clean import MASK, QN_ABBREVIATIONS, VIETNAMESE_UPPER_CLASS, TERMINAL_NOM, count_nom_chars, is_nom_char, nfc
+from .dictionary.book_lexicon import qn_syllables
 from .models import AlignmentRow, DiffElement
+from .review_metadata import write_review_metadata
 from .t1_map import Pair
-from .textdiff import auto_text_diff, validate_text_diff
+from .textdiff import auto_text_diff, validate_text_diff, variant_fold_from_config
 
-QN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+(?=[A-ZÀ-Ỹ\"“(\[]|\d)")
+QN_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?;:\u2026])\s+(?=[" + VIETNAMESE_UPPER_CLASS + r"\"“(\[\d])"
+)
+_QN_ABBREV_RE = re.compile(
+    r"\b(?:" + "|".join(sorted(QN_ABBREVIATIONS, key=len, reverse=True)) + r")\.$",
+    re.IGNORECASE,
+)
 NOM_TERMINAL_RE = re.compile(r"(?<=[\u3002\uFF01\uFF1F\uFF1B\uFF1A])")
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -58,10 +71,45 @@ class AlignConfig:
     max_qn_chars: int = 350
     max_nom_chars: int = 80
     join_cross_page: bool = True
+    # Cost per explicitly unmatched segment. Chosen on the same scale as the
+    # Needleman-Wunsch gap penalty (1.2). The true decision band: an explicit
+    # unmatched transition beats a forced 1-1 group only when the group cost
+    # exceeds 2 x 1.2 = 2.4, i.e. when |log(observed/expected)| > 2.4 for a
+    # single 1-1 group (observed syllables/Nôm chars outside roughly
+    # (0.09, 11.05)); inside that band a forced (possibly wrong) 1-1 match is
+    # cheaper than declaring both sides unmatched. Two unmatched segments lose
+    # to a decent 1-1 group but beat a badly-forced correspondence. Rows with
+    # no reading evidence in that band surface as ALIGN_EVIDENCE_INSUFFICIENT
+    # and block the gate — they are not trusted on structure alone.
+    unmatched_nom_penalty: float = 1.2
+    unmatched_qn_penalty: float = 1.2
+    # Segmentation strategy for this project. "cosegment" is the original
+    # anchor-interpolated cut heuristic; "charalign" projects the global
+    # reading-stream alignment onto the QN sentence boundaries (see
+    # hannom.charstream). Per-book overrides (segmentation, strip_texts)
+    # live in ``per_book``.
+    segmentation: str = "cosegment"
+    strip_texts: list[str] = field(default_factory=list)
+    per_book: dict[str, Any] = field(default_factory=dict)
+    # Weak orthographic variant fold inside the text_diff NW matcher
+    # (quỷ/quĩ/quy -> qui). Consumed from ``text_diff.variant_fold`` in the
+    # same file via ``variant_fold_from_config``; kept here so both the
+    # align-time call site and the caller-facing plumb can share it.
+    variant_fold: bool = True
+    # OPT-IN weak fold tier for the align DP reading bonus (verify-G M4/R3).
+    # Exact-only anchors keep full weight; a fold-only anchor counts at
+    # half weight (the 2.0/1.0 tier weights are the textdiff NW matcher's
+    # scale — charalign's Matcher uses 3.0/2.0 for the same distinction),
+    # i.e. ×0.5 in this 1.0-per-anchor unit. Default off: the DP
+    # bonus stays byte-identical to the pre-fix behaviour. Turn on only
+    # with ``alignment.dp_fold_bonus: true`` after re-baselining gates —
+    # a fold bonus further blunts ALIGN_EVIDENCE_INSUFFICIENT.
+    dp_fold_bonus: bool = False
 
 
 def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
-    raw = (raw or {}).get("alignment", raw or {})
+    raw_config = raw or {}
+    raw = raw_config.get("alignment", raw_config) or {}
     defaults = AlignConfig()
     return AlignConfig(
         expected_syllables_per_nom_char=float(
@@ -76,6 +124,13 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
         max_qn_chars=int(raw.get("max_qn_chars", defaults.max_qn_chars)),
         max_nom_chars=int(raw.get("max_nom_chars", defaults.max_nom_chars)),
         join_cross_page=bool(raw.get("join_cross_page", defaults.join_cross_page)),
+        unmatched_nom_penalty=float(raw.get("unmatched_nom_penalty", defaults.unmatched_nom_penalty)),
+        unmatched_qn_penalty=float(raw.get("unmatched_qn_penalty", defaults.unmatched_qn_penalty)),
+        segmentation=str(raw.get("segmentation", defaults.segmentation)),
+        strip_texts=[str(item) for item in (raw.get("strip_texts", []) or [])],
+        per_book=dict(raw.get("per_book", {}) or {}),
+        variant_fold=variant_fold_from_config(raw_config),
+        dp_fold_bonus=bool(raw.get("dp_fold_bonus", defaults.dp_fold_bonus)),
     )
 
 
@@ -84,12 +139,23 @@ def _split_long_text(text: str, max_chars: int) -> list[str]:
         return [text]
     pieces: list[str] = []
     remaining = text
+    # Note: when clamping to a clause boundary, pieces may exceed max_chars
+    # (bounded by the 2x lookahead) — mid-word hard cuts are the last resort.
+    marks = (" ", ";", ",", "\u3001", "\u3002", "\uFF0C", "\uFF1B", "\uFF01", "\uFF1F", "\uFF1A")
     while len(remaining) > max_chars:
         window = remaining[:max_chars]
         # Prefer a punctuation or whitespace boundary near the limit.
-        cut = max(window.rfind(mark) for mark in (" ", ";", ",", "\u3001", "\uFF1B"))
+        cut = max(window.rfind(mark) for mark in marks)
         if cut < max_chars // 2:
-            cut = max_chars
+            # Clamp to a clause boundary instead of cutting mid-word: take the
+            # earliest clause boundary in a bounded lookahead after the halfway
+            # point (at most 2x max_chars); hard-cut at max_chars is the last resort.
+            best = -1
+            for mark in marks:
+                pos = remaining.find(mark, max_chars // 2, 2 * max_chars)
+                if pos >= 0 and (best < 0 or pos + 1 < best):
+                    best = pos + 1
+            cut = best if best >= 0 else max_chars
         pieces.append(remaining[:cut].strip())
         remaining = remaining[cut:].strip()
     if remaining:
@@ -125,7 +191,13 @@ def split_qn_page(page: Any, max_chars: int = 350) -> list[str]:
     text = nfc(str(getattr(page, "text", "") or ""))
     if not text:
         return []
-    parts = [p.strip() for p in QN_SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    raw = [p.strip() for p in QN_SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    parts: list[str] = []
+    for part in raw:
+        if parts and _QN_ABBREV_RE.search(parts[-1]):
+            parts[-1] = f"{parts[-1]} {part}"
+        else:
+            parts.append(part)
     out: list[str] = []
     for part in parts:
         out.extend(_split_long_text(part, max_chars))
@@ -145,11 +217,76 @@ def _may_join_across_pages(previous: str, following: str, script: str) -> bool:
     return previous[-1] not in ".!?\u2026" and following[:1].islower()
 
 
+def _stream_segments(
+    pairs: Sequence[Pair],
+    cleaned_by_name: dict[str, Any],
+    script: str,
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    stats: dict[str, Any] | None = None,
+) -> list[TextSegment] | None:
+    """Global reading-stream co-segmentation (both scripts get the same cuts)."""
+    from .cosegment import PageUnit, stream_cosegment
+
+    nom_units: list[PageUnit] = []
+    qn_units: list[PageUnit] = []
+    missing_pages: list[str] = []
+    for pair in pairs:
+        for name in pair.ch:
+            page = cleaned_by_name.get(name)
+            if page is None:
+                missing_pages.append(name)
+                continue
+            nom_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
+        for name in pair.vi:
+            page = cleaned_by_name.get(name)
+            if page is None:
+                missing_pages.append(name)
+                continue
+            qn_units.append(PageUnit(name, nfc(str(getattr(page, "text", "") or ""))))
+    if stats is not None and missing_pages:
+        merged = set(stats.get("missing_clean_pages") or [])
+        merged.update(missing_pages)
+        stats["missing_clean_pages"] = sorted(merged)
+    stream = stream_cosegment(
+        nom_units, qn_units, lexicon=lexicon, dictionary=dictionary,
+        readings_cache=readings_cache, stats=stats,
+    )
+    if stream is None:
+        return None
+    if stats is not None:
+        stats["segmenter"] = "cosegment-stream"
+    nom_segs, qn_segs = stream
+    source = nom_segs if script == "nom" else qn_segs
+    out: list[TextSegment] = []
+    for i, s in enumerate(source):
+        out.append(
+            TextSegment(
+                text=s.text,
+                image_name=s.image_name,
+                page_no=s.page_no,
+                page_numbers=s.page_numbers,
+                image_names=s.image_names,
+                script=script,
+                order=i,
+                flags=list(s.flags),
+            )
+        )
+    return out
+
+
 def build_segments(
     pairs: Sequence[Pair],
     cleaned_by_name: dict[str, Any],
     script: str,
     config: AlignConfig,
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[list[TextSegment], list[str]]:
     """Build reading-order segments from image-map pairs.
 
@@ -157,9 +294,23 @@ def build_segments(
     decreasing page order; the vi side is increasing.
     """
     warnings: list[str] = []
+    if script in ("nom", "qn"):
+        stream = _stream_segments(
+            pairs, cleaned_by_name, script, lexicon=lexicon, dictionary=dictionary,
+            readings_cache=readings_cache, stats=stats,
+        )
+        if stream is not None:
+            if stats is not None:
+                warnings += [f"MISSING_CLEAN_PAGE:{name}" for name in stats.get("missing_clean_pages") or []]
+                warnings += [f"QN_SENTENCE_NO_NOM:{i}" for i in stats.get("sentences_isolated") or []]
+            return stream, warnings
+
     segments: list[TextSegment] = []
     order = 0
     for pair in pairs:
+        ch_names = pair.ch
+        vi_names = pair.vi
+
         names = pair.ch if script == "nom" else pair.vi
         for name in names:
             page = cleaned_by_name.get(name)
@@ -211,26 +362,80 @@ def build_segments(
     return merged, warnings
 
 
-def _reading_matches(nom_text: str, vi_text: str, lexicon: Any | None) -> tuple[int, int]:
-    """Return (matched known characters, known characters) for a group."""
-    if lexicon is None:
-        return 0, 0
-    tokens = {s.casefold() for s in qn_syllables(vi_text)}
-    tokens_flat = {strip_diacritics(t) for t in tokens}
-    known = matched = 0
-    for char in nom_text:
-        if not char.strip():
-            continue
-        readings = lexicon.readings(char) if hasattr(lexicon, "readings") else []
-        if not readings:
-            continue
-        known += 1
-        if any(
-            r.casefold() in tokens or strip_diacritics(r.casefold()) in tokens_flat
-            for r in readings
-        ):
-            matched += 1
-    return matched, known
+def _reading_matches(
+    nom_text: str,
+    vi_text: str,
+    lexicon: Any | None,
+    dictionary: Any | None = None,
+    *,
+    readings_cache: Any | None = None,
+    dp_fold: bool = False,
+) -> tuple[float, int]:
+    """Return (anchored weight, known characters) for a group.
+
+    Uses the union of lexicon, dictionary JSONL and (optionally) the compact
+    readings cache. Anchoring requires the same strict local-uniqueness
+    policy as ``hannom.anchors``, so the DP bonus cannot reward repeated,
+    ununique readings.
+
+    ``dp_fold=True`` (opt-in) additionally credits fold-only anchors at half
+    weight: exact anchor = 1.0, fold-only anchor = 0.5 (half of exact; the
+    2.0/1.0 tier weights are the textdiff NW matcher's scale; charalign's
+    Matcher uses 3.0/2.0 for the same distinction). The default keeps the
+    historical exact-only behaviour byte-identical.
+    """
+    from .anchors import find_reading_anchors, gather_readings, normalize_reading
+    from .charalign import fold
+
+    nom_chars = [c for c in nom_text if is_nom_char(c)]
+    if not nom_chars or (lexicon is None and dictionary is None and readings_cache is None):
+        return 0.0, 0
+    vi_folded = nfc(vi_text).casefold()
+    token_items_ = [
+        (m.start(), m.end(), m.group(0)) for m in QN_TOKEN_RE.finditer(vi_folded)
+    ]
+    if not token_items_:
+        return 0.0, 0
+    items = [
+        gather_readings(char, lexicon=lexicon, dictionary=dictionary, readings=readings_cache)[0]
+        for char in nom_chars
+    ]
+    known = sum(1 for readings in items if readings)
+    if known == 0:
+        return 0.0, 0
+    exact_anchors = find_reading_anchors(items, token_items_)
+    if not dp_fold:
+        return float(len(exact_anchors)), known
+    fold_items = [[normalize_reading(fold(r)) for r in readings] for readings in items]
+    fold_tokens = [(s, e, fold(t)) for s, e, t in token_items_]
+    fold_anchors = find_reading_anchors(fold_items, fold_tokens)
+    exact_set = set(exact_anchors)
+    fold_only = len({pair for pair in fold_anchors} - exact_set)
+    return float(len(exact_anchors)) + 0.5 * float(fold_only), known
+
+
+def semantic_evidence(
+    ch_txt: str,
+    vi_txt: str,
+    lexicon: Any | None,
+    dictionary: Any | None = None,
+    *,
+    readings_cache: Any | None = None,
+    dp_fold: bool = False,
+) -> tuple[float | None, float, int]:
+    """Return (semantic_confidence, anchored_count, known_count).
+
+    ``semantic_confidence`` is ``anchored / known`` when reading evidence
+    exists, else ``None`` (no evidence either way). ``anchored_count`` is
+    fractional only when ``dp_fold`` credits a fold-only anchor at half
+    weight (opt-in).
+    """
+    matched, known = _reading_matches(
+        ch_txt, vi_txt, lexicon, dictionary, readings_cache=readings_cache, dp_fold=dp_fold
+    )
+    if known == 0:
+        return None, 0.0, 0
+    return (matched / known), matched, known
 
 
 def _group_cost(
@@ -240,6 +445,10 @@ def _group_cost(
     b: int,
     config: AlignConfig,
     lexicon: Any | None,
+    dictionary: Any | None = None,
+    *,
+    readings_cache: Any | None = None,
+    apply_reading_bonus: bool = True,
 ) -> float:
     nom_count = max(1, count_nom_chars(nom_text))
     vi_count = max(1, len(QN_TOKEN_RE.findall(vi_text)))
@@ -254,7 +463,12 @@ def _group_cost(
         group_cost = config.one_to_many_penalty * (b - 1)
     elif a > 1 and b > 1:
         group_cost = config.many_to_many_penalty * (a + b - 2)
-    matched, known = _reading_matches(nom_text, vi_text, lexicon)
+    if not apply_reading_bonus:
+        return ratio_cost + group_cost
+    matched, known = _reading_matches(
+        nom_text, vi_text, lexicon, dictionary,
+        readings_cache=readings_cache, dp_fold=config.dp_fold_bonus,
+    )
     reading_bonus = 0.0
     if known:
         reading_bonus = 1.2 * (matched / known)
@@ -268,20 +482,32 @@ def align_segments(
     config: AlignConfig | None = None,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     minimum_confidence: float | None = None,
 ) -> list[AlignmentRow]:
     config = config or AlignConfig()
     n, m = len(nom_segments), len(qn_segments)
-    if n == 0 or m == 0:
-        return []
     inf = float("inf")
     dp = [[inf] * (m + 1) for _ in range(n + 1)]
-    back: list[list[tuple[int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    # back entries: ("group", a, b) | ("skip_nom", 1, 0) | ("skip_qn", 0, 1)
+    back: list[list[tuple[str, int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
     dp[0][0] = 0.0
     for i in range(n + 1):
         for j in range(m + 1):
             if dp[i][j] == inf:
                 continue
+            # Explicit unmatched transitions: a segment may remain
+            # unmatched instead of being forced into a weak correspondence.
+            if i + 1 <= n:
+                cost = dp[i][j] + config.unmatched_nom_penalty
+                if cost < dp[i + 1][j] - 1e-12:
+                    dp[i + 1][j] = cost
+                    back[i + 1][j] = ("skip_nom", 1, 0)
+            if j + 1 <= m:
+                cost = dp[i][j] + config.unmatched_qn_penalty
+                if cost < dp[i][j + 1] - 1e-12:
+                    dp[i][j + 1] = cost
+                    back[i][j + 1] = ("skip_qn", 0, 1)
             for a in range(1, config.max_group + 1):
                 if i + a > n:
                     break
@@ -292,51 +518,133 @@ def align_segments(
                         continue
                     nom_text = "".join(s.text for s in nom_segments[i : i + a])
                     vi_text = " ".join(s.text for s in qn_segments[j : j + b])
-                    cost = dp[i][j] + _group_cost(nom_text, vi_text, a, b, config, lexicon)
+                    cost = dp[i][j] + _group_cost(
+                        nom_text, vi_text, a, b, config, lexicon, dictionary,
+                        readings_cache=readings_cache,
+                    )
                     if cost < dp[i + a][j + b] - 1e-12:
                         dp[i + a][j + b] = cost
-                        back[i + a][j + b] = (a, b)
-    if dp[n][m] == inf:
-        return []
+                        back[i + a][j + b] = ("group", a, b)
 
-    groups: list[tuple[int, int, int, int, float]] = []
+    groups: list[tuple[int, int, int, int, float, str, int, int]] = []
     i, j = n, m
-    while i > 0 and j > 0:
+    while i > 0 or j > 0:
         step = back[i][j]
         if step is None:
-            break
-        a, b = step
-        groups.append((i - a, i, j - b, j, dp[i][j] - dp[i - a][j - b]))
+            # With unmatched transitions this cannot happen; refuse to
+            # invent groups rather than emit garbage if it did.
+            return []
+        kind, a, b = step
+        groups.append((i - a, i, j - b, j, dp[i][j] - dp[i - a][j - b], kind, a, b))
         i -= a
         j -= b
     groups.reverse()
+    return _emit_rows(
+        groups,
+        nom_segments,
+        qn_segments,
+        config=config,
+        lexicon=lexicon,
+        dictionary=dictionary,
+        readings_cache=readings_cache,
+        minimum_confidence=minimum_confidence,
+    )
 
+
+def _emit_rows(
+    groups: Sequence[tuple[int, int, int, int, float, str, int, int]],
+    nom_segments: Sequence[TextSegment],
+    qn_segments: Sequence[TextSegment],
+    *,
+    config: AlignConfig,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    minimum_confidence: float | None = None,
+) -> list[AlignmentRow]:
     rows: list[AlignmentRow] = []
     counters: dict[str, int] = {}
     threshold = minimum_confidence if minimum_confidence is not None else config.low_confidence_threshold
-    for (i0, i1, j0, j1, cost) in groups:
+    for (i0, i1, j0, j1, cost, kind, a, b) in groups:
         nom_group = list(nom_segments[i0:i1])
         qn_group = list(qn_segments[j0:j1])
-        if not nom_group or not qn_group:
+        if not nom_group and not qn_group:
             continue
         ch_txt = nfc("".join(s.text for s in nom_group))
-        vi_txt = nfc(" ".join(s.text for s in qn_group).strip())
+        vi_txt = nfc(" ".join(s.text for s in qn_group).strip()) if qn_group else ""
         if not ch_txt and not vi_txt:
             continue
-        img_id = nom_group[0].image_name
+        if kind == "group":
+            # A grouped row with an empty side is semantically an unmatched
+            # row (the stream carried a whole-sentence gap on one side);
+            # normalise here so every downstream path treats it as one.
+            if not ch_txt and vi_txt:
+                kind = "skip_qn"
+                normalized_skip = True
+            elif ch_txt and not vi_txt:
+                kind = "skip_nom"
+                normalized_skip = True
+            else:
+                normalized_skip = False
+        else:
+            normalized_skip = False
+        img_id = nom_group[0].image_name if nom_group else qn_group[0].image_name
         base = img_id[:-4] if img_id.lower().endswith(".jpg") else img_id
         counters[base] = counters.get(base, 0) + 1
         sentence_id = f"{base}.{counters[base]}"
-        confidence = 1.0 / (1.0 + max(0.0, cost))
+        # ``confidence`` is the STRUCTURAL grouping confidence: how plausible
+        # the segmentation/grouping is. It is intentionally free of reading
+        # bonuses and is never semantic correspondence evidence; semantic
+        # support is reported separately as ``semantic_confidence``.
+        if kind == "group":
+            structural_cost = _group_cost(
+                ch_txt, vi_txt, a, b, config, lexicon, dictionary,
+                readings_cache=readings_cache,
+                apply_reading_bonus=False,
+            )
+        else:
+            structural_cost = cost
+        if normalized_skip:
+            # Keep the structural confidence honest for normalised gap rows:
+            # never vouch for a correspondence the stream never supplied.
+            penalty = config.unmatched_qn_penalty if kind == "skip_qn" else config.unmatched_nom_penalty
+            structural_cost = max(structural_cost, penalty)
+        confidence = 1.0 / (1.0 + max(0.0, structural_cost))
+        semantic_confidence, _anchored, _known = semantic_evidence(
+            ch_txt, vi_txt, lexicon, dictionary,
+            readings_cache=readings_cache, dp_fold=config.dp_fold_bonus,
+        )
+        if kind in ("skip_nom", "skip_qn"):
+            semantic_confidence = 0.0
+        if kind == "group" and (semantic_confidence is None or semantic_confidence < 0.5):
+            evidence_flag = "ALIGN_EVIDENCE_INSUFFICIENT"
+        elif kind != "group":
+            evidence_flag = "ALIGN_EVIDENCE_INSUFFICIENT"
+        else:
+            evidence_flag = None
         flags: list[str] = []
         for segment in nom_group + qn_group:
             flags.extend(segment.flags)
-        if len(nom_group) != 1 or len(qn_group) != 1:
-            flags.append("NON_ONE_TO_ONE")
+        if evidence_flag:
+            flags.append(evidence_flag)
+        if kind == "skip_nom":
+            flags.extend(["UNMATCHED_NOM", "NON_ONE_TO_ONE"])
+        elif kind == "skip_qn":
+            flags.extend(["UNMATCHED_QN", "NON_ONE_TO_ONE"])
+        elif len(nom_group) > 1 and len(qn_group) == 1:
+            flags.extend(["ALIGNED_MANY_TO_ONE", "NON_ONE_TO_ONE"])
+        elif len(nom_group) == 1 and len(qn_group) > 1:
+            flags.extend(["ALIGNED_ONE_TO_MANY", "NON_ONE_TO_ONE"])
+        elif len(nom_group) > 1 and len(qn_group) > 1:
+            flags.extend(["ALIGNED_MANY_TO_MANY", "NON_ONE_TO_ONE"])
+        else:
+            flags.append("ALIGNED")
         if confidence < threshold:
             flags.append("ALIGN_LOW_CONF")
         if any(len(s.page_numbers) > 1 for s in nom_group + qn_group):
             flags.append("SPANS_PAGES")
+        if count_nom_chars(ch_txt) > 160:
+            flags.append("LONG_SEGMENT")
 
         text_diff: list[DiffElement] | None
         if len(nom_group) == 1 and len(qn_group) == 1 and ch_txt and vi_txt:
@@ -345,7 +653,9 @@ def align_segments(
                 vi_txt,
                 lexicon=lexicon,
                 dictionary=dictionary,
+                readings_cache=readings_cache,
                 strict_reading_mismatch=False,
+                allow_variant_fold=config.variant_fold,
             )
             text_diff = diff.elements
             flags.extend(diff.flags)
@@ -368,6 +678,7 @@ def align_segments(
                 text_diff=text_diff,
                 confidence=confidence,
                 flags=sorted(set(flags)),
+                semantic_confidence=semantic_confidence,
             )
         )
     return rows
@@ -381,10 +692,67 @@ def align_book(
     config: dict[str, Any] | None = None,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
-    nom_segments, nom_warnings = build_segments(pairs, cleaned_by_name, "nom", cfg)
-    qn_segments, qn_warnings = build_segments(pairs, cleaned_by_name, "qn", cfg)
+    per_book = cfg.per_book.get(book_id, {}) if isinstance(cfg.per_book, dict) else {}
+    segmentation = str(per_book.get("segmentation") or cfg.segmentation or "cosegment")
+    strip_texts = tuple(per_book.get("strip_texts") or cfg.strip_texts or ())
+    if segmentation == "charalign":
+        from .charstream import stream_segments_by_charalign
+        warnings: list[str] = []
+        try:
+            stream = stream_segments_by_charalign(
+                pairs, cleaned_by_name,
+                lexicon=lexicon, dictionary=dictionary,
+                readings_cache=readings_cache,
+                strip_texts=strip_texts,
+            )
+        except Exception as exc:  # fall back loudly, never crash the stage silently
+            stream = None
+            warnings.append(f"CHARALIGN_SEGMENTS_FAILED:{type(exc).__name__}:{exc}")
+        if stream is None:
+            warnings.append("CHARALIGN_SEGMENTS_FAILED: falling back to cosegment")
+        else:
+            nom_segments, qn_segments, stream_warnings = stream
+            warnings += stream_warnings
+            if stats is not None:
+                stats.setdefault("segmentation", "charalign")
+                stats.setdefault("stream_sentences", len(nom_segments))
+            if not nom_segments or not qn_segments:
+                return [], warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
+            # Segments are index-aligned one per QN sentence; force a 1-1 row
+            # per sentence. The DP is bypassed entirely for this book class.
+            groups: list[tuple[int, int, int, int, float, str, int, int]] = []
+            for i in range(len(nom_segments)):
+                nom = nom_segments[i]
+                qn = qn_segments[i]
+                kind = "group"
+                if not nom.text and qn.text:
+                    kind = "skip_qn"   # QN side has content the Nôm stream could not supply
+                elif nom.text and not qn.text:
+                    kind = "skip_nom"
+                groups.append((i, i + 1, i, i + 1, 0.0, kind, 1, 1))
+            rows = _emit_rows(
+                groups, nom_segments, qn_segments,
+                config=cfg, lexicon=lexicon, dictionary=dictionary,
+                readings_cache=readings_cache,
+                minimum_confidence=None,
+            )
+            return rows, sorted(set(warnings))
+
+    nom_segments, nom_warnings = build_segments(
+        pairs, cleaned_by_name, "nom", cfg, lexicon=lexicon, dictionary=dictionary,
+        readings_cache=readings_cache, stats=stats,
+    )
+    qn_segments, qn_warnings = build_segments(
+        pairs, cleaned_by_name, "qn", cfg, lexicon=lexicon, dictionary=dictionary,
+        readings_cache=readings_cache, stats=stats,
+    )
+    if stats is not None:
+        stats.setdefault("segmentation", "cosegment")
+        stats.setdefault("segmenter", "per-page-fallback")
     if not nom_segments or not qn_segments:
         return [], nom_warnings + qn_warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
     rows = align_segments(
@@ -393,6 +761,7 @@ def align_book(
         config=cfg,
         lexicon=lexicon,
         dictionary=dictionary,
+        readings_cache=readings_cache,
     )
     return rows, sorted(set(nom_warnings + qn_warnings))
 
@@ -439,8 +808,17 @@ def row_from_dict(data: dict[str, Any]) -> AlignmentRow:
 
 
 def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
+    """Write the five-column CSV and its review-metadata sidecar.
+
+    The CSV keeps the stable ``img_id, sentence_id, ch_txt, vi_txt,
+    text_diff`` schema. Flags and confidence are persisted alongside it in
+    ``<Name>.review_metadata.jsonl`` (see ``hannom.review_metadata``);
+    loading the CSV without restoring the sidecar yields rows that carry
+    ``REVIEW_METADATA_MISSING`` flags, never silently "clean" rows.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows)
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh, lineterminator="\n")
         writer.writerow(CSV_COLUMNS)
@@ -454,6 +832,7 @@ def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
                     row.text_diff_json(),
                 ]
             )
+    write_review_metadata(path, rows)
     return path
 
 

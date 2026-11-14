@@ -13,8 +13,45 @@ from ..models import OCRLine, OCRResult, PageRecord
 from ..state import State
 from .agreement import choose_consensus
 from .base import OCREngine, OCRUnavailable
-from .kimhannom import KimHanNomClient
+from .kimhannom import KimHanNomClient, scrub_server_payload
 from .mock import MockOCREngine
+from .quota import QuotaExceeded
+
+
+# Warnings the router promotes into page-level review metadata. The
+# specific BAND_RETRY_AFTER_FULLPAGE_FAILURE must survive: it means the
+# page may be incomplete and must not become trusted evidence.
+PROPAGATED_WARNING_CODES = {
+    "OCR_ENGINE_DISAGREE",
+    "BBOX_MISSING",
+    "OCR_EMPTY",
+    "BBOX_INVALID",
+    "OCR_TEXT_BBOX_COUNT_MISMATCH",
+    "BAND_RETRY_AFTER_FULLPAGE_FAILURE",
+    "ENGINE_UNAVAILABLE",
+    "IMAGE_REC_FALLBACK",
+    "API_CLASSIFIED_NOT_SINO_NOM",
+    "OCR_ROUTING_UNKNOWN_MODE",
+    "OCR_LINE_WITHOUT_BBOX",
+}
+
+
+def promote_review_flags(warnings: Iterable[str], flags: Iterable[str] | None = None) -> list[str]:
+    """Append warning codes from ``warnings`` onto ``flags`` (order-stable)."""
+    promoted = list(flags or [])
+    for warning in warnings or []:
+        code = str(warning).split(":", 1)[0]
+        if code in PROPAGATED_WARNING_CODES and code not in promoted:
+            promoted.append(code)
+    return promoted
+
+
+def _unavailability_reason(engine: object) -> str:
+    """Human-meaningful reason for an engine being unavailable (D20)."""
+    fn = getattr(engine, "unavailability_reason", None)
+    if callable(fn):
+        return str(fn())
+    return "unavailable"
 
 
 def sample_page_numbers(page_numbers: Iterable[int], count: int) -> set[int]:
@@ -27,7 +64,7 @@ def sample_page_numbers(page_numbers: Iterable[int], count: int) -> set[int]:
         return set(numbers)
     if count == 1:
         return {numbers[len(numbers) // 2]}
-    indices = [round(i * (len(numbers) - 1) / (count - 1)) for i in range(count)]
+    indices = [int(i * (len(numbers) - 1) / (count - 1)) for i in range(count)]
     return {numbers[index] for index in indices}
 
 
@@ -64,6 +101,16 @@ class OCRRouter:
         return (self.project.ocr_config or {}).get("engines", {})
 
     def build_engine(self, name: str) -> OCREngine:
+        # Cache one instance per engine per process; constructing a local
+        # engine per page would reload its models per page (~10-20 s each).
+        cache = getattr(self, "_engine_cache", None)
+        if cache is None:
+            cache = self._engine_cache = {}
+        if name not in cache:
+            cache[name] = self._build_engine_instance(name)
+        return cache[name]
+
+    def _build_engine_instance(self, name: str) -> OCREngine:
         configs = self._engine_configs()
         cfg = configs.get(name)
         if cfg is None:
@@ -96,36 +143,68 @@ class OCRRouter:
     def _path(self, page: PageRecord) -> Path:
         return self.engine_dir / f"{page.page_no:04d}.json"
 
-    def load_result(self, page: PageRecord) -> OCRResult | None:
-        path = self._path(page)
-        if not path.exists():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return OCRResult(
-            book_id=data["book_id"],
-            page_no=data["page_no"],
-            image_name=data["image_name"],
-            image_sha256=data["image_sha256"],
-            engine=data["engine"],
-            lines=[
-                OCRLine(
-                    text=line["text"],
-                    points=tuple(tuple(float(v) for v in pt) for pt in line["points"]),
-                    confidence=line.get("confidence"),
-                    script=line.get("script"),
-                    difficult=line.get("difficult"),
-                    extra=line.get("extra", {}),
-                )
-                for line in data.get("lines", [])
-            ],
-            raw=data.get("raw", {}),
-            warnings=list(data.get("warnings", [])),
-            cached=True,
-        )
+    def _fallback_path(self, page_no: int) -> Path:
+        # Local-engine results for pages the API could not serve (quota
+        # exhausted or API unavailable) are written here so they never
+        # clash with API-handled files in the main cache directory.
+        return self.engine_dir / "local_fallback" / f"{page_no:04d}.json"
 
-    def save_result(self, result: OCRResult) -> Path:
-        path = self._path_for(result.page_no)
-        payload = asdict(result)
+    def load_result(self, page: PageRecord) -> OCRResult | None:
+        # Prefer the API-handled file; fall back to the local fallback file.
+        for path in (self._path(page), self._fallback_path(page.page_no)):
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"[ocr] ignoring corrupt result file {path}: {exc}", flush=True)
+                continue
+            if not isinstance(data, dict):
+                print(f"[ocr] ignoring malformed result file {path}", flush=True)
+                continue
+            if str(data.get("image_sha256") or "") != page.sha256:
+                print(
+                    f"[ocr] ignoring stale result {path}: "
+                    f"image_sha256 {str(data.get('image_sha256'))[:8]}… != page {page.sha256[:8]}…",
+                    flush=True,
+                )
+                continue
+            result = OCRResult(
+                book_id=data["book_id"],
+                page_no=data["page_no"],
+                image_name=data["image_name"],
+                image_sha256=data["image_sha256"],
+                engine=data["engine"],
+                lines=[
+                    OCRLine(
+                        text=line["text"],
+                        points=tuple(tuple(float(v) for v in pt) for pt in line["points"]),
+                        confidence=line.get("confidence"),
+                        script=line.get("script"),
+                        difficult=line.get("difficult"),
+                        extra=line.get("extra", {}),
+                    )
+                    for line in data.get("lines", [])
+                ],
+                raw=data.get("raw", {}),
+                warnings=list(data.get("warnings", [])),
+                cached=True,
+            )
+            # Cache hits must also promote page-level warnings into
+            # review_flags, otherwise a stale cache never reaches the gate.
+            promoted = promote_review_flags(result.warnings, page.review_flags)
+            if promoted != list(page.review_flags or []):
+                self.state.update_page(
+                    page.book_id,
+                    page.page_no,
+                    review_flags=promoted,
+                )
+            return result
+        return None
+
+    def save_result(self, result: OCRResult, local_fallback: bool = False) -> Path:
+        path = self._fallback_path(result.page_no) if local_fallback else self._path_for(result.page_no)
+        payload = scrub_server_payload(asdict(result))
         payload["lines"] = [
             {
                 "text": line.text,
@@ -212,13 +291,22 @@ class OCRRouter:
         names = list(engines) if explicit else (
             list(self.book.ocr.nom) if script == "nom" else list(self.book.ocr.quoc_ngu)
         )
-        api_mode = (self.book.ocr.api_mode or "sample_then_low_confidence").strip().lower()
+        api_mode = (self.book.ocr.api_mode or "api_first").strip().lower()
         local_names, api_names = self._split_engines(names)
+        local_fallback = False
         unknown_mode = False
         if not explicit:
             if api_mode in {"never", "disabled", "local_only", "local-only"}:
                 api_names = []
-            elif api_mode not in {"always", "all", "sample_then_low_confidence", "sample_then_low_conf"}:
+            elif api_mode not in {
+                "always",
+                "all",
+                "sample_then_low_confidence",
+                "sample_then_low_conf",
+                "api_first",
+                "api-first",
+                "apifirst",
+            }:
                 # A typo must not silently spend quota. Be local-only and
                 # record the reason in the result metadata.
                 api_names = []
@@ -233,7 +321,7 @@ class OCRRouter:
                 try:
                     engine = self.build_engine(name)
                     if not engine.is_available():
-                        unavailable.append(f"{name}: unavailable")
+                        unavailable.append(f"{name}: {_unavailability_reason(engine)}")
                         continue
                     result = engine.recognize_page(page, script)
                     results.append(result)
@@ -252,6 +340,33 @@ class OCRRouter:
             if api_names and self._should_call_api(script, page.page_no, results):
                 api_called = True
                 run_engines(api_names)
+        elif api_mode in {"api_first", "api-first", "apifirst"}:
+            if script == "nom" and api_names:
+                # API first. Once the quota is exhausted (or the API cannot
+                # serve the page), switch to the local models; their results
+                # are written to local_fallback/ files so they never clash
+                # with the API-handled cache files.
+                for name in api_names:
+                    try:
+                        engine = self.build_engine(name)
+                        if not engine.is_available():
+                            unavailable.append(f"{name}: {_unavailability_reason(engine)}")
+                            continue
+                        results.append(engine.recognize_page(page, script))
+                        api_called = True
+                    except QuotaExceeded as exc:
+                        unavailable.append(f"{name}: {exc}")
+                    except OCRUnavailable as exc:
+                        unavailable.append(f"{name}: {exc}")
+                    except Exception as exc:  # keep the pipeline honest and resumable
+                        unavailable.append(f"{name}: {type(exc).__name__}: {exc}")
+                if not results:
+                    local_fallback = True
+                    run_engines(local_names)
+            else:
+                # Quốc ngữ (or no API configured): local-first, saved to the
+                # main cache path as before.
+                run_engines(local_names)
         else:
             # Local-only mode, including an unknown api_mode.
             run_engines(local_names)
@@ -278,19 +393,15 @@ class OCRRouter:
         result.raw["routing"] = {
             "api_mode": api_mode,
             "api_called": api_called,
+            "local_fallback": local_fallback,
             "engines_requested": names,
             "engines_unavailable": unavailable,
             "api_sample_pages": sorted(self._sample_set(script)) if api_names else [],
         }
-        self.save_result(result)
+        self.save_result(result, local_fallback=local_fallback)
 
         confidence = page_confidence(results)
-        flags = list(page.review_flags)
-        for warning in result.warnings:
-            code = warning.split(":", 1)[0]
-            if code in {"OCR_ENGINE_DISAGREE", "BBOX_MISSING", "OCR_EMPTY", "BBOX_INVALID", "OCR_TEXT_BBOX_COUNT_MISMATCH"}:
-                if code not in flags:
-                    flags.append(code)
+        flags = promote_review_flags(result.warnings, page.review_flags)
         self.state.update_page(
             page.book_id,
             page.page_no,
@@ -319,6 +430,8 @@ class OCRRouter:
             numbers = [p.page_no for p in targets if str(p.folder) == folder]
             self._api_samples[script] = sample_page_numbers(numbers, self.book.ocr.sample_pages)
         out: list[OCRResult] = []
-        for page in targets:
+        total = len(targets)
+        for i, page in enumerate(targets, 1):
             out.append(self.run_page(page, engines=engines, force=force))
+            print(f"[{self.book.book_id}] OCR {i}/{total} p{page.page_no} ({out[-1].engine})", flush=True)
         return out

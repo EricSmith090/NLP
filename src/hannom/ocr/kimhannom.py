@@ -17,6 +17,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from ..labels import points_to_quad
 from ..models import OCRLine, OCRResult, PageRecord
 from ..state import State, utc_now
 from .base import OCREngine, OCRUnavailable
-from .quota import QuotaLedger
+from .quota import QuotaExceeded, QuotaLedger
 
 
 class KimHanNomError(RuntimeError):
@@ -42,9 +43,23 @@ class ApiBusinessError(KimHanNomError):
 
 
 def _success_code(value: Any) -> bool:
-    # The manual documents the string "000000"; accept the integer zero some
-    # deployments return, but do not guess arbitrary success values.
-    return value == "000000" or value == 0
+    # The manual documents exactly one success value: the string "000000".
+    # Anything else (integer 0, boolean False, "0", null, ...) is a failure.
+    return value == "000000"
+
+
+# Keys the Vintern/server responses embed but downstream stages must never
+# persist: a full base64-encoded image. They are stripped on save.
+_SCRUBBED_KEYS = ("result_image_base64",)
+
+
+def scrub_server_payload(obj: Any) -> Any:
+    """Recursively strip keys listed in ``_SCRUBBED_KEYS`` from a payload."""
+    if isinstance(obj, dict):
+        return {k: scrub_server_payload(v) for k, v in obj.items() if k not in _SCRUBBED_KEYS}
+    if isinstance(obj, list):
+        return [scrub_server_payload(item) for item in obj]
+    return obj
 
 
 @dataclass
@@ -63,25 +78,27 @@ class KimHanNomClient(OCREngine):
         project: ProjectConfig,
         state: State,
         token: str | None = None,
-        token_id: str | None = None,
     ):
         self.project = project
         self.state = state
         self.token = token or os.environ.get(project.api.token_env, "")
-        self.token_id = token_id or (hashlib.sha256(self.token.encode()).hexdigest()[:8] if self.token else None)
         self.ledger = QuotaLedger(state, project.api.limits, project.api.min_delay_seconds)
         self.cache_dir = project.api.cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._session = None
 
     def is_available(self) -> bool:
+        return self.unavailability_reason() == "available"
+
+    def unavailability_reason(self) -> str:
+        """Why the client cannot serve pages: available|no_token|import_error."""
         if not self.token:
-            return False
+            return "no_token"
         try:
             import requests  # noqa: F401
         except ImportError:
-            return False
-        return True
+            return "import_error"
+        return "available"
 
     def _get_session(self):
         if self._session is not None:
@@ -102,6 +119,54 @@ class KimHanNomClient(OCREngine):
         )
         return self._session
 
+    def _check_quota(self) -> None:
+        """Raise QuotaExceeded, or (wait_on_quota) sleep until a call is allowed."""
+        while True:
+            try:
+                self.ledger.check()
+                return
+            except QuotaExceeded as exc:
+                if not self.project.api.wait_on_quota:
+                    raise
+                wait = max(1.0, float(exc.retry_after)) + 5.0
+                resume = datetime.now() + timedelta(seconds=wait)
+                print(
+                    f"[kimhannom] {exc} -> waiting until {resume:%d/%m %H:%M} then resuming",
+                    flush=True,
+                )
+                time.sleep(wait)
+
+    def _prepare_upload(self, page: PageRecord) -> tuple[Path, str, int]:
+        """(image to upload, its sha256, scale). scale > 1 uploads an enlarged copy.
+
+        The enlarged copy is deterministic and keyed by the original page
+        hash, so caches stay valid and reruns never re-upload it.
+        """
+        scale = max(1, int(self.project.api.upscale))
+        if scale == 1:
+            return Path(page.path), page.sha256, 1
+        out = self.project.data_dir / "ocr" / "api_upscaled" / f"{page.sha256}_x{scale}.jpg"
+        if not out.exists():
+            from PIL import Image
+
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(page.path) as img:
+                rgb = img.convert("RGB")
+                big = rgb.resize((rgb.width * scale, rgb.height * scale), Image.LANCZOS)
+            tmp = out.with_suffix(".tmp.jpg")
+            big.save(tmp, quality=95)
+            tmp.replace(out)
+        return out, hashlib.sha256(out.read_bytes()).hexdigest(), scale
+
+    def _page_layout(self, file_name: str, image_sha256: str) -> dict[str, Any]:
+        """Page layout for image-ocr: from structure-classification, or fixed."""
+        if self.project.api.classify:
+            return self.classify(file_name, image_sha256).data
+        return {
+            "ocr_id": self.project.api.fixed_ocr_id,
+            "reading_direction": self.project.api.fixed_reading_direction,
+        }
+
     def _cache_key(self, endpoint: str, image_sha256: str, params: dict[str, Any]) -> str:
         payload = json.dumps({"endpoint": endpoint, "image": image_sha256, "params": params}, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -113,13 +178,21 @@ class KimHanNomClient(OCREngine):
         path = self._cache_path(key)
         if not path.exists():
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return ApiResponse(
-            endpoint=data["endpoint"],
-            data=data["data"],
-            raw=data.get("raw", {}),
-            cached=True,
-        )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[kimhannom] ignoring corrupt API cache file {path}: {exc}", flush=True)
+            return None
+        try:
+            return ApiResponse(
+                endpoint=data["endpoint"],
+                data=data["data"],
+                raw=data.get("raw", {}),
+                cached=True,
+            )
+        except (KeyError, TypeError):
+            print(f"[kimhannom] ignoring malformed API cache file {path}", flush=True)
+            return None
 
     def _save_cache(self, key: str, response: ApiResponse) -> None:
         path = self._cache_path(key)
@@ -130,7 +203,10 @@ class KimHanNomClient(OCREngine):
             "raw": response.raw,
             "saved_at": utc_now().isoformat(),
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(scrub_server_payload(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _upload_cache_path(self, image_sha256: str) -> Path:
         return self.cache_dir / "uploads" / image_sha256[:2] / f"{image_sha256}.json"
@@ -174,7 +250,7 @@ class KimHanNomClient(OCREngine):
         url = f"{self.project.api.base_url}/api/web/clc-sinonom/{endpoint}"
         last_error: Exception | None = None
         for attempt in range(1, self.project.api.max_retries + 1):
-            self.ledger.check()
+            self._check_quota()
             wait = self.ledger.seconds_until_allowed()
             if wait > 0:
                 time.sleep(min(wait, self.project.api.min_delay_seconds * 2))
@@ -198,9 +274,15 @@ class KimHanNomClient(OCREngine):
                         f"{endpoint}: HTTP {status}: {response.text[:300]!r}"
                     )
                 raw = response.json()
-                self.ledger.record(endpoint, image_sha256, f"http_{status}")
                 if not isinstance(raw, dict):
+                    self.ledger.record(endpoint, image_sha256, f"http_{status}", note="non_dict_response")
                     raise KimHanNomError("API response is not a JSON object")
+                self.ledger.record(
+                    endpoint,
+                    image_sha256,
+                    f"http_{status}",
+                    business_code=str(raw.get("code")) if raw.get("code") is not None else None,
+                )
                 if not _success_code(raw.get("code")):
                     message = raw.get("message")
                     raise ApiBusinessError(f"{endpoint}: {raw.get('code')}: {message}")
@@ -252,11 +334,19 @@ class KimHanNomClient(OCREngine):
     def classify(self, file_name: str, image_sha256: str) -> ApiResponse:
         return self._request(
             "structure-classification",
-            json_payload={"file_name": file_name},
+            json_payload={
+                "file_name": file_name,
+                # v2.1 guideline (p.4): 0 = server auto-detect. The API
+                # manual's parameter table omits these; the server rejects
+                # requests without them (code 000108, verified 2026-11-08).
+                "ocr_id": 0,
+                "lang_type": 0,
+                "reading_direction": 0,
+            },
             image_sha256=image_sha256,
             # Classification is a function of the image, not of the temporary
             # server-side file_name. Omitting it makes the cache reusable.
-            cache_params={},
+            cache_params={"ocr_id": 0, "lang_type": 0, "reading_direction": 0},
         )
 
     def ocr(
@@ -320,44 +410,88 @@ class KimHanNomClient(OCREngine):
         )
 
     @staticmethod
-    def _extract_boxes(data: dict[str, Any]) -> tuple[list[str], list[Any]]:
-        # Documented shape.
+    def _extract_boxes(
+        data: dict[str, Any],
+    ) -> tuple[list[str], list[Any], list[float | None]]:
+        """Split the image-ocr data into (texts, boxes, confidences).
+
+        Documented shape (API manual v2026-10-10, ImageOcrData), verified
+        live on 2026-11-08:
+
+            result_ocr_text: list[str]
+            result_bbox:     list of [points, [transcription, confidence]],
+                             matched by index with result_ocr_text
+
+        The guideline-mentioned shape (details.details, a list of
+        {"transcription", "points", "difficult"}) is equally present on the
+        live server. ``points`` and per-box confidence are taken from
+        whichever shape is found; ``difficult`` is taken from
+        details.details when available.
+        """
         texts = data.get("result_ocr_text")
         boxes = data.get("result_bbox")
-        if isinstance(texts, str):
-            texts = [texts]
-        if isinstance(boxes, dict):
-            boxes = [boxes]
-        if texts is not None or boxes is not None:
-            return list(texts or []), list(boxes or [])
-
-        # Guideline-mentioned shape: details.details.
         details = data.get("details")
+        details_list = None
         if isinstance(details, dict):
-            details = details.get("details")
-        if isinstance(details, list):
-            texts = []
-            boxes = []
-            for item in details:
+            details_list = details.get("details")
+        if isinstance(details_list, list):
+            difficult = [item.get("difficult") if isinstance(item, dict) else None for item in details_list]
+        else:
+            difficult = None
+
+        if texts is not None or boxes is not None:
+            text_list = [texts] if isinstance(texts, str) else list(texts or [])
+            box_list = [boxes] if isinstance(boxes, dict) else list(boxes or [])
+            points_out: list[Any] = []
+            confidences: list[float | None] = []
+            for item in box_list:
+                points: Any = item
+                confidence: float | None = None
+                meta: Any = None
+                # [points, [transcription, confidence]] nesting (live shape).
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and isinstance(item[0], list)
+                ):
+                    points, meta = item
+                if isinstance(meta, (list, tuple)):
+                    if len(meta) >= 2 and isinstance(meta[1], (int, float)):
+                        confidence = float(meta[1])
+                elif isinstance(meta, dict):
+                    raw_conf = meta.get("confidence") or meta.get("score")
+                    if isinstance(raw_conf, (int, float)):
+                        confidence = float(raw_conf)
+                points_out.append(points)
+                confidences.append(confidence)
+            return list(text_list), points_out, confidences
+
+        if isinstance(details_list, list):
+            texts_out: list[str] = []
+            points_out = []
+            for item in details_list:
                 if isinstance(item, dict):
-                    texts.append(item.get("transcription", ""))
-                    boxes.append(item.get("points"))
-            return texts, boxes
-        return [], []
+                    texts_out.append(str(item.get("transcription", "")))
+                    points_out.append(item.get("points"))
+                else:
+                    texts_out.append("")
+                    points_out.append(None)
+            return texts_out, points_out, [None] * len(texts_out)
+        return [], [], []
 
     def recognize_page(self, page: PageRecord, script: str) -> OCRResult:
         if not self.is_available():
             raise OCRUnavailable(f"Kim Hán Nôm unavailable: set {self.project.api.token_env}")
-        file_name = self.upload(page.path, page.sha256)
+        upload_path, upload_sha, scale = self._prepare_upload(page)
+        file_name = self.upload(upload_path, upload_sha)
         try:
-            classification = self.classify(file_name, page.sha256)
-            cdata = classification.data
+            cdata = self._page_layout(file_name, upload_sha)
             ocr_id = int(cdata.get("ocr_id", 1) or 1)
             lang_type = 2 if script == "nom" else 1
             reading_direction = int(cdata.get("reading_direction", 1) or 1)
             response = self.ocr(
                 file_name,
-                page.sha256,
+                upload_sha,
                 ocr_id=ocr_id,
                 lang_type=lang_type,
                 reading_direction=reading_direction,
@@ -365,15 +499,14 @@ class KimHanNomClient(OCREngine):
         except ApiBusinessError:
             # A cached server-side file_name can expire. Re-upload exactly
             # once, then let a second business error surface unchanged.
-            file_name = self.upload(page.path, page.sha256, force=True)
-            classification = self.classify(file_name, page.sha256)
-            cdata = classification.data
+            file_name = self.upload(upload_path, upload_sha, force=True)
+            cdata = self._page_layout(file_name, upload_sha)
             ocr_id = int(cdata.get("ocr_id", 1) or 1)
             lang_type = 2 if script == "nom" else 1
             reading_direction = int(cdata.get("reading_direction", 1) or 1)
             response = self.ocr(
                 file_name,
-                page.sha256,
+                upload_sha,
                 ocr_id=ocr_id,
                 lang_type=lang_type,
                 reading_direction=reading_direction,
@@ -381,11 +514,47 @@ class KimHanNomClient(OCREngine):
         warnings: list[str] = []
         if script == "nom" and cdata.get("is_sino_nom") is False:
             warnings.append("API_CLASSIFIED_NOT_SINO_NOM")
-        texts, boxes = self._extract_boxes(response.data)
+        texts, boxes, confidences = self._extract_boxes(response.data)
+        difficulty: list[Any] | None = None
+        details = response.data.get("details")
+        if isinstance(details, dict) and isinstance(details.get("details"), list):
+            items = details["details"]
+            if len(items) == len(texts):
+                difficulty = [item.get("difficult") if isinstance(item, dict) else None for item in items]
+            else:
+                warnings.append("DIFFICULT_LENGTH_MISMATCH")
+        # image-rec fallback: guideline requires fixing invalid boxes via
+        # image-rec on cropped lines. A full-page image-rec re-run recovers
+        # recognition when image-ocr boxes are missing/invalid.
+        needs_rec = (
+            len(texts) != len(boxes)
+            or (texts and not boxes)
+            or (bool(texts) and len([t for t in texts if t]) > len([b for b in boxes if b is not None]) * 2)
+        )
+        if needs_rec and ocr_id != 3:
+            try:
+                rec = self.recognize(
+                    file_name,
+                    upload_sha,
+                    ocr_id=ocr_id,
+                    lang_type=lang_type,
+                    reading_direction=reading_direction,
+                )
+                r_texts, r_boxes, r_confs = self._extract_boxes(rec.data)
+                if r_texts and r_boxes and len(r_texts) >= len(texts):
+                    texts, boxes, confidences = r_texts, r_boxes, r_confs
+                    warnings.append("IMAGE_REC_FALLBACK")
+            except Exception as exc:  # noqa: BLE001 - fallback is best-effort
+                warnings.append(f"IMAGE_REC_FALLBACK_FAILED:{type(exc).__name__}")
+        elif needs_rec:
+            # ocr_id == 3 (scene pictures): image-rec is documented for text
+            # lines only; record that recovery was considered and waived.
+            warnings.append("OCR_REC_SKIPPED_SCENE")
+
         lines: list[OCRLine] = []
         if len(texts) != len(boxes):
             warnings.append(f"OCR_TEXT_BBOX_COUNT_MISMATCH:{len(texts)}:{len(boxes)}")
-        for text, box in zip(texts, boxes):
+        for index, (text, box) in enumerate(zip(texts, boxes)):
             if not text:
                 continue
             if box is None:
@@ -396,7 +565,15 @@ class KimHanNomClient(OCREngine):
             except ValueError as exc:
                 warnings.append(f"BBOX_INVALID:{exc}")
                 continue
-            lines.append(OCRLine(text=str(text), points=quad, script=script))
+            if scale != 1:
+                # Boxes come back in the enlarged image; map them onto the
+                # original page image that is labelled and submitted.
+                quad = tuple((x / scale, y / scale) for x, y in quad)
+            confidence = confidences[index] if index < len(confidences) else None
+            line_difficult = difficulty[index] if difficulty is not None else None
+            lines.append(
+                OCRLine(text=str(text), points=quad, confidence=confidence, script=script, difficult=line_difficult)
+            )
         if not lines:
             warnings.append("OCR_EMPTY")
         return OCRResult(
@@ -406,6 +583,6 @@ class KimHanNomClient(OCREngine):
             image_sha256=page.sha256,
             engine=self.name,
             lines=lines,
-            raw=response.raw,
+            raw={**(response.raw or {}), "upload_scale": scale, "classified": bool(self.project.api.classify)},
             warnings=sorted(set(warnings)),
         )

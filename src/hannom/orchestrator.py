@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import warnings
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,10 +14,9 @@ from typing import Any, Iterable, Sequence
 
 from .align import (
     align_book,
-    read_alignment_csv,
     write_alignment_csv,
 )
-from .clean import CleanedPage, clean_page_lines, detect_running_lines
+from .clean import CleanedPage, clean_page_lines, detect_running_lines, validate_clean_text
 from .config import BookConfig, ProjectConfig, load_config
 from .dictionary.book_lexicon import BookLexicon
 from .dictionary.index import build_dictionary_index
@@ -42,6 +43,8 @@ from .report import (
     validate_report_data,
 )
 from .review.patches import apply_patches, read_patches
+from .review_decisions import apply_decisions, decision_path, parse_decisions
+from .review_metadata import load_rows_with_metadata
 from .state import State, iso, utc_now
 from .t1_map import Pair, build_image_map, load_image_map
 
@@ -141,11 +144,42 @@ def _sort_lines(lines: Sequence[OCRLine], script: str) -> list[OCRLine]:
 def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict[str, Any]:
     router = OCRRouter(project, book, state)
     pages = state.pages(book.book_id)
+    # Running-line detection needs cross-page evidence; compute once here so
+    # the label path and the clean path drop the same headers/footers.
+    running: dict[str, set[str]] = {}
+    try:
+        from .clean import detect_running_lines as _detect
+
+        for _script, _folder in (("nom", "ch"), ("qn", "vi")):
+            _lines_by_page = []
+            for _p in pages:
+                if str(_p.folder) != _folder:
+                    continue
+                _res = router.load_result(_p)
+                _lines_by_page.append(
+                    [line.text for line in _res.lines if line.text.strip()] if _res else []
+                )
+            if _lines_by_page:
+                running[_script] = _detect(_lines_by_page)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[hannom] labels: running-lines detection disabled for {book.book_id}: {exc}")
+        running = {}
     by_folder: dict[str, list[PageRecord]] = {}
     for page in pages:
         by_folder.setdefault(str(page.folder), []).append(page)
+    # Prune label folders from bins that no longer have pages in the DB
+    # (e.g. after the 2026-11-12 re-bin, SLQ's intro/toc went to zero while
+    # their stale label files remained on disk). Stages are write-only by
+    # design, so pruning stale bins must happen here, explicitly.
+    label_root = project.data_dir / "labels" / book.book_id
+    for folder in ("ch", "vi", "intro", "ref", "toc", "misc"):
+        if folder not in by_folder:
+            stale = label_root / folder
+            if stale.exists():
+                shutil.rmtree(stale)
+                print(f"[hannom] labels: pruned stale {folder}/ for {book.book_id} (bin has no pages in the DB)")
     counts: dict[str, Any] = {}
-    for folder in ("ch", "vi", "intro", "ref", "toc"):
+    for folder in ("ch", "vi", "intro", "ref", "toc", "misc"):
         folder_pages = sorted(by_folder.get(folder, []), key=lambda p: p.page_no)
         if not folder_pages:
             continue
@@ -165,7 +199,8 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
                 if not line.text.strip():
                     continue
                 cleaned = clean_page_lines(
-                    book.book_id, page.page_no, page.image_name, script, [line.text]
+                    book.book_id, page.page_no, page.image_name, script, [line.text],
+                    running_lines=running.get(script),
                 )
                 text = cleaned.lines[0] if cleaned.lines else ""
                 if not text:
@@ -187,12 +222,30 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
         state_path = _book_stage(project, book, state, "labels") / folder / "fileState.txt"
         write_label_txt(image_names, boxes_by_image, label_path, folder)
         write_file_state(image_names, state_path, folder, 1)
+        no_result = {p.image_name for p in folder_pages if p.image_name in empty}
+        with_boxes = {name for name in boxes_by_image if boxes_by_image[name]}
+        all_noise = {
+            p.image_name
+            for p in folder_pages
+            if p.image_name not in no_result and p.image_name not in with_boxes
+        }
+        # Reconcile the label flags on every regenerated page: drop stale
+        # empty flags from pages that now carry boxes, and raise exactly one
+        # flag for each empty page (LABEL_EMPTY_OCR = OCR missing; OCR_ALL_NOISE
+        # = OCR ran but every line was cleaned away). An in-scope page must
+        # never leave a regeneration unflagged.
+        for page in folder_pages:
+            image = page.image_name
+            before = set(page.review_flags)
+            if image in no_result:
+                new_flags = (before | {"LABEL_EMPTY_OCR"}) - {"OCR_ALL_NOISE"}
+            elif image in all_noise:
+                new_flags = (before | {"OCR_ALL_NOISE"}) - {"LABEL_EMPTY_OCR"}
+            else:
+                new_flags = before - {"LABEL_EMPTY_OCR", "OCR_ALL_NOISE"}
+            if new_flags != before:
+                state.update_page(book.book_id, page.page_no, review_flags=sorted(new_flags))
         counts[folder] = {"images": len(image_names), "boxes": sum(len(v) for v in boxes_by_image.values()), "empty": empty}
-        if empty:
-            for page in folder_pages:
-                if page.image_name in empty:
-                    flags = sorted(set(page.review_flags + ["LABEL_EMPTY_OCR"]))
-                    state.update_page(book.book_id, page.page_no, review_flags=flags)
     return counts
 
 
@@ -221,7 +274,7 @@ def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[
     count = 0
     flags: dict[str, int] = {}
     for page in pages:
-        if page.folder not in {"ch", "vi", "intro", "toc", "ref"}:
+        if page.folder not in {"ch", "vi", "intro", "toc", "ref", "misc"}:
             continue
         result = router.load_result(page)
         if result is None:
@@ -235,6 +288,10 @@ def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[
             [line.text for line in result.lines],
             running_lines=running.get("ch" if script == "nom" else "vi"),
         )
+        text_issues = validate_clean_text(cleaned.text, script)
+        if text_issues:
+            if "CLEAN_TEXT_INVALID" not in cleaned.flags:
+                cleaned.flags.append("CLEAN_TEXT_INVALID")
         dest = out_dir / f"{page.page_no:04d}.json"
         dest.write_text(json.dumps(cleaned.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         count += 1
@@ -267,18 +324,113 @@ def _load_pairs(project: ProjectConfig, book: BookConfig, state: State) -> list[
     return load_image_map(path)
 
 
+def load_readings_cache(project: ProjectConfig) -> Any | None:
+    """Load (or rebuild) the compact readings cache once; None when unavailable.
+
+    Honours ``dictionary.skip_sources`` from the dictionary config (default:
+    nothing skipped). The cache contributes char ∪ word reading evidence to
+    the in-pipeline matchers alongside the JSONL dictionary adapters; absence
+    of the drop or the cache simply yields no cache evidence (identical to
+    the pre-cache behaviour).
+    """
+    try:
+        from .dictionary.readings import load_readings
+
+        dictionary_cfg = project.dictionary_config or {}
+        cfg = (dictionary_cfg or {}).get("dictionary", dictionary_cfg or {})
+        entries_dir = project.root / str(cfg.get("entries_dir", "dictionaries/entries"))
+        cache = project.data_dir / "dictionary" / "char_readings.json"
+        skip = cfg.get("skip_sources") or None
+        if isinstance(skip, str):
+            skip = [skip]
+        return load_readings(entries_dir, cache, skip_sources=skip)
+    except Exception as exc:
+        # Evidence degradation must never be silent: the pipeline runs with
+        # no cache evidence (unlike pre-2026-11-14 consumers) — say so.
+        warnings.warn(f"readings cache unavailable ({type(exc).__name__}: {exc}); continuing without cache evidence")
+        return None
+
+
+def learn_for_book(lexicon, rows, dictionary, failures):
+    """Fail-closed learning gate shared by ``stage_align`` and tests.
+
+    Log-wide failures (unattributable to any sentence) disable learning
+    for the book. Row-specific failures are handled inside
+    ``learn_from_rows`` via ``decision_integrity``.
+    """
+    if any(failure.sentence_id is None for failure in failures or []):
+        return {
+            "learned_pairs": 0,
+            "characters": len(lexicon.data),
+            "skipped_log_wide_failure": True,
+            "detail": "decision log integrity failure; learning disabled for this run",
+            "quarantine": lexicon.quarantine_summary(),
+        }
+    return lexicon.learn_from_rows(rows, dictionary)
+
+
+def _rederivable_text_diff_flag(flag: str) -> bool:
+    """Return True for flags fully re-derived from the recomputed text_diff.
+
+    ``recompute_text_diff`` re-derives every ``DIFF_*`` flag (and the matching
+    ``REVIEW:DIFF_*`` pairs) from the row’s text; keeping the align-time
+    originals alongside the recompute-time ones produced contradictory pairs
+    like ``DIFF_READING_MISMATCH`` + ``DIFF_NO_READING_MISMATCH`` on the same
+    row (verify-F sec.5.A). Re-derived flags are therefore replaced, never
+    unioned. Human-facing flags that survive: ``IMAGE_REC_*``, ``OCR_*``,
+    ``ALIGN_*``, ``COSEGMENTED_*``, ``SPANS_PAGES``, ``UNMATCHED_*``.
+    ``DICT_UNAVAILABLE`` and ``MASK_ONLY_DIFFERENCE`` are also re-derived
+    (dictionary empty-flag branch and the [MASK] difference check), so they
+    are replaced rather than unioned — the same metadata-hygiene reason.
+    """
+    if flag.startswith("DIFF_"):
+        return True
+    if flag == "TEXT_DIFF_INVALID":
+        return True
+    if flag in {"DICT_UNAVAILABLE", "MASK_ONLY_DIFFERENCE"}:
+        return True
+    if flag.startswith("REVIEW:"):
+        rest = flag[len("REVIEW:"):]
+        return rest.startswith("DIFF_") or rest == "DICT_MISS"
+    return False
+
+
 def recompute_text_diff(
     rows: Iterable[AlignmentRow],
     *,
     lexicon: BookLexicon | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    force_recompute: bool = False,
+    alignment_config: dict | None = None,
 ) -> list[AlignmentRow]:
-    from .textdiff import auto_text_diff, validate_text_diff
+    from .textdiff import auto_text_diff, validate_text_diff, variant_fold_from_config
 
+    single_fold = variant_fold_from_config(alignment_config)
     out: list[AlignmentRow] = []
     for row in rows:
+        if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
+            # Rows carrying an explicit review decision (any status) or a
+            # human content edit are authoritative; the automatic
+            # recomputation must never overwrite them.
+            out.append(row)
+            continue
         if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
+            # Non-1-1 rows are forced null FIRST, unconditionally — before any
+            # force_recompute is applied. Such rows can never be re-scored.
             row.text_diff = None
+            out.append(row)
+            continue
+        recomputed_from_null = row.text_diff is None
+        if recomputed_from_null and not force_recompute:
+            # The align stage deliberately left this row unscored
+            # (non-1-1 / n-m grouping), and CSV round-trips lose the
+            # NON_ONE_TO_ONE flag that marks it. Keep the null unless the
+            # caller explicitly force-recomputes (--force-recompute). When it
+            # does, the row is re-scored as a 1-1 candidate but is flagged
+            # ALIGN_FORCE_RECOMPUTED_FROM_NULL so the evaluator classifies it
+            # "unverified", never "verified", regardless of what the re-score
+            # finds.
             out.append(row)
             continue
         diff = auto_text_diff(
@@ -286,16 +438,57 @@ def recompute_text_diff(
             row.vi_txt,
             lexicon=lexicon,
             dictionary=dictionary,
+            readings_cache=readings_cache,
             strict_reading_mismatch=False,
+            # Book 3's Quốc ngữ translation is transcribed in modern/mixed
+            # orthography; hvdic readings are recorded archaically, so exact
+            # matching under-rejects. Flat matching is still a 1-1 phonetic
+            # claim — it does not invent readings.
+            allow_flat_match=True,
+            allow_variant_fold=single_fold,
         )
         row.text_diff = diff.elements
-        row.flags = sorted(set(row.flags + diff.flags + [f"REVIEW:{r}" for r in diff.review_reasons]))
+        row.flags = sorted(
+            {flag for flag in row.flags if not _rederivable_text_diff_flag(flag)}
+            | set(diff.flags)
+            | {f"REVIEW:{r}" for r in diff.review_reasons}
+        )
+        if recomputed_from_null:
+            row.flags = sorted(set(row.flags + ["ALIGN_FORCE_RECOMPUTED_FROM_NULL"]))
         if diff.elements is not None:
             problems = validate_text_diff(row.ch_txt, row.vi_txt, diff.elements)
             if problems:
-                row.flags.append("TEXT_DIFF_INVALID")
+                row.flags = sorted(set(row.flags) | {"TEXT_DIFF_INVALID"})
         out.append(row)
     return out
+
+
+def reconcile_for_book(
+    project: ProjectConfig,
+    book: BookConfig,
+    lexicon: BookLexicon,
+    *,
+    governance_rows: list[AlignmentRow] | None = None,
+    governance_failures: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Fail-closed lexicon reconciliation shared by ``stage_align`` and tests.
+
+    Uses the current governing row state (post patches and decisions) to
+    withdraw automated evidence no longer authorized by review. Log-wide
+    failure: no revocation, no mutation (documented fail-closed).
+    """
+    if governance_rows is None or governance_failures is None:
+        gov_rows, _blocking, _audit = load_rows_for_evaluation(project, book)
+        _d, gov_failures, _issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+        governance_rows = gov_rows
+        governance_failures = gov_failures
+    if any(getattr(f, "sentence_id", "x") is None for f in governance_failures):
+        return {"skipped_log_wide_failure": True, "changed": False}
+    summary = lexicon.reconcile(governance_rows, dry_run=False)
+    if summary.get("changed"):
+        lexicon.backup()
+        lexicon.save()
+    return summary
 
 
 def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple[list[AlignmentRow], dict[str, Any]]:
@@ -305,8 +498,19 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         raise PipelineError(f"{book.book_id}: no cleaned pages; run clean first")
     dictionary_cfg = project.dictionary_config or {}
     dictionary = build_dictionary_index(project.root, dictionary_cfg, book_id=book.book_id)
+    readings_cache = load_readings_cache(project)
     lexicon_path = project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"
     lexicon = BookLexicon(lexicon_path)
+    csv_path_prev = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+    if csv_path_prev.exists():
+        # Automated evidence that is no longer authorized (superseded,
+        # invalidated, conflicted, log-wide failure) must not influence
+        # this alignment. Reconcile against the *previous* CSV + current
+        # decisions before alignment consumes the lexicon.
+        revocation = reconcile_for_book(project, book, lexicon)
+    else:
+        revocation = {"skipped_no_previous_csv": True, "changed": False}
+    align_stats: dict[str, Any] = {}
     rows, warnings = align_book(
         book.book_id,
         pairs,
@@ -314,14 +518,43 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         config=project.alignment_config,
         lexicon=lexicon,
         dictionary=dictionary,
+        readings_cache=readings_cache,
+        stats=align_stats,
     )
-    # Learn from this book's rows, save, then recompute diffs with the new
-    # evidence. This is the only pass that changes automatic colours.
-    learned = lexicon.learn_from_rows(rows, dictionary)
-    lexicon.save()
-    rows = recompute_text_diff(rows, lexicon=lexicon, dictionary=dictionary)
+    if align_stats.get("qn_tokens_stream") is not None:
+        # Fail-closed stream-vs-emitted token parity: any sentence the
+        # aligner lost must be a hard error, never a silent success.
+        stream_tokens = align_stats["qn_tokens_stream"]
+        emitted_tokens = align_stats.get("qn_tokens_emitted")
+        dropped = align_stats.get("segments_dropped") or 0
+        if dropped != 0 or emitted_tokens != stream_tokens:
+            raise PipelineError(
+                f"{book.book_id}: alignment lost QN content: "
+                f"stream_tokens={stream_tokens} emitted_tokens={emitted_tokens} "
+                f"sentences_skipped={align_stats.get('sentences_skipped') or []}"
+            )
+    # Human patches are applied BEFORE learning and BEFORE recomputation so
+    # that active learning never consumes unreviewed machine output. Lexicon
+    # learning itself is restricted to rows whose decision history is sound
+    # (see review_decisions.apply_decisions); a log-wide integrity failure
+    # fails the learning step closed for the whole book.
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows = apply_patches(rows, patches)
+    decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+    rows, review_issues, review_audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
+    learned = learn_for_book(lexicon, rows, dictionary, failures)
+    lexicon.save()
+    rows = recompute_text_diff(
+        rows,
+        lexicon=lexicon,
+        dictionary=dictionary,
+        readings_cache=readings_cache,
+        alignment_config=project.alignment_config,
+    )
+    # Apply patches and decisions again so human content and review
+    # decisions always win over the automatic recomputation.
+    rows = apply_patches(rows, patches)
+    rows, _, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
     summary = {
@@ -329,6 +562,11 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         "rows": len(rows),
         "warnings": warnings,
         "lexicon": learned,
+        "lexicon_quarantine": lexicon.quarantine_summary(),
+        "lexicon_revocation": revocation,
+        "review_decision_issues": review_issues,
+        "review_decision_audit": review_audit,
+        "stats": align_stats or None,
         "flags": {
             flag: sum(1 for row in rows if flag in row.flags)
             for flag in sorted({flag for row in rows for flag in row.flags})
@@ -339,21 +577,54 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     return rows, summary
 
 
+def load_rows_for_evaluation(
+    project: ProjectConfig, book: BookConfig
+) -> tuple[list[AlignmentRow], list[str], list[str]]:
+    """Load the CSV, restore its metadata sidecar, apply content patches
+    and overlay review decisions.
+
+    Returns (rows, blocking_issues, audit_diagnostics):
+
+    - ``blocking_issues`` are current-revision failures that must block the
+      evaluation gate (sidecar metadata problems, active decision-integrity
+      failures).
+    - ``audit_diagnostics`` are historical diagnostics that remain
+      inspectable without blocking the current revision.
+    """
+    csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+    rows, issues = load_rows_with_metadata(csv_path)
+    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
+    rows = apply_patches(rows, patches)
+    decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+    rows, active, audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
+    return rows, issues + active, audit
+
+
+def _load_rows_patched(project, book) -> tuple[list[AlignmentRow], list[str], list[str]]:
+    """Backward-compatible alias for ``load_rows_for_evaluation``."""
+    return load_rows_for_evaluation(project, book)
+
+
 def stage_evaluate(project: ProjectConfig, book: BookConfig, state: State) -> BookMetrics:
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
         raise PipelineError(f"{book.book_id}: missing CSV {csv_path}")
-    rows = read_alignment_csv(csv_path)
-    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    rows = apply_patches(rows, patches)
+    rows, blocking_issues, audit = load_rows_for_evaluation(project, book)
     metrics = evaluate_rows(
         book.book_id,
         rows,
         minimum_similarity=float(project.quality.get("minimum_similarity", 95.0)),
         null_ratio_warn=float(project.quality.get("null_ratio_warn", 0.05)),
         yellow_ratio_warn=float(project.quality.get("yellow_ratio_warn", 0.05)),
+        minimum_coverage=float(project.quality.get("minimum_coverage", 0.9)),
+        max_unverified_ratio=float(project.quality.get("max_unverified_ratio", 0.05)),
+        integrity_issues=blocking_issues,
+        audit_diagnostics=audit,
     )
     dest = _book_stage(project, book, state, "evaluation") / "metrics.json"
+    if dest.exists():
+        stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+        shutil.copy2(dest, dest.with_name(f"metrics.{stamp}.json"))
     write_json(dest, metrics.to_dict())
     state.set_artifact(book.book_id, "evaluation", "metrics", dest, meta=metrics.to_dict())
     return metrics
@@ -365,13 +636,12 @@ def stage_package(
     state: State,
     *,
     strict_gate: bool = True,
+    allow_empty_labels: bool = False,
 ) -> tuple[Path, list]:
     csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
     if not csv_path.exists():
         raise PipelineError(f"{book.book_id}: missing CSV {csv_path}")
-    rows = read_alignment_csv(csv_path)
-    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    rows = apply_patches(rows, patches)
+    rows, _, _ = _load_rows_patched(project, book)
     metrics = stage_evaluate(project, book, state)
     if strict_gate and not metrics.passed:
         raise PipelineError(
@@ -386,11 +656,13 @@ def stage_package(
         book,
         book_dir,
         minimum_similarity=float(project.quality.get("minimum_similarity", 95.0)),
+        allow_empty_labels=allow_empty_labels,
     )
-    if issues:
+    blockers = [i for i in issues if i.severity != "warning"]
+    if blockers:
         raise PipelineError(
             f"{book.book_id}: package validation failed: "
-            + "; ".join(f"{i.code}:{i.message}" for i in issues[:5])
+            + "; ".join(f"{i.code}:{i.message}" for i in blockers[:5])
         )
     return book_dir, issues
 
@@ -420,11 +692,12 @@ def stage_package_all(
     *,
     strict_gate: bool = True,
     strict_report: bool = True,
+    allow_empty_labels: bool = False,
 ) -> dict[str, Any]:
     book_dirs: list[Path] = []
     metrics: list[BookMetrics] = []
     for book in project.books:
-        book_dir, _ = stage_package(project, book, state, strict_gate=strict_gate)
+        book_dir, _ = stage_package(project, book, state, strict_gate=strict_gate, allow_empty_labels=allow_empty_labels)
         book_dirs.append(book_dir)
         metrics.append(stage_evaluate(project, book, state))
     report_path, report_issues, _ = build_report(project, metrics, strict=strict_report)

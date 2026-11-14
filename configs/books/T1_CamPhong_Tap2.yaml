@@ -12,11 +12,18 @@ nom_end_hint: 540
 translation_start: 9
 translation_end: 275
 back_matter_is_toc: true
+# Printed cross-reference in every substantive QN page (header):
+# Nôm printed = Nôm PDF − 2; this book's offset: Nôm PDF = 549 − vi PDF.
+vi_to_nom_offset: 549
+# Non-translation pages: 273 ("CHÚ THÍCH" endnotes), 274 (endnotes cont.),
+# 275 ("- 273 - BẢN CHỮ NÔM" divider) — footnote-only pages with no printed
+# marker and no Nôm counterpart (2026-11-12 audit, verify-B).
+inventory_misc: [273, 274, 275]
 
 ocr:
-  nom: [paddleocr_vl, kimhannom]
-  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
-  ensemble: true
-  api_mode: sample_then_low_confidence
+  # API first for Nôm; local engines take over when the quota is reached.
+  nom: [kimhannom, paddleocr_vl]
+  quoc_ngu: [vintern_1b_v2]
+  api_mode: api_first
   sample_pages: 12
 review_profile: strict

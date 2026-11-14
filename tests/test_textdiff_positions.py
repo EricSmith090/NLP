@@ -74,6 +74,26 @@ def test_different_types_cannot_overlap():
     assert any("overlapping" in issue for issue in issues)
 
 
+def test_same_type_overlap_is_also_forbidden():
+    a = make_element("字字字", "x", [[0, 2]], [], "error")
+    b = make_element("字字字", "x", [[1, 3]], [], "error")
+    issues = validate_text_diff("字字字", "x", [a, b])
+    assert any("overlapping" in issue for issue in issues)
+
+
+def test_span_endpoints_must_be_letters():
+    # Span starting/ending on punctuation or a space is not allowed.
+    element = DiffElement(
+        nom_pos=((0, 1),),
+        nom_sub_text="字",
+        vi_pos=((1, 3),),
+        vi_sub_text=" x",
+        type="error",
+    )
+    issues = validate_text_diff("字", "a x", [element])
+    assert any("must start with a letter" in issue or "must end with a letter" in issue for issue in issues)
+
+
 def test_decisions_build_exact_elements():
     elements = diff_from_decisions(
         "字字",

@@ -25,10 +25,20 @@ if str(SRC) not in sys.path:
 import streamlit as st  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from hannom.align import read_alignment_csv  # noqa: E402
 from hannom.config import load_config  # noqa: E402
 from hannom.labels import read_label_txt  # noqa: E402
 from hannom.review.patches import ReviewPatch, append_patch, apply_patches, read_patches  # noqa: E402
+from hannom.review_decisions import (  # noqa: E402
+    STATUS_ACCEPTED_DIFFERENCE,
+    STATUS_ACCEPTED_MATCH,
+    STATUS_UNMATCHED,
+    STATUS_UNRESOLVED,
+    append_decision,
+    decision_path,
+    make_decision,
+    parse_decisions,
+)
+from hannom.review_metadata import load_rows_with_metadata  # noqa: E402
 from hannom.state import State  # noqa: E402
 from hannom.textdiff import diff_summary, make_element  # noqa: E402
 
@@ -86,9 +96,30 @@ def main() -> None:
     if not csv_path.exists():
         st.warning(f"Chưa có CSV nháp: {csv_path}")
         return
-    rows = read_alignment_csv(csv_path)
+    rows, metadata_issues = load_rows_with_metadata(csv_path)
+    if metadata_issues:
+        st.warning(
+            "Metadata review không đầy đủ hoặc không khớp: "
+            + ", ".join(metadata_issues[:5])
+            + (" …" if len(metadata_issues) > 5 else "")
+            + ". Các dòng thiếu metadata không được coi là sạch."
+        )
     patch_path = project.data_dir / "review" / f"{book.book_id}.patches.jsonl"
     rows = apply_patches(rows, read_patches(patch_path))
+    decisions_file = decision_path(project.data_dir, book.book_id)
+    from hannom.review_decisions import apply_decisions  # noqa: E402
+
+    decisions, failures, decision_issues = parse_decisions(decisions_file)
+    rows, decision_issues, _audit = apply_decisions(
+        rows, decisions, decision_issues, failures=failures
+    )
+    if decision_issues:
+        st.warning(
+            "Quyết định review không hợp lệ/đã cũ: "
+            + ", ".join(decision_issues[:5])
+            + (" …" if len(decision_issues) > 5 else "")
+            + ". Quyết định cũ không được dùng để xác minh."
+        )
 
     st.sidebar.metric("Số dòng", len(rows))
     only_flagged = st.sidebar.checkbox("Chỉ dòng cần review", value=True)
@@ -98,7 +129,8 @@ def main() -> None:
             (i, row)
             for i, row in indexed
             if any(
-                flag.startswith(("ALIGN_LOW_CONF", "DIFF_", "REVIEW:", "OCR_", "BBOX_"))
+                flag.startswith(("ALIGN_LOW_CONF", "DIFF_", "REVIEW:", "OCR_", "BBOX_", "REVIEW_METADATA_", "UNMATCHED_", "REVIEW_DECISION_"))
+                or flag in {"REVIEW_STATUS_UNRESOLVED", "REVIEW_STATUS_REJECTED"}
                 for flag in row.flags
             )
         ]
@@ -169,13 +201,27 @@ def main() -> None:
         )
         reviewer = st.text_input("Người review", value=os.environ.get("USERNAME", ""))
         reason = st.text_input("Lý do", value="")
+        mappings_json = st.text_area(
+            "Positional mappings (JSON list, optional) — e.g. "
+            '[{"nom_char":"之","nom_position":0,"qn_token":"thì","qn_token_position":2}]',
+            value="",
+            height=60,
+        )
+        c_span = st.columns(1)
+        with c_span[0]:
+            add_span = st.form_submit_button("Thêm span màu")
         c1, c2, c3 = st.columns(3)
         with c1:
-            add_span = st.form_submit_button("Thêm span màu")
-        with c2:
             save = st.form_submit_button("Lưu patch")
+        with c2:
+            accept_match = st.form_submit_button("✓ Chấp nhận match")
         with c3:
-            accept = st.form_submit_button("Chấp nhận (không đổi)")
+            accept_diff = st.form_submit_button("≈ Chấp nhận khác biệt")
+        c4, c5 = st.columns(2)
+        with c4:
+            unresolved = st.form_submit_button("? Chưa rõ (unresolved)")
+        with c5:
+            unmatched = st.form_submit_button("∅ Unmatched")
 
         # The span builder is intentionally explicit: the reviewer supplies
         # exact half-open code-point positions and the type.
@@ -206,12 +252,65 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Span không hợp lệ: {exc}")
 
-    if save or accept:
-        if accept:
-            ch_txt, vi_txt, diff_json = row.ch_txt, row.vi_txt, row.text_diff_json()
+    def _parse_mappings(ch_content, vi_content):
+        """Validate the complete mapping set against the current row.
+
+        Returns (mappings, errors). The entire set is validated before any
+        decision is recorded; one invalid mapping invalidates the set.
+        """
+        if not mappings_json.strip():
+            return [], []
+        try:
+            raw_items = json.loads(mappings_json)
+        except json.JSONDecodeError as exc:
+            return None, [f"Positional mappings JSON sai: {exc}"]
+        if not isinstance(raw_items, list):
+            return None, ["Positional mappings phải là một danh sách JSON."]
+        from hannom.review_decisions import (
+            CharacterTokenMapping,
+            validate_mappings_against_text,
+        )
+
+        try:
+            items = [CharacterTokenMapping.from_dict(item) for item in raw_items]
+        except Exception as exc:  # noqa: BLE001
+            return None, [f"Positional mappings không hợp lệ: {exc}"]
+        errors = validate_mappings_against_text(items, ch_content, vi_content)
+        if errors:
+            return None, errors
+        return items, []
+
+    def _record_decision(status, decision_ch, decision_vi, decision_diff):
+        from hannom.review_decisions import make_decision as _make
+
+        mappings, mapping_errors = _parse_mappings(decision_ch, decision_vi)
+        if mapping_errors:
+            for error in mapping_errors:
+                st.error(error)
+            st.warning("Quyết định KHÔNG được ghi: tập mapping không hợp lệ.")
+            return
+        try:
+            decision = _make(
+                book_id=book.book_id,
+                sentence_id=row.sentence_id,
+                status=status,
+                reviewer=reviewer.strip(),
+                reason=reason.strip(),
+                ch_txt=decision_ch,
+                vi_txt=decision_vi,
+                text_diff_json=decision_diff,
+                character_token_mappings=mappings,
+            )
+            append_decision(decision_path(project.data_dir, book.book_id), decision)
+            st.success(f"Đã ghi quyết định '{status}' cho {row.sentence_id}.")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Không ghi được quyết định: {exc}")
+
+    if save:
         if not reviewer.strip():
             st.error("Cần nhập người review.")
         else:
+            typed = False
             state = State(project.data_dir / "state.sqlite3")
             try:
                 for field, before, after in (
@@ -220,6 +319,7 @@ def main() -> None:
                     ("text_diff", row.text_diff_json(), diff_json),
                 ):
                     if before != after:
+                        typed = True
                         patch = ReviewPatch(
                             book_id=book.book_id,
                             sentence_id=row.sentence_id,
@@ -234,10 +334,32 @@ def main() -> None:
                             book.book_id, field, before, after,
                             reviewer.strip(), reason.strip() or None,
                         )
-                st.success("Đã ghi patch. Chạy lại bước align/text_diff để áp dụng.")
+                if typed:
+                    # Saving a correction is a content edit, NOT an approval
+                    # of the alignment. Record it explicitly.
+                    _record_decision("content_edited", ch_txt, vi_txt, diff_json)
+                else:
+                    st.info("Không có thay đổi nào để ghi.")
             finally:
                 state.close()
             st.rerun()
+
+    if accept_match or accept_diff or unresolved or unmatched:
+        if not reviewer.strip():
+            st.error("Cần nhập người review.")
+        else:
+            status = (
+                "accepted_match" if accept_match
+                else "accepted_difference" if accept_diff
+                else "unresolved" if unresolved
+                else "unmatched"
+            )
+            # The decision hash binds the approval to the *persisted*
+            # content (patches applied, exactly what the gate evaluates).
+            # Unsaved form edits never leak into the hash.
+            _record_decision(status, row.ch_txt, row.vi_txt, row.text_diff_json())
+            st.rerun()
+
 
     if st.session_state.get("pending_diff"):
         st.info("Có span đang chờ. Dán JSON này vào ô text_diff nếu muốn giữ:")

@@ -3,7 +3,7 @@
 **Status:** Planning / pre-implementation  
 **Created:** 2026-11-08  
 **Deadline:** 2026-11-30  
-**Workspace:** `C:\Users\MSI VN\Desktop\NLP Project`  
+**Workspace:** `C:\Users\MSI VN\Desktop\NLP` (previously `C:\Users\MSI VN\Desktop\NLP Project`; renamed — stored absolute paths in `data/state.sqlite3` and the raw manifests were rebased on 2026-11-08)  
 **Entry point:** This document. No pipeline code exists yet.
 
 **TL;DR:** Three T1 books (950 pages) are due 2026-11-30. Build a local-first OCR/alignment pipeline; use Kim Hán Nôm API only as a measured second opinion. Deliver one ZIP with three book folders, one report, PPOCRLabel labels, CSV/XLSX alignment, and `image_map.json`. Enforce ≥95% per book. No pipeline code exists yet; start with §13.
@@ -324,13 +324,17 @@ PDF
 
 ## 7. Key technical choices and rationale
 
-### 7.1 OCR: local majority + API second opinion
+### 7.1 OCR: Kim Hán Nôm API first (superseded local-majority decision)
+
+> Superseded 2026-11-08: Nôm OCR now uses the API first (`api_mode: api_first`); local models are the fallback once the quota is reached, writing to `local_fallback/` files. See `docs/decisions.md` and `configs/ocr.yaml`. The original local-majority rationale below is kept for history.
+
+**Original decision (history):** local majority + API second opinion
 
 **Why:** the Kim Hán Nôm quota is 600 calls/week; each image needs at least 2, realistically 3 calls. All 421 estimated Nôm pages would need 842–1,263 calls (~1.4–2.7 weeks plus retries), leaving little buffer. Local models are free, keep confidential data on-machine, and can process the QN bulk quickly.
 
 **Model plan for 8 GB VRAM / 16 GB RAM:**
 
-- Quốc ngữ: `Vintern-1B-v2` primary; `PaddleOCR-VL` / PP-OCRv5 fallback.
+- Quốc ngữ: Vintern-1B-v2 primary (benchmark 2026-11-08 on pages 11 and 41 of Book 3: near-perfect transcription of archaic Vietnamese including circumflexes/tildes/unchanged archaic spellings; ~35 s/page, peak 2.3 GB VRAM, RTX 4060). Transcription is a full-page box per image (guideline p.12 allows one box per page). Kim Hán Nôm API is Hán/Nôm-only and must not receive QN pages. PaddleOCR latin/ch models confirmed unusable for this text (128 distinct tokens with systematic tone-mark loss in Book 3) and are no longer used for QN.
 - Nôm: `PaddleOCR-VL` or PP-OCRv5 local primary; Kim Hán Nôm API for low-confidence pages and validation.
 - Run models **sequentially**, batch size 1–4; unload between stages. Do not attempt a 7B ensemble.
 - If PaddleOCR-VL installation fails on Windows, fall back to PP-OCRv5 or a Transformers-based OCR model.
@@ -351,6 +355,13 @@ PDF
 - Token in `.env`; never in logs, Git, or `source.zip`.
 - Single-threaded, delayed, exponential backoff, cache by image SHA-256, quota ledger.
 - Verify the actual `image-ocr` response schema on day one: the API manual says `result_ocr_text`/`result_bbox`; the project guideline mentions `details.details`. Do not code against an assumption.
+
+**Verified on 2026-11-08** (Book 3 p67, 4 quota calls total incl. one rejected attempt):
+- `structure-classification` REQUIRES `ocr_id=0, lang_type=0, reading_direction=0`; with file_name only, the server returns code 000108 (title `t_field_value_required`). The API manual's parameter table omits these fields -- the guideline (p.4) is authoritative; the client was fixed accordingly.
+- `image-ocr` returns BOTH documented `result_ocr_text` (array of str) / `result_bbox` AND `details.details` (`{transcription, points, difficult}`). Live `result_bbox` entries are `[points, [transcription, confidence]]` matched by index (not bare points arrays).
+- The classification response ALSO embeds a full annotated image (`result_image_base64`, undocumented) and a duplicate OCR payload (`result`). Not used for production; cached responses on disk are correspondingly larger.
+- p67 (Nom title page) yielded exactly 2 text regions, confidences 0.98 / 0.998 -- matches the page content (2 large text columns + `- 65 -` folio number, which is page chrome).
+- `.env` with `KIMHANNOM_TOKEN` is present (gitignored); ledger rows recorded for all 4 calls.
 - Rate limits: 25/minute, 50/hour, 200/day, 600/week.
 - Enums: `ocr_id` 1 normal vertical, 2 administrative, 3 outdoor, 4 normal horizontal; `lang_type` 0 unknown, 1 Hán, 2 Nôm; `reading_direction` 1 vertical, 2 horizontal; `epitaph` 0 normal, 1 epitaph.
 
@@ -543,7 +554,7 @@ scope: all
 expected_pages: 282
 ocr:
   nom: [paddleocr_vl, kimhannom]
-  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
+  quoc_ngu: [paddleocr_vl]
   ensemble: true
   api_mode: sample_then_low_confidence
 review_profile: strict
@@ -602,7 +613,7 @@ Review load estimate: 10–20% of Nôm pages (~42–84 pages), more if local Nô
 
 | Date | Work / gate |
 |---|---|
-| **Nov 8–10** | Install PyTorch/OCR stack; benchmark `Vintern-1B-v2` and `PaddleOCR-VL`; 20–30 page pilot; API sample if token; 5-page gold sample; decide if enhancement is needed. **Pilot go/no-go Nov 10.** |
+| **Nov 8–10** | OCR stack installed 2026-11-08 (paddlepaddle 3.3.1 + paddleocr 3.7.0 for Nôm draft/geometry; Vintern-1B-v2 on GPU for all QN pages); benchmark done (QN: Vintern, near-perfect; Nôm: Kim Hán Nôm, conf 0.945-0.989 on 24 pages); API sample if token; 5-page gold sample; decide if enhancement is needed. **Pilot go/no-go Nov 10.** |
 | **Nov 11–14** | Scaffold repo; extraction, classification, T1 mapping, label generation, validators; Book 3 end-to-end pilot. |
 | **Nov 15–20** | OCR production: local majority; API low-confidence; cleaning; start Book 2 (largest Nôm section). **OCR complete Nov 20.** |
 | **Nov 21–25** | Alignment and `text_diff`; per-book 95% gate; review queue. |

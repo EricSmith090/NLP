@@ -3,21 +3,38 @@ pdf: "CV20-24127189/T1_Cấm Phòng Cho Bổn Đạo (Tập 1).pdf"
 layout: T1
 scope: all
 expected_pages: 282
-# Verified from sample pages on 2026-11-08. Page numbers are PDF pages,
-# not printed page numbers. Front matter ends before the QN translation;
-# the Nôm block is detected from image evidence and should include p147-276.
+# Verified from sample pages on 2026-11-08 and from the parens cross-reference
+# discovered by reading page images directly (2026-11-12). Page numbers are
+# PDF pages, not printed page numbers.
+# The translation front matter (PDF 13-20: covers, foreword, TOC — each page
+# is mapped shoreshly onto Nôm PDF 276-269 by the parenthetical Nôm page
+# number printed in its header) IS in scope. The blank/modern-reprint-cover/
+# publisher back-matter pages carry no translation and are in misc/.
 front_matter_end: 20
 nom_start_hint: 147
 nom_end_hint: 276
 translation_start: 21
 translation_end: 144
-# QN TOC/back matter starts at p277.
+# The print edition's back matter (PDF 277-282: "BẢN QUỐC NGỮ"/"BẢN CHỮ NÔM"
+# dividers and print index) and the glossary ("CHÚ THÍCH", PDF 143-144) carry
+# no Nôm translation; reported in the report and shipped in misc/.
 back_matter_is_toc: true
+# Printed cross-reference in every substantive QN page (header):
+# Nôm printed = Nôm PDF − 2; this book's offset: Nôm PDF = 289 − vi PDF.
+vi_to_nom_offset: 289
+# Declarative bin overrides (PDF pages).
+# The translation front matter pages carry parens cross-references to the
+# Nôm book (PDF 13=parens 274 → Nôm PDF 276, ..., PDF 20=parens 267 → PDF 269):
+inventory_vi: [13, 14, 15, 16, 17, 18, 19, 20]
+# Non-translation pages: 5,7-11 (modern reprint cover, giới thiệu, "BẢN QUỐC
+# NGỮ" divider); 277-282 (publisher back-matter dividers/indexes + two Vintern
+# prompt-spill pages); 143,144 ("CHÚ THÍCH" glossary); 145 (pre-existing misc):
+inventory_misc: [5, 7, 8, 9, 10, 11, 277, 278, 279, 280, 281, 282, 143, 144, 145]
 
 ocr:
-  nom: [paddleocr_vl, kimhannom]
-  quoc_ngu: [vintern_1b_v2, paddleocr_vl]
-  ensemble: true
-  api_mode: sample_then_low_confidence
+  # API first for Nôm; local engines take over when the quota is reached.
+  nom: [kimhannom, paddleocr_vl]
+  quoc_ngu: [vintern_1b_v2]
+  api_mode: api_first
   sample_pages: 12
 review_profile: strict

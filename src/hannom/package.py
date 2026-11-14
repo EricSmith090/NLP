@@ -10,6 +10,7 @@ import csv
 import hashlib
 import json
 import shutil
+import warnings
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,6 +180,17 @@ def build_book_folder(
     image_map_pairs: Sequence[Pair] | None = None,
 ) -> Path:
     root = output_root or project.output_dir
+    # Back up the state DB before any destructive packaging step
+    # (best-effort: warn, never mask the packaging itself).
+    db = project.data_dir / "state.sqlite3"
+    if db.exists():
+        try:
+            from .state import State
+
+            with State(db) as st:
+                st.backup("package")
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"state backup before packaging failed: {exc}", stacklevel=2)
     book_dir = root / book.book_name
     if book_dir.exists():
         shutil.rmtree(book_dir)
@@ -202,27 +214,78 @@ def build_book_folder(
         missing = by_folder.get(f"missing_{folder}", [])
         if missing:
             dest = book_dir / "missing" / folder
-            names = _copy_jpegs(
+            _copy_jpegs(
                 project.data_dir / "pages" / book.book_id / "native", dest, missing
             )
-            _copy_label_files(labels_root, dest, names, f"missing/{folder}", require_labels=False)
+            # Guidelines: missing/ch image also lives in ch/ (QN missing);
+            # missing/vi image lives only in missing/vi (Nom missing).
+            if folder == "ch":
+                dest_ch = book_dir / "ch"
+                dest_ch.mkdir(parents=True, exist_ok=True)
+                _copy_jpegs(
+                    project.data_dir / "pages" / book.book_id / "native",
+                    dest_ch,
+                    missing,
+                )
+        # missing/ never carries Label.txt / fileState.txt.
 
     # Source PDF: exactly one original file in the book folder.
     pdf_dest = book_dir / f"{book.book_name}.pdf"
     shutil.copy2(book.pdf, pdf_dest)
 
-    # Image map. Use the exact names present in the final folders.
-    if image_map_pairs is None:
-        image_map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
-        image_map_pairs = load_image_map(image_map_path) if image_map_path.exists() else []
-    image_map = {"pairs": [pair.to_dict() for pair in image_map_pairs]}
-    (book_dir / f"{book.book_name}_image_map.json").write_text(
-        json.dumps(image_map, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    # Orientation-corrected merged PDF, required by the guideline when any
+    # image changed. Staged by tools/build_updated_pdf.py; absence is normal
+    # for books with no rotated pages (e.g. Book 3).
+    staged_updated = (
+        project.output_dir / book.book_id / book.book_name / f"{book.book_name}_updated.pdf"
     )
+    if staged_updated.exists():
+        shutil.copy2(staged_updated, book_dir / f"{book.book_name}_updated.pdf")
+
+    # Image map. Copy the maintained artifact verbatim (pairs + full meta:
+    # mapping_source, markers_used, vi_page_count, verified/candidate
+    # counts) instead of round-tripping through Pair objects (which dropped
+    # the whole meta block and silently re-defaulted statuses).
+    image_map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
+    if image_map_path.exists():
+        (book_dir / f"{book.book_name}_image_map.json").write_bytes(image_map_path.read_bytes())
+    else:
+        if image_map_pairs is None:
+            image_map_pairs = []
+        fallback = {"pairs": [pair.to_dict() for pair in image_map_pairs]}
+        (book_dir / f"{book.book_name}_image_map.json").write_text(
+            json.dumps(fallback, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
 
     csv_path = book_dir / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
     write_alignment_xlsx(book_dir / f"{book.book_name}.xlsx", rows)
+
+    # Regenerate pages.jsonl from the final in-memory page state so the
+    # recorded artifact is no longer the stale Stage-1-time snapshot (the
+    # SQLite DB remains authoritative). Best-effort: warn, never fail.
+    try:
+        from .intake import sha256_file
+        from .pages import _write_pages_jsonl
+        from .state import State
+
+        manifest_path = project.data_dir / "pages" / book.book_id / "pages.jsonl"
+        _write_pages_jsonl(manifest_path, list(pages))
+        with State(project.data_dir / "state.sqlite3") as st:
+            st.set_artifact(
+                book.book_id,
+                "pages",
+                "native_jsonl",
+                manifest_path,
+                sha256=sha256_file(manifest_path),
+                meta={
+                    "page_count": len(pages),
+                    "kind": "packaging-snapshot",
+                    "native_size": sorted({(p.width, p.height) for p in pages}),
+                },
+            )
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"pages.jsonl regeneration at packaging time failed: {exc}", stacklevel=2)
     return book_dir
 
 
@@ -356,6 +419,7 @@ def validate_book_package(
     *,
     minimum_similarity: float | None = None,
     require_labels: bool = True,
+    allow_empty_labels: bool = False,
 ) -> list[PackageIssue]:
     issues: list[PackageIssue] = []
     if not book_dir.exists():
@@ -363,6 +427,26 @@ def validate_book_package(
     expected_pdf = book_dir / f"{book.book_name}.pdf"
     if not expected_pdf.exists():
         issues.append(PackageIssue("MISSING_PDF", "source PDF missing", path=str(expected_pdf)))
+    # The guideline requires <Book>_updated.pdf whenever any image changed
+    # (rotated pages). Enforced as an error gate, not a courtesy copy.
+    try:
+        from .updated_pdf import check_updated_pdf, load_pages_readonly
+
+        pages_ro = load_pages_readonly(project, book.book_id)
+        if pages_ro is None:
+            issues.append(
+                PackageIssue(
+                    "STATE_UNAVAILABLE",
+                    "state.sqlite3 missing/unreadable; _updated.pdf checks skipped",
+                    severity="warning",
+                )
+            )
+        else:
+            issues.extend(check_updated_pdf(project, book, book_dir, pages_ro))
+    except Exception as exc:  # noqa: BLE001
+        issues.append(
+            PackageIssue("UPDATED_PDF_CHECK_FAILED", str(exc), severity="warning")
+        )
     csv_path = book_dir / f"{book.book_name}.csv"
     xlsx_path = book_dir / f"{book.book_name}.xlsx"
     if not csv_path.exists():
@@ -370,7 +454,38 @@ def validate_book_package(
     if not xlsx_path.exists():
         issues.append(PackageIssue("MISSING_XLSX", "XLSX missing", path=str(xlsx_path)))
     if not (book_dir / f"{book.book_name}_image_map.json").exists():
-        issues.append(PackageIssue("MISSING_IMAGE_MAP", "image_map.json missing"))
+        # Guideline v2.1: <Tên sách>_image_map.json is optional. Emit a warning
+        # only; a missing optional file must not block packaging.
+        issues.append(PackageIssue("MISSING_IMAGE_MAP", "image_map.json missing (optional per guideline v2.1)", severity="warning"))
+    # Promote present-but-invalid maps to errors up front: coverage, order,
+    # duplicate/unknown names and the printed-marker formula are all checked
+    # against the actual folder contents, not just the map's internal shape.
+    if (book_dir / f"{book.book_name}_image_map.json").exists():
+        try:
+            from .t1_map import load_image_map as _load_map, validate_image_map as _validate_map
+
+            img_map_pairs = _load_map(book_dir / f"{book.book_name}_image_map.json")
+            ch_names = {p.name for p in (book_dir / "ch").glob("*.jpg")} if (book_dir / "ch").exists() else set()
+            vi_names = {p.name for p in (book_dir / "vi").glob("*.jpg")} if (book_dir / "vi").exists() else set()
+            missing_ch = (
+                {p.name for p in (book_dir / "missing" / "ch").glob("*.jpg")}
+                if (book_dir / "missing" / "ch").exists()
+                else set()
+            )
+            missing_vi = (
+                {p.name for p in (book_dir / "missing" / "vi").glob("*.jpg")}
+                if (book_dir / "missing" / "vi").exists()
+                else set()
+            )
+            for msg in _validate_map(
+                img_map_pairs,
+                ch_names=ch_names | missing_ch,
+                vi_names=vi_names | missing_vi,
+                vi_to_nom_offset=getattr(book, "vi_to_nom_offset", None),
+            ):
+                issues.append(PackageIssue("IMAGE_MAP_INVALID", msg, path=str(book_dir)))
+        except Exception as exc:  # noqa: BLE001
+            issues.append(PackageIssue("IMAGE_MAP_INVALID", str(exc), path=str(book_dir)))
 
     for folder in ("ch", "vi"):
         folder_dir = book_dir / folder
@@ -398,6 +513,26 @@ def validate_book_package(
                 issues.append(PackageIssue("MISSING_LABELS", f"{folder}/Label.txt missing"))
             if not (folder_dir / "fileState.txt").exists():
                 issues.append(PackageIssue("MISSING_FILESTATE", f"{folder}/fileState.txt missing"))
+            if not allow_empty_labels and (folder_dir / "Label.txt").exists():
+                empty_images = 0
+                try:
+                    from .labels import read_label_txt
+
+                    rows = read_label_txt(folder_dir / "Label.txt")
+                    empty_images = sum(1 for boxes in rows.values() if not boxes)
+                except ValueError:
+                    # Already reported as LABEL_INVALID above.
+                    pass
+                if empty_images:
+                    issues.append(
+                        PackageIssue(
+                            "EMPTY_LABELS",
+                            f"{folder}/Label.txt: {empty_images} images have no boxes; "
+                            "re-run OCR + labels, or pass --allow-empty-labels to ship an "
+                            "explicitly incomplete book",
+                            path=str(folder_dir / "Label.txt"),
+                        )
+                    )
 
     # CSV must be readable and internally consistent.
     if csv_path.exists():
@@ -421,8 +556,18 @@ def validate_book_package(
                 issues.append(PackageIssue("CSV_TEXT_DIFF", f"{row.sentence_id}: {problem}", path=str(csv_path)))
         if minimum_similarity is not None:
             from .evaluate import evaluate_rows
+            from .orchestrator import load_rows_for_evaluation
 
-            metrics = evaluate_rows(book.book_id, rows, minimum_similarity=minimum_similarity)
+            try:
+                gate_rows, gate_issues, _audit = load_rows_for_evaluation(project, book)
+            except Exception as exc:  # noqa: BLE001
+                gate_rows, gate_issues = [], [f"METADATA_LOAD_ERROR:{exc}"]
+            metrics = evaluate_rows(
+                book.book_id,
+                gate_rows,
+                minimum_similarity=minimum_similarity,
+                integrity_issues=gate_issues,
+            )
             if not metrics.passed:
                 issues.append(
                     PackageIssue(
@@ -500,6 +645,8 @@ def validate_source_zip(path: Path) -> list[PackageIssue]:
                 continue
             if "KIMHANNOM_TOKEN=" in text:
                 value = text.split("KIMHANNOM_TOKEN=", 1)[1].splitlines()[0].strip()
-                if value:
+                # Placeholders (<token>, <...>) and this validator's own
+                # source code are not secrets.
+                if value and not value.startswith("<") and "package.py" not in name:
                     issues.append(PackageIssue("SOURCE_CONTAINS_TOKEN", name, path=str(path)))
     return issues

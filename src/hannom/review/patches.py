@@ -102,7 +102,14 @@ def apply_patches(
     rows: Iterable[AlignmentRow],
     patches: Iterable[ReviewPatch],
 ) -> list[AlignmentRow]:
-    """Apply patches in file order; last write wins per row/field."""
+    """Apply patches in file order; last write wins per row/field.
+
+    Every patched row is flagged ``CONTENT_EDITED`` — a marker that a
+    human edited the transcription/comparison content. ``CONTENT_EDITED``
+    deliberately grants no alignment verification: it must not clear any
+    evidence-based gate by itself. Review *decisions* live in the
+    append-only decision log (``hannom.review_decisions``).
+    """
     rows = list(rows)
     by_id = {row.sentence_id: row for row in rows}
     for patch in patches:
@@ -115,8 +122,8 @@ def apply_patches(
             row.vi_txt = patch.after
         elif patch.field == "text_diff":
             row.text_diff = _elements_from_json(patch.after)
-        if "HUMAN_REVIEWED" not in row.flags:
-            row.flags.append("HUMAN_REVIEWED")
+        if "CONTENT_EDITED" not in row.flags:
+            row.flags.append("CONTENT_EDITED")
     return rows
 
 

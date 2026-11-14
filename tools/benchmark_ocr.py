@@ -71,10 +71,15 @@ def main(argv: list[str] | None = None) -> int:
         print("No extracted pages. Run intake/extract/classify first.", file=sys.stderr)
         return 2
     sample = _sample(pages, args.pages)
-    engines = args.engine or list(book.ocr.nom)
+    # Default to local engines only so the tool is runnable without quota or
+    # --allow-api. Pass --engine kimhannom --allow-api explicitly for the API.
+    if args.engine:
+        engines = list(args.engine)
+    else:
+        engines = [n for n in list(book.ocr.nom) if n != "kimhannom"]
     if any(name == "kimhannom" for name in engines) and not args.allow_api:
-        print("Refusing to call Kim Hán Nôm without --allow-api.", file=sys.stderr)
-        return 2
+        engines = [n for n in engines if n != "kimhannom"]
+        print("Benchmark: skipping kimhannom without --allow-api.", file=sys.stderr)
 
     results = []
     for name in engines:

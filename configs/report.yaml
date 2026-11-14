@@ -37,6 +37,7 @@ screenshots:
 method_notes:
   - "Pipeline cục bộ: trích ảnh gốc, phân loại trang, OCR, PPOCRLabel, làm sạch, căn hàng, text_diff, đánh giá và đóng gói."
   - "923/950 ảnh được sao chép nguyên byte từ JPEG nhúng; 27 ảnh xoay được chuyển hướng lossless ở độ phân giải gốc (không upscale)."
+  - "Hai file <Book>_updated.pdf (Tập 1 và Tập 2; Sách 3 không cần) đã tạo bằng tools/build_updated_pdf.py từ ảnh trích xuất: ảnh nhúng nguyên byte, một ảnh/trang, số trang giữ nguyên (282/550, trang xoay: 263+274 / 287+295+296+305+310+335+339+345+349+364+386+392+405+414+416+419+426+447+452+459+461+499+505+515+525). HÀNH ĐỘNG CẦN LÀM TRƯỚC KHI NỘP: thông báo cho người giao sách về hai file _updated.pdf và danh sách trang xoay."
   - "Kim Hán Nôm API chỉ dùng như ý kiến thứ hai có đo lường; không dùng nhiều tài khoản và không gửi ảnh mặc định."
   - "Từ điển là tùy chọn; ký tự không có trong từ điển không bị tự động tô đỏ mà vào hàng đợi review."
   - "Yellow không bao giờ được tạo tự động; chỉ dùng cho các trường hợp đặc biệt trong quy định và luôn được ghi lý do."
@@ -48,12 +49,12 @@ yellow_reasons:
   T1_SuaLoiQuyen: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
 
 book_notes:
-  T1_CamPhong_Tap1: "Biên Nôm đã kiểm tra trực quan: p147-276; p146 trống, p277 bắt đầu mục lục QN. 282 ảnh, tất cả 800x1135."
-  T1_CamPhong_Tap2: "Biên Nôm đã kiểm tra trực quan: p277-540; p541 bắt đầu mục lục QN. 550 ảnh: 525 ảnh 800x1135 và 25 bản scan xoay gốc 564x800 đã chuyển hướng lossless."
+  T1_CamPhong_Tap1: "Biên Nôm đã kiểm tra trực quan: p147-276; p146 trống, p277 bắt đầu mục lục QN. 282 ảnh, tất cả 800x1135. _updated.pdf đã tạo (282 trang; xoay: p263, p274)."
+  T1_CamPhong_Tap2: "Biên Nôm đã kiểm tra trực quan: p277-540; p541 bắt đầu mục lục QN. 550 ảnh: 525 ảnh 800x1135 và 25 bản scan xoay gốc 564x800 đã chuyển hướng lossless. _updated.pdf đã tạo (550 trang; 25 trang xoay)."
   T1_SuaLoiQuyen: "Biên Nôm đã kiểm tra trực quan: p67-116; p117-118 là mục lục QN. p61 trống và không vào vi/. 118 ảnh 800x1135."
 
 citations:
   - "Quy_định_đồ_án_v2.1.pdf — quy định đồ án (nguồn chuẩn)."
   - "Hướng dẫn sử dụng API Kim Hán Nôm, phiên bản 2026-10-10."
   - "Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ, v1 03/11/2026 (nguồn tùy chọn)."
-  - "PyMuPDF 1.28.2; PaddleOCR/PaddleOCR-VL; Vintern-1B-v2; PPOCRLabel; Streamlit 1.51.0; openpyxl 3.1.5."
+  - "PyMuPDF 1.28.2; Vintern-1B-v2 (5CD-AI); PaddleOCR 3.7.0; PPOCRLabel; Streamlit 1.51.0; openpyxl 3.1.5."

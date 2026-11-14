@@ -83,9 +83,17 @@ def inspect_pdf(path: str | Path) -> PdfInspection:
         doc.close()
 
 
-def _link_or_copy(src: Path, dst: Path) -> str:
+def _link_or_copy(src: Path, dst: Path, *, expected_sha: str | None = None) -> str:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
+        if not dst.is_file():
+            raise IntakeError(f"raw copy path is not a regular file: {dst}")
+        if expected_sha is not None and sha256_file(dst) != expected_sha:
+            raise IntakeError(
+                f"raw copy diverged from the assigned PDF: {dst} "
+                f"(sha256 mismatch; assigned sha256 {expected_sha}); "
+                "refusing to proceed — reconcile or replace the raw archive manually"
+            )
         return "existing"
     try:
         os.link(src, dst)
@@ -117,14 +125,33 @@ def lock_scope(project: ProjectConfig, book: BookConfig, state: State) -> dict[s
 
     raw_dir = project.data_dir / "raw" / book.book_id
     raw_pdf = raw_dir / "original.pdf"
-    link_kind = _link_or_copy(book.pdf, raw_pdf)
+    link_kind = _link_or_copy(book.pdf, raw_pdf, expected_sha=inspection.sha256)
+    # Preserve first-run link semantics across re-runs: a re-run must not
+    # overwrite "hardlink"/"copy" with "existing" (the archive semantics are
+    # the audit trail for how the ground-truth raw copy was produced).
+    manifest_path = raw_dir / "manifest.json"
+    previous_raw_link = None
+    if manifest_path.exists():
+        try:
+            previous_raw_link = (read_json(manifest_path) or {}).get("raw_link")
+        except Exception:  # noqa: BLE001 - a corrupt manifest must not block intake
+            previous_raw_link = None
+    first_run_link = (
+        previous_raw_link if previous_raw_link in {"hardlink", "copy"} else link_kind
+    )
+    raw_link = (
+        first_run_link
+        if link_kind == "existing" and previous_raw_link in {"hardlink", "copy"}
+        else link_kind
+    )
     manifest = {
         "book_id": book.book_id,
         "book_name": book.book_name,
         "assigned_pdf": str(book.pdf),
         "assigned_pdf_name": book.pdf.name,
         "raw_pdf": str(raw_pdf),
-        "raw_link": link_kind,
+        "raw_link": raw_link,
+        "raw_link_first_seen": first_run_link,
         "inspection": inspection.to_dict(),
         "layout": book.layout,
         "scope": book.scope,
@@ -134,7 +161,7 @@ def lock_scope(project: ProjectConfig, book: BookConfig, state: State) -> dict[s
         "nom_start_hint": book.nom_start_hint,
         "nom_end_hint": book.nom_end_hint,
     }
-    dest = raw_dir / "manifest.json"
+    dest = manifest_path
     write_json(dest, manifest)
     state.set_artifact(
         book.book_id,

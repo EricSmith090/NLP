@@ -17,10 +17,9 @@ from .index import Sense
 UNIHAN_FIELDS = {
     "kVietnamese": "reading",
     "kDefinition": "definition",
-    "kMandarin": "reading",
-    "kHanyuPinyin": "reading",
-    "kCantonese": "reading",
 }
+# Systems excluded from QN matching per Entry/v1 "Không suy đoán":
+# kMandarin/kHanyuPinyin → pinyin, kCantonese → jyutping. Kept as gloss only.
 
 
 def _codepoint(char: str) -> str:
@@ -65,14 +64,25 @@ class UnihanAdapter:
                     continue
                 key = UNIHAN_FIELDS.get(field)
                 if key is None:
-                    continue
-                sense = Sense(
-                    source=self.name,
-                    definition=value if key == "definition" else "",
-                    reading=value if key == "reading" else "",
-                    gloss=value if key not in {"definition", "reading"} else "",
-                    raw={"field": field, "value": value},
-                )
+                    # Non-Vietnamese systems: keep as structural gloss, never
+                    # as a Quốc ngữ reading.
+                    sense = Sense(
+                        source=self.name,
+                        definition="",
+                        reading="",
+                        gloss=f"{field}: {value}",
+                        raw={"field": field, "value": value},
+                        systems=(),
+                    )
+                else:
+                    sense = Sense(
+                        source=self.name,
+                        definition=value if key == "definition" else "",
+                        reading=value if key == "reading" else "",
+                        gloss="",
+                        raw={"field": field, "value": value},
+                        systems=("hv",) if key == "reading" else (),
+                    )
                 index.setdefault(char, []).append(sense)
         self._index = index
         return index
@@ -113,8 +123,15 @@ class CcCedictAdapter:
                 for char in {traditional, simplified}:
                     if len(char) != 1:
                         continue
+                    # CEDICT pinyin is not a QN reading; keep as gloss only.
                     index.setdefault(char, []).append(
-                        Sense(source=self.name, reading=pinyin, gloss=gloss, raw={"line": line})
+                        Sense(
+                            source=self.name,
+                            reading="",
+                            gloss=f"{pinyin} {gloss}".strip(),
+                            raw={"line": line},
+                            systems=(),
+                        )
                     )
         self._index = index
         return index
@@ -148,9 +165,10 @@ class MakeMeAHanziAdapter:
         return char, Sense(
             source=self.name,
             definition=str(definition or ""),
-            reading=str(pinyin or ""),
-            gloss=str(decomposition or ""),
+            reading="",
+            gloss=f"{pinyin} {decomposition}".strip(),
             raw=raw,
+            systems=(),
         )
 
     def _load(self) -> dict[str, list[Sense]]:

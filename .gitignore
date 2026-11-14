@@ -4,6 +4,14 @@
 /models/
 /artifacts/
 *.zip
+# Official dictionary drop received on 2026-11-04 (entries/*.jsonl + viewer
+# binaries + reference scans, ~3.4 GB). Keep out of git; wire into
+# configs/dictionary.yaml via entries_dir instead.
+/dictionaries-04-11-2026/
+/dictionaries/
+
+# Local credentials for the Hán Nôm website (never commit; never package)
+hannom_API.md
 
 # Secrets
 .env
@@ -27,3 +35,6 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local submission build (stale deliverable; never commit)
+/submission/

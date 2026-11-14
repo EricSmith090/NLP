@@ -23,10 +23,27 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from .clean import MASK, count_nom_chars, is_nom_char, nfc
+from .anchors import gather_readings
+from .charalign import fold as variant_fold
 from .models import DiffElement
 
 QN_TOKEN_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 MASK_RE = re.compile(re.escape(MASK))
+
+
+def variant_fold_from_config(raw_config: Any | None) -> bool:
+    """Read the ``text_diff.variant_fold`` key from a loaded alignment config.
+
+    The key lives next to ``text_diff.unknown_policy`` in
+    ``configs/alignment.yaml``; if it is missing the weak variant fold stays
+    enabled (the documented default), matching the historical behaviour.
+    Returns ``True`` unless the key is explicitly set to a falsy value.
+    """
+    cfg = raw_config or {}
+    text_diff = cfg.get("text_diff") if isinstance(cfg, dict) else None
+    if not isinstance(text_diff, dict):
+        return True
+    return bool(text_diff.get("variant_fold", True))
 
 
 @dataclass
@@ -37,6 +54,14 @@ class DiffResult:
     matched_readings: int = 0
     known_nom_chars: int = 0
     unknown_nom_chars: int = 0
+    lexicon_matched_readings: int = 0
+    dictionary_matched_readings: int = 0
+    dictionary_known_nom_chars: int = 0
+    ambiguous_nom_chars: int = 0
+    # NW anchor composition for auditability (exact=2.0, flat=1.0, fold=1.0).
+    matched_exact_readings: int = 0
+    matched_flat_readings: int = 0
+    matched_fold_readings: int = 0
 
     @property
     def text_diff(self) -> list[DiffElement] | None:
@@ -52,6 +77,9 @@ class DiffResult:
             "matched_readings": self.matched_readings,
             "known_nom_chars": self.known_nom_chars,
             "unknown_nom_chars": self.unknown_nom_chars,
+            "matched_exact_readings": self.matched_exact_readings,
+            "matched_flat_readings": self.matched_flat_readings,
+            "matched_fold_readings": self.matched_fold_readings,
         }
 
 
@@ -130,6 +158,10 @@ def make_element(
     return element
 
 
+def _is_letter(ch: str) -> bool:
+    return is_nom_char(ch) or ch.isalpha()
+
+
 def validate_element(nom: str, vi: str, element: DiffElement) -> list[str]:
     issues: list[str] = []
     nom = nfc(nom)
@@ -138,6 +170,17 @@ def validate_element(nom: str, vi: str, element: DiffElement) -> list[str]:
         issues.append(f"invalid type {element.type!r}")
     if not element.nom_pos and not element.vi_pos:
         issues.append("both sides are empty")
+    for label, text, spans in (("nom", nom, element.nom_pos), ("vi", vi, element.vi_pos)):
+        ordered = sorted(spans)
+        if list(spans) != ordered:
+            issues.append(f"{label} spans must be sorted ascending")
+        for start, end in spans:
+            if not (0 <= start < end <= len(text)):
+                continue
+            if not _is_letter(text[start]):
+                issues.append(f"{label} span {start, end} must start with a letter")
+            if not _is_letter(text[end - 1]):
+                issues.append(f"{label} span {start, end} must end with a letter")
     if element.nom_pos:
         actual = _span_text(nom, element.nom_pos)
         if actual != element.nom_sub_text:
@@ -197,14 +240,14 @@ def validate_text_diff(
         for issue in validate_element(nom, vi, element):
             issues.append(f"element {index}: {issue}")
         for span in element.nom_pos:
-            for other, kind in occupied_nom:
-                if spans_overlap(span, other) and kind != element.type:
-                    issues.append(f"element {index}: overlapping nom positions of different types")
+            for other, _kind in occupied_nom:
+                if spans_overlap(span, other):
+                    issues.append(f"element {index}: overlapping nom positions")
             occupied_nom.append((span, element.type))
         for span in element.vi_pos:
-            for other, kind in occupied_vi:
-                if spans_overlap(span, other) and kind != element.type:
-                    issues.append(f"element {index}: overlapping vi positions of different types")
+            for other, _kind in occupied_vi:
+                if spans_overlap(span, other):
+                    issues.append(f"element {index}: overlapping vi positions")
             occupied_vi.append((span, element.type))
     return issues
 
@@ -250,42 +293,17 @@ def diff_from_decisions(
     return elements
 
 
-def _reading_match(
-    char: str,
-    readings: Sequence[str],
-    tokens: Sequence[tuple[int, int, str]],
-    start_index: int,
-) -> int | None:
-    if not readings:
-        return None
-    flat_readings = set()
-    for reading in readings:
-        value = reading.strip().casefold()
-        if not value:
-            continue
-        flat_readings.add(value)
-        decomposed = unicodedata.normalize("NFD", value)
-        flat_readings.add("".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn"))
-    for index in range(start_index, len(tokens)):
-        token = tokens[index][2]
-        token_flat = "".join(
-            ch
-            for ch in unicodedata.normalize("NFD", token)
-            if unicodedata.category(ch) != "Mn"
-        )
-        if token in flat_readings or token_flat in flat_readings:
-            return index
-    return None
-
-
 def auto_text_diff(
     nom: str,
     vi: str,
     *,
     lexicon: Any | None = None,
     dictionary: Any | None = None,
+    readings_cache: Any | None = None,
     strict_reading_mismatch: bool = False,
     proper_name: bool = False,
+    allow_flat_match: bool = False,
+    allow_variant_fold: bool = True,
 ) -> DiffResult:
     """Conservative automatic diff.
 
@@ -293,6 +311,15 @@ def auto_text_diff(
     when that reading cannot be matched anywhere in the QN sentence. Unknown
     characters never become red solely because a dictionary is incomplete.
     Yellow is never generated automatically.
+
+    Matching is exact (NFC, casefold) first; a weak variant fold
+    (quỷ/quỉ/quĩ -> qui, d/gi and đ/d alternation) is accepted as a weak
+    reading match (score 1.0, like the flat tone-folded match), never as a
+    stronger signal. The fold applies to comparisons only, never to stored
+    text. When the fold anchors at least one character the row carries the
+    non-blocking flag ``DIFF_VARIANT_FOLD_APPLIED`` so fold coverage can be
+    audited in ``summary.json`` / CSV flags; ``matched_fold_readings``
+    counts the anchored characters.
     """
     nom = nfc(nom)
     vi = nfc(vi)
@@ -306,6 +333,7 @@ def auto_text_diff(
         return DiffResult(elements=[], flags=["MASK_ONLY_DIFFERENCE"])
 
     chars = _char_positions(nom)
+    abs_pos = [abs_index for abs_index, _ in chars]
     tokens = _qn_tokens(vi)
     if not chars:
         return DiffResult(
@@ -321,14 +349,26 @@ def auto_text_diff(
         )
 
     readings_by_index: dict[int, list[str]] = {}
-    known = 0
+    sources: dict[int, str] = {}
     for index, char in chars:
-        readings: list[str] = []
-        if lexicon is not None and hasattr(lexicon, "readings"):
-            readings = list(lexicon.readings(char))
+        readings, source = gather_readings(
+            char, lexicon=lexicon, dictionary=dictionary, readings=readings_cache
+        )
         if readings:
             readings_by_index[index] = readings
-            known += 1
+            sources[index] = source
+    known = len(readings_by_index)
+    dictionary_known = sum(1 for source in sources.values() if "dictionary" in source)
+    if known:
+        token_set = {t[2] for t in tokens}
+        ambiguous = sum(
+            1 for readings in readings_by_index.values()
+            if sum(1 for reading in readings if reading in token_set) >= 2
+        )
+    else:
+        ambiguous = 0
+    if ambiguous:
+        flags.append("DIFF_AMBIGUOUS_READINGS")
 
     if not known:
         # No positive evidence. Do not invent red spans and do not claim the
@@ -348,20 +388,97 @@ def auto_text_diff(
             unknown_nom_chars=len(chars),
         )
 
-    # Greedy reading alignment. QN expansions are allowed; unmatched known
-    # Nôm characters are candidates for red.
+    # Global 1-1 phonetic alignment (Needleman-Wunsch, O(n·m)) — far more
+    # robust than a greedy cursor for this text class. Require an
+    # exact, flat or (default-on) fold reading match to count as anchorable.
+    # Evidence lookups are keyed by the ABSOLUTE position of the character in
+    # the Nôm string (`abs_pos[list_index]`); the NW iteration indexes the
+    # filtered ideograph list, so list index and absolute position diverge the
+    # moment any non-ideograph (PUA, punctuation, [MASK]) precedes one.
+    GAP = -1.2
+
+    def _match_tier(list_index: int, token_index: int) -> str:
+        rs = readings_by_index.get(abs_pos[list_index])
+        if not rs:
+            return "absent"  # neutral; matches are never made on this cell
+        tok = tokens[token_index][2]
+        exact = {r.strip().casefold() for r in rs if r.strip()}
+        if tok in exact:
+            return "exact"
+        if allow_flat_match:
+            flat = {
+                "".join(c for c in unicodedata.normalize("NFD", r) if unicodedata.category(c) != "Mn")
+                for r in exact
+            }
+            tok_flat = "".join(c for c in unicodedata.normalize("NFD", tok) if unicodedata.category(c) != "Mn")
+            if tok_flat in flat:
+                return "flat"
+        if allow_variant_fold:
+            fold_variants = {variant_fold(r) for r in exact}
+            if variant_fold(tok) in fold_variants:
+                return "fold"
+        return "mismatch"
+
+    def _score(list_index: int, token_index: int) -> float:
+        tier = _match_tier(list_index, token_index)
+        if tier in {"exact", "flat", "fold"}:
+            return 2.0 if tier == "exact" else 1.0
+        if tier == "mismatch":
+            return -1.0
+        return 0.0  # "absent"
+
+    n, m_ = len(chars), len(tokens)
+    NEG = -1e9
+    dp = [[NEG] * (m_ + 1) for _ in range(n + 1)]
+    back = [[None] * (m_ + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + GAP
+        back[i][0] = 'up'
+    for j in range(1, m_ + 1):
+        dp[0][j] = dp[0][j - 1] + GAP
+        back[0][j] = 'left'
+    for i in range(1, n + 1):
+        for j in range(1, m_ + 1):
+            s_ij = _score(i - 1, j - 1)
+            diag = dp[i - 1][j - 1] + s_ij
+            up = dp[i - 1][j] + GAP
+            left = dp[i][j - 1] + GAP
+            best = max(diag, up, left)
+            dp[i][j] = best
+            if best == diag:
+                back[i][j] = 'diag'
+            elif best == up:
+                back[i][j] = 'up'
+            else:
+                back[i][j] = 'left'
+
     matched: set[int] = set()
-    token_cursor = 0
     char_matches: dict[int, int] = {}
-    for index, char in chars:
-        readings = readings_by_index.get(index)
-        if not readings:
-            continue
-        token_index = _reading_match(char, readings, tokens, token_cursor)
-        if token_index is not None:
-            matched.add(index)
-            char_matches[index] = token_index
-            token_cursor = token_index + 1
+    lexicon_matched = 0
+    dictionary_matched = 0
+    tier_counters = {"exact": 0, "flat": 0, "fold": 0}
+    i, j = n, m_
+    while i > 0 or j > 0:
+        step = back[i][j]
+        if step == 'diag':
+            tier = _match_tier(i - 1, j - 1)
+            if tier in tier_counters:
+                abs_index = abs_pos[i - 1]
+                matched.add(abs_index)
+                char_matches[abs_index] = j - 1
+                tier_counters[tier] += 1
+                source = sources.get(abs_index, "")
+                if "lexicon" in source:
+                    lexicon_matched += 1
+                if "dictionary" in source:
+                    dictionary_matched += 1
+            i -= 1
+            j -= 1
+        elif step == 'up':
+            i -= 1
+        else:
+            j -= 1
 
     unknown = len(chars) - known
     if unknown:
@@ -372,10 +489,6 @@ def auto_text_diff(
     elements: list[DiffElement] = []
     unmatched_run: list[tuple[int, str]] = []
     last_matched_token = -1
-    anchors = sorted(char_matches.items(), key=lambda kv: kv[0])
-    anchor_index = 0
-    all_positions = [idx for idx, _ in chars]
-
     def flush_run(next_token_start: int | None) -> None:
         nonlocal unmatched_run
         if not unmatched_run:
@@ -425,7 +538,6 @@ def auto_text_diff(
             # the preceding QN material.
             flush_run(char_matches[char_index])
             last_matched_token = char_matches[char_index]
-            anchor_index += 1
         else:
             unmatched_run.append((char_index, char))
     flush_run(None)
@@ -438,6 +550,10 @@ def auto_text_diff(
         if nom != vi:
             review.append("DIFF_UNVERIFIED_DIFFERENT_TEXT")
 
+    if dictionary_matched:
+        flags.append("DIFF_READINGS_FROM_DICTIONARY")
+    if tier_counters["fold"]:
+        flags.append("DIFF_VARIANT_FOLD_APPLIED")
     if proper_name:
         flags.append("PROPER_NAME_CANDIDATE")
     if not strict_reading_mismatch and elements:
@@ -453,6 +569,13 @@ def auto_text_diff(
         matched_readings=len(matched),
         known_nom_chars=known,
         unknown_nom_chars=unknown,
+        lexicon_matched_readings=lexicon_matched,
+        dictionary_matched_readings=dictionary_matched,
+        dictionary_known_nom_chars=dictionary_known,
+        ambiguous_nom_chars=ambiguous,
+        matched_exact_readings=tier_counters["exact"],
+        matched_flat_readings=tier_counters["flat"],
+        matched_fold_readings=tier_counters["fold"],
     )
 
 
