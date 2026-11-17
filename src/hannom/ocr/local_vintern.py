@@ -39,6 +39,29 @@ _PROMPT = (
 )
 
 
+def _drop_return_dict(model) -> None:
+    """Make Vintern's remote code generate with transformers 4.46.
+
+    InternVLChatModel.generate passes ``return_dict=None`` on to
+    ``language_model.generate``; transformers 4.46 forwards unknown generate
+    kwargs to the model call, which already sets ``return_dict=True`` ->
+    "got multiple values for keyword argument 'return_dict'". The value is
+    always None on that path (chat() never sets it), so dropping it changes
+    nothing else. The downloaded model files are left untouched.
+    """
+    language_model = getattr(model, "language_model", None)
+    if language_model is None or getattr(language_model, "_hannom_drops_return_dict", False):
+        return
+    original = language_model.generate
+
+    def generate(*args, **kwargs):
+        kwargs.pop("return_dict", None)
+        return original(*args, **kwargs)
+
+    language_model.generate = generate
+    language_model._hannom_drops_return_dict = True
+
+
 class VinternEngine(OCREngine):
     name = "vintern_1b_v2"
 
@@ -79,6 +102,7 @@ class VinternEngine(OCREngine):
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         ).eval().cuda()
+        _drop_return_dict(self._model)
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_id, trust_remote_code=True, use_fast=False
         )

@@ -186,6 +186,7 @@ def charalign_cmd(
     console.print(f"Nôm only {stats['nom_only']}, QN only {stats['qn_only']}, dictionary coverage {stats['dictionary_coverage']}")
     console.print(f"Score now: {stats['score_now']}")
     console.print(f"Score if learned candidates confirmed: {stats['score_if_candidates_confirmed']}")
+    console.print(f"Score if every tone/letter-only pair is fine: {stats['score_if_fold_pairs_ok']}")
     console.print(f"text_diff format problems: {stats['text_diff_problem_count']}")
     for key, path in paths.items():
         console.print(f"  {key}: {path}")

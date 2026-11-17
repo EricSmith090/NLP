@@ -21,6 +21,21 @@ all QN syllables in reading order) character by character:
 
 Nothing is invented: a match always comes from a dictionary reading or a
 human-confirmed lexicon entry; everything else is reported for review.
+
+How a (character, syllable) pair is judged:
+
+- ``exact``: the syllable is one of the character's dictionary readings;
+- ``variant``: the same reading in an old spelling — i/y (quỉ = quỷ,
+  quí = quý), old tone placement (hoà = hòa), d/gi (dấu = giấu). Tone and
+  vowel marks must be identical. Black: the rules keep old spellings and
+  black means "same meaning";
+- ``fold``: equal only after dropping tone or vowel marks or đ/d
+  (Thành ~ thánh, đê ~ để, chưa ~ chừa). On Sửa Lưỡi Quyển almost all of
+  these were QN OCR slips, Nôm OCR confusions or readings missing from the
+  dictionary, so a fold pair keeps the alignment in sync but is *red* in
+  the draft until a human fixes the OCR or confirms the reading;
+- ``lex``: a learned/confirmed book reading; ``unknown``: no dictionary
+  entry; ``diff``: anything else.
 """
 
 from __future__ import annotations
@@ -45,17 +60,46 @@ CN_NUMERALS = frozenset("〇零一二三四五六七八九十百千廿卅")
 PAGE_NO_RE = re.compile(r"\.(\d+)(?:_\d+)?\.jpg$", re.IGNORECASE)
 _Y_AS_I_RE = re.compile(r"(qu|[bcdghklmnprstvx]{0,3})y")
 
-SCORE = {"exact": 3.0, "fold": 2.0, "lex": 2.0, "unknown": 0.0, "diff": -1.0}
+SCORE = {"exact": 3.0, "variant": 3.0, "fold": 2.0, "lex": 2.0, "unknown": 0.0, "diff": -1.0}
 GAP = -2.0
-BLACK = frozenset({"exact", "fold", "lex"})
+# Pair kinds that are black (same reading) without a human decision.
+BLACK = frozenset({"exact", "variant"})
+# Combining marks of the five Vietnamese tones: huyền, sắc, ngã, hỏi, nặng.
+TONE_MARKS = frozenset("̣̀́̃̉")
+VOWELS = frozenset("aăâeêioôơuưy")
+
+
+def _split_tone(text: str) -> tuple[str, str]:
+    """(syllable without its tone mark, the tone mark); vowel marks stay."""
+    decomposed = unicodedata.normalize("NFD", text.casefold())
+    tone = "".join(c for c in decomposed if c in TONE_MARKS)
+    base = unicodedata.normalize("NFC", "".join(c for c in decomposed if c not in TONE_MARKS))
+    return base, tone
+
+
+def variant_key(text: str) -> str:
+    """Old-spelling form that still keeps the tone and the vowel marks.
+
+    quỉ = quỷ, quí = quý (i/y), hoà = hòa (tone placement), dấu = giấu and
+    dìn = gìn (d/gi). But má != mà, nầy != này, đi != di: those differ in
+    a tone, a vowel or a consonant, which changes the word.
+    """
+    base, tone = _split_tone(text)
+    if _Y_AS_I_RE.fullmatch(base):
+        base = base[:-1] + "i"
+    if base.startswith("gi") and len(base) > 2:
+        rest = base[2:]
+        base = ("d" if rest[0] in VOWELS else "di") + rest
+    return f"{base}|{tone}"
 
 
 def fold(text: str) -> str:
-    """Accent/old-spelling-insensitive form used only as a *weak* match.
+    """Tone/vowel-mark-insensitive form: a *weak* match for the alignment only.
 
     quỷ/quỉ/quĩ -> qui, đ -> d, and the old d/gi alternation (dấu = giấu,
-    dối = giối) -> d. The text itself is never changed; this only decides
-    whether a syllable may be one of the character's readings.
+    dối = giối) -> d. It drops tones, so it also equates words that differ
+    (má/mà): a fold pair helps the two streams stay in sync but is never
+    black on its own. The text itself is never changed.
     """
     decomposed = unicodedata.normalize("NFD", text.casefold())
     out = "".join(c for c in decomposed if unicodedata.category(c) != "Mn").replace("đ", "d")
@@ -92,6 +136,7 @@ class QnToken:
     start: int
     end: int
     page: str
+    variant: str = ""
 
 
 @dataclass
@@ -191,7 +236,12 @@ def build_qn_stream(pages: Sequence[tuple[str, str]]) -> tuple[str, list[QnToken
         starts[image] = len(tokens)
         for match in QN_TOKEN_RE.finditer(text):
             word = match.group(0)
-            tokens.append(QnToken(word, norm_reading(word), fold(word), pos + match.start(), pos + match.end(), image))
+            tokens.append(
+                QnToken(
+                    word, norm_reading(word), fold(word), pos + match.start(), pos + match.end(), image,
+                    variant=variant_key(word),
+                )
+            )
         parts.append(text)
         pos += len(text)
     return "".join(parts), tokens, starts, markers
@@ -204,7 +254,7 @@ def build_qn_stream(pages: Sequence[tuple[str, str]]) -> tuple[str, list[QnToken
 
 @dataclass
 class Op:
-    kind: str  # exact | fold | lex | unknown | diff (pairs) ; N (Nôm only) ; Q (QN only)
+    kind: str  # exact | variant | lex | fold | unknown | diff (pairs) ; N (Nôm only) ; Q (QN only)
     i: int | None
     j: int | None
 
@@ -213,25 +263,29 @@ class Matcher:
     def __init__(self, readings: Readings, lexicon: dict[str, set[str]] | None = None):
         self.readings = readings
         self.lexicon = lexicon or {}
-        self._cache: dict[str, tuple[frozenset[str], frozenset[str], frozenset[str]]] = {}
+        self._cache: dict[str, tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]] = {}
 
-    def sets(self, ch: str) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    def sets(self, ch: str) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
+        """(exact readings, their variant keys, their fold keys, lexicon readings)."""
         cached = self._cache.get(ch)
         if cached is None:
             exact = self.readings.of(ch)
+            variants = frozenset(variant_key(r) for r in exact)
             folded = frozenset(fold(r) for r in exact)
             lex = frozenset(self.lexicon.get(ch, ()))
-            cached = self._cache[ch] = (exact, folded, lex)
+            cached = self._cache[ch] = (exact, variants, folded, lex)
         return cached
 
     def kind(self, ch: str, token: QnToken) -> str:
-        exact, folded, lex = self.sets(ch)
+        exact, variants, folded, lex = self.sets(ch)
         if token.norm in exact:
             return "exact"
-        if token.fold in folded:
-            return "fold"
+        if token.variant in variants:
+            return "variant"
         if token.norm in lex:
             return "lex"
+        if token.fold in folded:
+            return "fold"
         if not exact and not lex:
             return "unknown"
         return "diff"
@@ -346,7 +400,8 @@ def learn_lexicon(
         op = ops[k]
         if op.kind not in ("unknown", "diff"):
             continue
-        if ops[k - 1].kind in ("exact", "fold") and ops[k + 1].kind in ("exact", "fold"):
+        context = ("exact", "variant", "fold")
+        if ops[k - 1].kind in context and ops[k + 1].kind in context:
             evidence[nom[op.i].ch][qn[op.j].norm] += 1
     learned: dict[str, set[str]] = {}
     for ch, counter in evidence.items():
@@ -419,7 +474,9 @@ def build_rows(
     qn: Sequence[QnToken],
     ops: Sequence[Op],
     lexicon_is_confirmed: bool,
+    fold_is_black: bool = False,
 ) -> list[Row]:
+    """Rows per QN sentence; ``*_is_black`` only serve the what-if scores."""
     spans = sentence_spans(stream_text)
     token_sentence: list[int] = []
     s = 0
@@ -497,7 +554,11 @@ def build_rows(
             run.clear()
 
         for op in sentence_ops:
-            black = op.kind in ("exact", "fold") or (op.kind == "lex" and lexicon_is_confirmed)
+            black = (
+                op.kind in BLACK
+                or (op.kind == "lex" and lexicon_is_confirmed)
+                or (op.kind == "fold" and fold_is_black)
+            )
             if black:
                 flush()
             else:
@@ -681,12 +742,16 @@ def align_book(
     qn_spelling: list[dict[str, Any]] = []
     for row in rows:
         for op in row.ops:
-            if op.kind == "fold":
+            if op.kind in ("variant", "fold"):
                 token = qn[op.j]
                 qn_spelling.append(
                     {
                         "img_id": row.img_id,
                         "sentence_id": row.sentence_id,
+                        # variant: old spelling, already black (just skim it);
+                        # tone_or_letter: red until the QN OCR is fixed or the
+                        # reading is confirmed in a dictionary.
+                        "kind": "variant" if op.kind == "variant" else "tone_or_letter",
                         "nom": nom[op.i].ch,
                         "qn_ocr": token.text,
                         "dictionary": " ".join(sorted(readings.of(nom[op.i].ch))),
@@ -705,7 +770,7 @@ def align_book(
                 {
                     "img_id": row.img_id,
                     "sentence_id": row.sentence_id,
-                    "kind": _element_kind(element, row, nom, qn),
+                    "kind": _element_kind(element, matcher2),
                     "nom": element["nom_sub_text"],
                     "qn": element["vi_sub_text"],
                     "where": "; ".join(where[:3]),
@@ -733,7 +798,7 @@ def align_book(
     stats = {
         "nom_chars": len(nom),
         "qn_syllables": len(qn),
-        "pairs": {k: kinds.get(k, 0) for k in ("exact", "fold", "lex", "unknown", "diff")},
+        "pairs": {k: kinds.get(k, 0) for k in ("exact", "variant", "fold", "lex", "unknown", "diff")},
         "nom_only": kinds.get("N", 0),
         "qn_only": kinds.get("Q", 0),
         "dictionary_coverage": round(sum(1 for c in nom if readings.known(c.ch)) / max(1, len(nom)), 4),
@@ -746,19 +811,30 @@ def align_book(
     # What the score would be if every learned candidate were confirmed.
     optimistic = build_rows(stream_text, nom, qn, ops, lexicon_is_confirmed=True)
     stats["score_if_candidates_confirmed"] = similarity(optimistic)
+    # Upper bound: every tone/letter-only difference turns out to be fine
+    # (the old behaviour, which counted them black automatically).
+    stats["score_if_fold_pairs_ok"] = similarity(
+        build_rows(stream_text, nom, qn, ops, lexicon_is_confirmed=False, fold_is_black=True)
+    )
     problems = [p for row in rows for p in validate_text_diff(row)]
     stats["text_diff_problems"] = problems[:50]
     stats["text_diff_problem_count"] = len(problems)
     return BookResult(rows, stats, review, qn_spelling, lexicon_candidates, dropped)
 
 
-def _element_kind(element: dict[str, Any], row: Row, nom: Sequence[NomChar], qn: Sequence[QnToken]) -> str:
+def _element_kind(element: dict[str, Any], matcher: Matcher) -> str:
     if not element["vi_pos"]:
         return "nom_extra"
     if not element["nom_pos"]:
         return "qn_extra"
     if element["type"] == "warn":
         return "name_or_number"
+    chars = [c for c in element["nom_sub_text"] if is_ideograph(c)]
+    sylls = QN_TOKEN_RE.findall(element["vi_sub_text"])
+    if chars and len(chars) == len(sylls) and all(fold(s) in matcher.sets(c)[2] for c, s in zip(chars, sylls)):
+        # Only a tone/vowel mark or đ/d differs: fix the QN OCR, or confirm
+        # the reading in a dictionary (Nôm often borrows a sound with another tone).
+        return "tone_or_letter"
     return "mismatch"
 
 

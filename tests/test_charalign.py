@@ -13,6 +13,7 @@ from hannom.charalign import (
     fold,
     similarity,
     validate_text_diff,
+    variant_key,
 )
 from hannom.dictionary.readings import Readings
 
@@ -39,6 +40,38 @@ def test_fold_handles_old_spellings_and_ocr_tone_slips():
     assert fold("giấu") == fold("dấu") == "dau"
     assert fold("Đến") == "den"
     assert fold("hay") == "hay"  # y after a vowel is not turned into i
+
+
+def test_variant_key_accepts_old_spellings_but_keeps_tones():
+    # Same word, old spelling: black.
+    assert variant_key("quỉ") == variant_key("quỷ")  # i/y
+    assert variant_key("Quí") == variant_key("quý")
+    assert variant_key("hoà") == variant_key("hòa")  # old tone placement
+    assert variant_key("dấu") == variant_key("giấu")  # d/gi
+    assert variant_key("dìn") == variant_key("gìn")
+    # A different tone, vowel or consonant is a different word: not a variant.
+    assert variant_key("má") != variant_key("mà")
+    assert variant_key("Quĩ") != variant_key("quỷ")
+    assert variant_key("nầy") != variant_key("này")
+    assert variant_key("đi") != variant_key("di")
+
+
+def test_matcher_tells_old_spellings_from_tone_slips():
+    readings = Readings({"char": {"貴": ["quý"], "丑": ["giấu"], "聖": ["thánh"]}})
+    _, tokens, _, _ = build_qn_stream([("B.001.jpg", "quý quí quì giấu dấu thánh Thành")])
+    matcher = Matcher(readings)
+    kinds = [matcher.kind(ch, token) for ch, token in zip("貴貴貴丑丑聖聖", tokens)]
+    assert kinds == ["exact", "variant", "fold", "exact", "variant", "exact", "fold"]
+
+
+def test_tone_slip_keeps_the_alignment_but_stays_red():
+    # "nầy" is not a dictionary reading of 尼 (này): it still pairs with 尼
+    # (no shift), but it is red until a human fixes the OCR or confirms it.
+    (row,) = _rows(["付𡥵尼朱鬼"], "Phó con nầy cho quỉ.")
+    assert row.text_diff == [
+        {"nom_pos": [[2, 3]], "nom_sub_text": "尼", "vi_pos": [[8, 11]], "vi_sub_text": "nầy", "type": "error"}
+    ]
+    assert validate_text_diff(row) == []
 
 
 def test_rules_example_gives_the_documented_text_diff():
