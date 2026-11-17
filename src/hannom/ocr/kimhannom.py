@@ -479,37 +479,69 @@ class KimHanNomClient(OCREngine):
             return texts_out, points_out, [None] * len(texts_out)
         return [], [], []
 
+    def _layout_and_ocr(
+        self,
+        page: PageRecord,
+        upload_sha: str,
+        upload_path: str | Path,
+        script: str,
+        file_name: str,
+    ) -> tuple[dict[str, Any], ApiResponse, int, int, int]:
+        """Classify the page, then obtain its OCR payload.
+
+        When ``api.embedded_ocr`` is enabled and the structure-classification
+        response carries the full OCR ``result`` block (text, boxes,
+        difficulties — verified byte-equal to image-ocr 2026-11-17,
+        247/247 cached pages), reuse it and skip the image-ocr call entirely.
+        Falls back to image-ocr whenever the embedded payload is absent.
+        """
+        cdata = self._page_layout(file_name, upload_sha)
+        ocr_id = int(cdata.get("ocr_id", 1) or 1)
+        lang_type = 2 if script == "nom" else 1
+        reading_direction = int(cdata.get("reading_direction", 1) or 1)
+        embedded = cdata.get("result") if isinstance(cdata, dict) else None
+        if (
+            self.project.api.embedded_ocr
+            and self.project.api.classify
+            and isinstance(embedded, dict)
+            and isinstance(embedded.get("result_ocr_text"), list)
+        ):
+            response = ApiResponse(
+                endpoint="image-ocr",
+                data=embedded,
+                raw={
+                    "code": "000000",
+                    "is_success": True,
+                    "message": None,
+                    "source": "structure-classification.embedded",
+                },
+                cached=True,
+            )
+            return cdata, response, ocr_id, lang_type, reading_direction
+        response = self.ocr(
+            file_name,
+            upload_sha,
+            ocr_id=ocr_id,
+            lang_type=lang_type,
+            reading_direction=reading_direction,
+        )
+        return cdata, response, ocr_id, lang_type, reading_direction
+
     def recognize_page(self, page: PageRecord, script: str) -> OCRResult:
         if not self.is_available():
             raise OCRUnavailable(f"Kim Hán Nôm unavailable: set {self.project.api.token_env}")
         upload_path, upload_sha, scale = self._prepare_upload(page)
         file_name = self.upload(upload_path, upload_sha)
         try:
-            cdata = self._page_layout(file_name, upload_sha)
-            ocr_id = int(cdata.get("ocr_id", 1) or 1)
-            lang_type = 2 if script == "nom" else 1
-            reading_direction = int(cdata.get("reading_direction", 1) or 1)
-            response = self.ocr(
-                file_name,
-                upload_sha,
-                ocr_id=ocr_id,
-                lang_type=lang_type,
-                reading_direction=reading_direction,
+            cdata, response, ocr_id, lang_type, reading_direction = self._layout_and_ocr(
+                page, upload_sha, upload_path, script, file_name
             )
         except ApiBusinessError:
             # A cached server-side file_name can expire. Re-upload exactly
             # once, then let a second business error surface unchanged.
             file_name = self.upload(upload_path, upload_sha, force=True)
-            cdata = self._page_layout(file_name, upload_sha)
-            ocr_id = int(cdata.get("ocr_id", 1) or 1)
-            lang_type = 2 if script == "nom" else 1
-            reading_direction = int(cdata.get("reading_direction", 1) or 1)
-            response = self.ocr(
-                file_name,
-                upload_sha,
-                ocr_id=ocr_id,
-                lang_type=lang_type,
-                reading_direction=reading_direction,
+            cdata, response, ocr_id, lang_type, reading_direction = self._layout_and_ocr(
+                page, upload_sha, upload_path, script, file_name
             )
         warnings: list[str] = []
         if script == "nom" and cdata.get("is_sino_nom") is False:

@@ -36,6 +36,16 @@ alignment:
   # same distinction; i.e. 0.5× in the 1.0-per-anchor bonus unit). Expect
   # ALIGN_EVIDENCE_INSUFFICIENT to drop; turn on only after re-baselining.
   dp_fold_bonus: false
+  # Monotonicity band for the align DP. Only cells with |i - j| <= dp_band
+  # are evaluated (group transitions likewise may not leave the band).
+  # Translations advance together; the full n×m grid on Tap2 is ~25M cells
+  # × 16 group transitions with a reading-anchor computation each —
+  # hours of CPU with zero output. 64 comfortably tolerates long runs of
+  # untranslated material. If the banded grid cannot reach (n, m), the
+  # aligner automatically falls back to the full unbanded DP (a warning is
+  # recorded), so nothing is silently lost. Set 0 (or remove) for the
+  # historical full DP.
+  dp_band: 64
 
 text_diff:
   # Unknown readings are routed to review, never auto-red.

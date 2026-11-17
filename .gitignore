@@ -38,3 +38,7 @@ Thumbs.db
 
 # Local submission build (stale deliverable; never commit)
 /submission/
+
+# Instructor-supplied reference drop (v2.4 spec, updated tools/samples, 2026-11-16).
+# Kept locally only — never committed.
+/instructor's reference/

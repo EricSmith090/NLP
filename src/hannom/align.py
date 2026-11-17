@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -105,6 +106,15 @@ class AlignConfig:
     # with ``alignment.dp_fold_bonus: true`` after re-baselining gates —
     # a fold bonus further blunts ALIGN_EVIDENCE_INSUFFICIENT.
     dp_fold_bonus: bool = False
+    # Monotonicity band for the align DP. Only cells with |i - j| <= dp_band
+    # are evaluated (group transitions likewise may not leave the band).
+    # Rationale: translations advance together, the full n×m grid is O(25M
+    # cells × 16 group transitions) on a book like Tap2, and every cell
+    # costs a reading-anchor computation. dp_band=0/None disables banding.
+    # When the banded run cannot reach (n, m) — legitimate drift beyond the
+    # band, e.g. whole untranslated pages — align_segments falls back to
+    # the full unbanded DP, so correctness is never sacrificed for speed.
+    dp_band: int | None = 64
 
 
 def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
@@ -131,6 +141,8 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
         per_book=dict(raw.get("per_book", {}) or {}),
         variant_fold=variant_fold_from_config(raw_config),
         dp_fold_bonus=bool(raw.get("dp_fold_bonus", defaults.dp_fold_bonus)),
+        dp_band=(None if raw.get("dp_band", defaults.dp_band) in (None, 0, "0")
+                 else int(raw.get("dp_band", defaults.dp_band))),
     )
 
 
@@ -486,6 +498,42 @@ def align_segments(
     minimum_confidence: float | None = None,
 ) -> list[AlignmentRow]:
     config = config or AlignConfig()
+    band = config.dp_band if config.dp_band and config.dp_band > 0 else None
+    if band is not None:
+        solved = _dp_solve(
+            nom_segments, qn_segments, config,
+            lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+            minimum_confidence=minimum_confidence, band=band,
+        )
+        if solved is not None:
+            return solved
+        warnings.warn(
+            f"alignment.dp_band={band} could not reach (n, m) within the band; "
+            f"falling back to the full unbanded DP (slow)",
+            stacklevel=2,
+        )
+    solved = _dp_solve(
+        nom_segments, qn_segments, config,
+        lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+        minimum_confidence=minimum_confidence, band=None,
+    )
+    assert solved is not None
+    return solved
+
+
+def _dp_solve(
+    nom_segments: Sequence[TextSegment],
+    qn_segments: Sequence[TextSegment],
+    config: AlignConfig,
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    minimum_confidence: float | None = None,
+    band: int | None = None,
+) -> list[AlignmentRow] | None:
+    """One DP pass. With ``band`` set, cells with |i - j| > band are skipped;
+    returns None when the banded grid cannot reach (n, m)."""
     n, m = len(nom_segments), len(qn_segments)
     inf = float("inf")
     dp = [[inf] * (m + 1) for _ in range(n + 1)]
@@ -493,17 +541,21 @@ def align_segments(
     back: list[list[tuple[str, int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
     dp[0][0] = 0.0
     for i in range(n + 1):
-        for j in range(m + 1):
+        if band:
+            j_lo, j_hi = max(0, i - band), min(m, i + band)
+        else:
+            j_lo, j_hi = 0, m
+        for j in range(j_lo, j_hi + 1):
             if dp[i][j] == inf:
                 continue
             # Explicit unmatched transitions: a segment may remain
             # unmatched instead of being forced into a weak correspondence.
-            if i + 1 <= n:
+            if i + 1 <= n and (not band or j >= i + 1 - band):
                 cost = dp[i][j] + config.unmatched_nom_penalty
                 if cost < dp[i + 1][j] - 1e-12:
                     dp[i + 1][j] = cost
                     back[i + 1][j] = ("skip_nom", 1, 0)
-            if j + 1 <= m:
+            if j + 1 <= m and (not band or j + 1 <= i + band):
                 cost = dp[i][j] + config.unmatched_qn_penalty
                 if cost < dp[i][j + 1] - 1e-12:
                     dp[i][j + 1] = cost
@@ -516,6 +568,8 @@ def align_segments(
                         break
                     if a > 1 and b > 1 and (a > config.max_nm_group or b > config.max_nm_group):
                         continue
+                    if band and abs((i + a) - (j + b)) > band:
+                        continue
                     nom_text = "".join(s.text for s in nom_segments[i : i + a])
                     vi_text = " ".join(s.text for s in qn_segments[j : j + b])
                     cost = dp[i][j] + _group_cost(
@@ -525,6 +579,9 @@ def align_segments(
                     if cost < dp[i + a][j + b] - 1e-12:
                         dp[i + a][j + b] = cost
                         back[i + a][j + b] = ("group", a, b)
+
+    if band and dp[n][m] == inf:
+        return None
 
     groups: list[tuple[int, int, int, int, float, str, int, int]] = []
     i, j = n, m

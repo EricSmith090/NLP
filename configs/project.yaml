@@ -24,10 +24,16 @@ api:
   token_env: "KIMHANNOM_TOKEN"
   # Exact documented value; do not substitute a python-requests default.
   user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
+  # Server accepts calls past 200/day for this token (verified 2026-11-17:
+  # image-upload accepted after local 200/day consumed). Actual daily cap is
+  # unknown (instructors reportedly raised it; not in any delivered spec —
+  # v2.3 still says 200/day). per_day is therefore an interim high ceiling;
+  # the server remains the arbiter. Weekly stays at 600 (only written number).
+  embedded_ocr: true
   limits:
     per_minute: 25
     per_hour: 50
-    per_day: 200
+    per_day: 10000
     per_week: 600
   min_delay_seconds: 3.0
   timeout_seconds: 120

@@ -207,11 +207,24 @@ def build_dictionary_index(
 
     root = Path(project_root)
     cfg = dictionary_config.get("dictionary", dictionary_config)
+    skip_raw = cfg.get("skip_sources") or ()
+    if isinstance(skip_raw, str):
+        skip_raw = [skip_raw]
+    # Honour skip_sources (same semantics as the readings cache): skipped
+    # sources are not adapted at all. The 2026-11-14 verify-G finding was
+    # that catusf carries zero usable qn/hv/nom readings, yet the JSONL
+    # adapter path still parsed its 2.43 GB file (with raw records retained)
+    # on every run — the dominant cost of an align.
+    skip = {str(name) for name in skip_raw}
     adapters: list[DictionaryAdapter] = []
     configured: list[str] = []
 
     entries_dir = root / str(cfg.get("entries_dir", "dictionaries/entries"))
     for path in sorted(entries_dir.glob("*.jsonl")):
+        if path.name in skip or path.stem in skip:
+            print(f"[hannom] dictionary: skipping {path.name} (dictionary.skip_sources)", flush=True)
+            configured.append(f"jsonl:{path.stem} (skipped)")
+            continue
         configured.append(f"jsonl:{path.stem}")
         adapters.append(JsonlDictionary(path, name=f"jsonl:{path.stem}"))
 

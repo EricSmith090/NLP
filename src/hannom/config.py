@@ -82,6 +82,12 @@ class ApiSettings:
     classify: bool = True
     fixed_ocr_id: int = 1
     fixed_reading_direction: int = 1
+    # Reuse the OCR payload embedded in the structure-classification response
+    # (result_ocr_text / result_bbox / details — verified byte-equal to a
+    # standalone image-ocr response, 247/247 cached pages 2026-11-17) instead
+    # of calling image-ocr. Halves the per-page API burn: upload + classify
+    # only. False = always call image-ocr (documented flow).
+    embedded_ocr: bool = False
     # Upload the page enlarged by this integer factor (1 = original image).
     # Small, faint scans OCR better at 2x (tested 2026-11-11 on Tap2 p277:
     # 3 dropped characters recovered). Boxes are scaled back to the original
@@ -201,6 +207,7 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
         classify=bool(api_raw.get("classify", True)),
         fixed_ocr_id=int(api_raw.get("fixed_ocr_id", 1)),
         fixed_reading_direction=int(api_raw.get("fixed_reading_direction", 1)),
+        embedded_ocr=bool(api_raw.get("embedded_ocr", False)),
         upscale=max(1, int(api_raw.get("upscale", 1))),
     )
 
