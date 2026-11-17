@@ -24,17 +24,17 @@ api:
   token_env: "KIMHANNOM_TOKEN"
   # Exact documented value; do not substitute a python-requests default.
   user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0"
-  # Server accepts calls past 200/day for this token (verified 2026-11-17:
-  # image-upload accepted after local 200/day consumed). Actual daily cap is
-  # unknown (instructors reportedly raised it; not in any delivered spec —
-  # v2.3 still says 200/day). per_day is therefore an interim high ceiling;
-  # the server remains the arbiter. Weekly stays at 600 (only written number).
+  # Quota raised by the instructors (Zalo announcement, ~2026-11-17):
+  # 500/minute, 3000/hour, 10000/day, 70000/week. The written spec (v2.4,
+  # 16/11) still lists the old 25/50/200/600; the announcement supersedes it.
+  # The server remains the arbiter. Note min_delay_seconds below still caps
+  # the client at ~20 calls/minute.
   embedded_ocr: true
   limits:
-    per_minute: 25
-    per_hour: 50
+    per_minute: 500
+    per_hour: 3000
     per_day: 10000
-    per_week: 600
+    per_week: 70000
   min_delay_seconds: 3.0
   timeout_seconds: 120
   max_retries: 3
