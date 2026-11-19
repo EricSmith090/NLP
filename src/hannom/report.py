@@ -17,7 +17,11 @@ import pymupdf
 from PIL import Image
 
 from .config import ProjectConfig
-from .models import BookMetrics
+from .models import AlignmentRow, BookMetrics
+
+PLACEHOLDER = "〓"
+PHONETIC, MEANING = "phonetic", "meaning"
+TYPE_LABELS = {PHONETIC: "dịch âm", MEANING: "dịch nghĩa"}
 
 PAGE_W, PAGE_H = 595.0, 842.0  # A4 points
 MARGIN_X, MARGIN_Y = 54.0, 54.0
@@ -53,10 +57,135 @@ class ReportData:
     method_notes: list[str] = field(default_factory=list)
     yellow_reasons: dict[str, str] = field(default_factory=dict)
     output_path: Path | None = None
+    # v2.4 additions
+    translation_types: dict[str, Any] = field(default_factory=dict)
+    null_row_justification: dict[str, str] = field(default_factory=dict)
+    confidence_note: str = ""
+    missing_pages: dict[str, list[str]] = field(default_factory=dict)
+    book_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # configs/report.yaml placeholder_descriptions: {"U+F047C": "cấu tạo …"}
+    placeholder_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 class ReportValidationError(RuntimeError):
     pass
+
+
+def _default_confidence_note() -> str:
+    return (
+        "Label.txt có thêm trường `confidence` trong mỗi box: đây là giá trị truyền nguyên từ "
+        "API Kim Hán Nôm (độ tin cậy nhận dạng của dịch vụ), không phải nhãn do nhóm gán "
+        "và không tham gia vào text_diff hay công thức chấm điểm."
+    )
+
+
+def _norm_type(value: Any) -> str:
+    v = str(value or "").strip().lower()
+    if v in {"meaning", "nghia", "nghĩa", "dich nghia", "dịch nghĩa"}:
+        return MEANING
+    return PHONETIC
+
+
+def _expand_types(rows: Sequence[AlignmentRow], spec: Any) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    """Per-row translation type. ``spec`` is a list of items
+    {images|sentence_ids: [first, last] | range: all, type} (ranges in row order,
+    inclusive) or a plain type string. Undeclared rows default to phonetic."""
+    types = [PHONETIC] * len(rows)
+    problems: list[str] = []
+    declared: list[dict[str, Any]] = []
+    if isinstance(spec, str):
+        spec = [{"range": "all", "type": spec}]
+    for item in spec or []:
+        if not isinstance(item, dict):
+            continue
+        t = _norm_type(item.get("type"))
+        by_img = "images" in item
+        rng = item.get("images", item.get("sentence_ids"))
+        if rng is None:
+            lo, hi, label = 0, len(rows) - 1, "all"
+        else:
+            if isinstance(rng, str):
+                parts = [x.strip() for x in rng.replace("..", "-").split("-", 1)]
+            else:
+                parts = [str(x) for x in rng]
+            if len(parts) == 1:
+                parts = parts * 2
+            if len(parts) != 2:
+                problems.append(f"bad range {rng!r}")
+                continue
+            ids = [r.img_id if by_img else r.sentence_id for r in rows]
+            if parts[0] not in ids or parts[1] not in ids:
+                problems.append(f"range endpoint not found {parts}")
+                continue
+            lo = ids.index(parts[0])
+            hi = len(ids) - 1 - ids[::-1].index(parts[1])
+            label = f"{parts[0]}..{parts[1]}"
+        for i in range(lo, hi + 1):
+            types[i] = t
+        declared.append({"range": label, "type": t, "rows": max(0, hi - lo + 1)})
+    return types, problems, declared
+
+
+def compute_book_report_stats(
+    rows: Sequence[AlignmentRow],
+    translation_spec: Any = None,
+    null_justification: str = "",
+    placeholder_origins: Sequence[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Pure v2.4 report statistics for one book from its CSV rows."""
+    total = len(rows)
+    types, problems, declared = _expand_types(rows, translation_spec)
+    meaning_rows = sum(1 for t in types if t == MEANING)
+    null_rows = sum(1 for r in rows if r.text_diff is None)
+    warn_total = warn_reviewed = 0
+    yellow_chars = nom_chars = 0
+    sugg: dict[str, dict[str, int]] = {}
+    pending = 0
+    for r in rows:
+        nom_chars += len(r.ch_txt or "")
+        for el in r.text_diff or []:
+            if el.type != "warn":
+                continue
+            warn_total += 1
+            yellow_chars += len(el.nom_sub_text or "")
+            if el.reviewed == 1:
+                warn_reviewed += 1
+            if el.suggest is not None:
+                b = sugg.setdefault(el.suggest_by or "unknown", {"accepted": 0, "rejected": 0, "pending": 0})
+                if el.reviewed == 1:
+                    b["accepted" if el.nom_sub_text == el.suggest else "rejected"] += 1
+                else:
+                    b["pending"] += 1
+                    pending += 1
+    # Every 〓 with its position and, when the clean stage recorded it, the
+    # original glyph code (v2.4: list position + glyph description).
+    from .placeholders import assign_origins, code_counts
+
+    placeholders, placeholder_problems = assign_origins(rows, list(placeholder_origins or []))
+    if placeholder_origins is None:
+        placeholder_problems = []
+    return {
+        "total_rows": total,
+        "translation_declared": bool(declared),
+        "translation_types": declared,
+        "translation_problems": problems,
+        "meaning_rows": meaning_rows,
+        "meaning_ratio": (meaning_rows / total) if total else None,
+        "yellow_elements": warn_total,
+        "yellow_reviewed": warn_reviewed,
+        "yellow_unreviewed": warn_total - warn_reviewed,
+        "yellow_chars": yellow_chars,
+        "yellow_ratio": (yellow_chars / nom_chars) if nom_chars else None,
+        "suggestions": sugg,
+        "suggestions_pending": pending,
+        "placeholder_count": len(placeholders),
+        "placeholders": placeholders,
+        "placeholder_codes": code_counts(placeholders),
+        "placeholder_problems": placeholder_problems,
+        "null_rows": null_rows,
+        "null_ratio": (null_rows / total) if total else None,
+        "null_justification": null_justification,
+    }
 
 
 def _font_paths() -> tuple[str, str, str | None]:
@@ -259,7 +388,7 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
         "Pipeline cục bộ: trích ảnh gốc, phân loại trang, OCR, PPOCRLabel, làm sạch, "
         "căn hàng, text_diff, đánh giá và đóng gói.",
         "Kim Hán Nôm API chỉ dùng như ý kiến thứ hai có đo lường; không dùng nhiều tài khoản.",
-        "Từ điển là tùy chọn; ký tự không có trong từ điển không bị tự động tô đỏ.",
+        "text_diff theo Quy định v2.4 (cùng ngữ nghĩa với công cụ chấm ocr-nom-align v0.2.0): so âm đọc bỏ 5 dấu thanh; chữ 〓 và chữ không có âm đọc trong từ điển bị tô đỏ; âm tiết thừa bị tô đỏ; đoạn có số được tô vàng.",
     ]:
         writer.paragraph(f"- {note}")
 
@@ -270,13 +399,13 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                 [
                     ("Sách", metrics.book_id),
                     (
-                        "Similarity",
-                        "N/A" if metrics.similarity is None else f"{metrics.similarity:.2f}%",
-                    ),
-                    (
-                        "Similarity (spec formula, all non-null rows)",
+                        "Similarity (công thức Quy định v2.4, mọi dòng không null)",
                         "N/A" if metrics.spec_formula_similarity is None
                         else f"{metrics.spec_formula_similarity:.2f}%",
+                    ),
+                    (
+                        "Similarity nội bộ (chỉ dòng đã xác minh; tham khảo)",
+                        "N/A" if metrics.similarity is None else f"{metrics.similarity:.2f}%",
                     ),
                     (
                         "Spec formula red/denom",
@@ -332,7 +461,8 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
                 ("Semantic evidence rows", str(metrics.semantic_evidence_rows)),
                 ("Evidence-insufficient rows", str(metrics.evidence_insufficient_rows)),
                 ("Decision diagnostics (superseded)", str(len(metrics.decision_audit_diagnostics))),
-                ("Similarity", "N/A" if metrics.similarity is None else f"{metrics.similarity:.4f}%"),
+                ("Similarity (Quy định v2.4)", "N/A" if metrics.spec_formula_similarity is None else f"{metrics.spec_formula_similarity:.4f}%"),
+                ("Similarity nội bộ (chỉ dòng đã xác minh)", "N/A" if metrics.similarity is None else f"{metrics.similarity:.4f}%"),
                 ("Kết luận", "PASS" if metrics.passed else "FAIL"),
             ]
         )
@@ -350,6 +480,56 @@ def build_report_pdf(data: ReportData, output_path: str | Path) -> Path:
             writer.heading("Cảnh báo", 3)
             for warning in metrics.warnings[:30]:
                 writer.paragraph(f"- {warning}", size=9.5)
+
+    writer.new_page()
+    writer.heading("Các mục theo Quy định v2.4", 1)
+    for book_id, st in data.book_stats.items():
+        writer.heading(f"Sách {book_id}", 2)
+        if st.get("translation_declared"):
+            for t in st.get("translation_types", []):
+                writer.paragraph(f"- Loại dịch [{t['range']}]: {TYPE_LABELS[t['type']]} ({t['rows']} dòng)")
+        else:
+            writer.paragraph("[BLOCKER] Chưa khai báo loại dịch (dịch âm / dịch nghĩa).", color=(0.75, 0, 0))
+        ratio = st.get("meaning_ratio")
+        writer.paragraph(
+            f"Cặp dịch nghĩa: {st['meaning_rows']} / {st['total_rows']}"
+            + ("" if ratio is None else f" ({ratio:.2%})")
+        )
+        writer.paragraph(
+            f"Ký tự Nôm vàng (warn): {st['yellow_elements']} phần tử; đã review {st['yellow_reviewed']}, "
+            f"chưa review {st['yellow_unreviewed']}; tỷ lệ yellow "
+            + ("N/A" if st["yellow_ratio"] is None else f"{st['yellow_ratio']:.2%}")
+        )
+        for src, b in sorted(st["suggestions"].items()):
+            writer.paragraph(
+                f"Gợi ý nguồn '{src}': chấp nhận {b['accepted']}, từ chối {b['rejected']}, chưa xử lý {b['pending']}"
+            )
+        if not st["suggestions"]:
+            writer.paragraph("Gợi ý: không có.")
+        nr = st["null_ratio"]
+        writer.paragraph(
+            f"Dòng null (text_diff = null): {st['null_rows']} / {st['total_rows']}"
+            + ("" if nr is None else f" ({nr:.2%})")
+        )
+        writer.paragraph(f"Lý do dòng null: {st['null_justification'] or '[CHƯA GHI LÝ DO]'}")
+        writer.paragraph(f"Ký tự 〓: {st['placeholder_count']} lần xuất hiện")
+        for code, count in st.get("placeholder_codes", {}).items():
+            desc = data.placeholder_descriptions.get(code, "").strip() or "[CHƯA MÔ TẢ CẤU TẠO]"
+            writer.paragraph(f"  {code} × {count}: {desc}", size=9, after=0)
+        for ph in st["placeholders"][:200]:
+            writer.paragraph(
+                f"  {ph['sentence_id']} @ {ph['position']} ({ph.get('code', 'unknown')})", size=9, after=0
+            )
+        if len(st["placeholders"]) > 200:
+            writer.paragraph(
+                f"  ... và {len(st['placeholders']) - 200} vị trí khác (đầy đủ trong report_summary.json).", size=9
+            )
+        lost = data.missing_pages.get(book_id)
+        writer.paragraph(
+            "Trang bị mất khi scan: " + ("; ".join(lost) if lost else "không có (không có thư mục missing/).")
+        )
+    writer.heading("Trường confidence trong Label.txt", 2)
+    writer.paragraph(data.confidence_note or _default_confidence_note())
 
     writer.new_page()
     writer.heading("Phụ lục ảnh chụp bắt buộc", 1)
@@ -408,6 +588,50 @@ def load_report_config(project: ProjectConfig) -> ReportData:
     data.method_notes = [str(x) for x in raw.get("method_notes", []) or []]
     data.yellow_reasons = {str(k): str(v) for k, v in (raw.get("yellow_reasons", {}) or {}).items()}
     data.book_notes = {str(k): str(v) for k, v in (raw.get("book_notes", {}) or {}).items()}
+    data.translation_types = dict(raw.get("translation_types", {}) or {})
+    data.null_row_justification = {
+        str(k): str(v) for k, v in (raw.get("null_row_justification", {}) or {}).items()
+    }
+    data.confidence_note = str(raw.get("confidence_note", "") or "")
+    data.placeholder_descriptions = {
+        str(k).upper().replace("U+", "U+"): str(v) for k, v in (raw.get("placeholder_descriptions", {}) or {}).items()
+    }
+    for book in project.books:
+        csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+        if csv_path.exists():
+            try:
+                from .align import read_alignment_csv
+
+                rows = read_alignment_csv(csv_path)
+            except Exception:
+                rows = None
+            if rows is not None:
+                origins = None
+                try:
+                    from .orchestrator import load_cleaned_pages
+                    from .placeholders import stream_origins
+                    from .t1_map import load_image_map
+
+                    map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
+                    if map_path.exists():
+                        origins = stream_origins(load_image_map(map_path), load_cleaned_pages(project, book))
+                except Exception:  # noqa: BLE001 - the report still lists positions
+                    origins = None
+                data.book_stats[book.book_id] = compute_book_report_stats(
+                    rows,
+                    data.translation_types.get(book.book_id, data.translation_types.get("default")),
+                    data.null_row_justification.get(book.book_id, ""),
+                    origins,
+                )
+        lost = sorted(
+            str(p.relative_to(project.data_dir))
+            for base in (project.data_dir / "labels" / book.book_id, project.data_dir / "pages" / book.book_id)
+            if base.exists()
+            for p in base.rglob("missing")
+            if p.is_dir()
+        )
+        if lost:
+            data.missing_pages[book.book_id] = lost
     return data
 
 
@@ -420,6 +644,29 @@ def validate_report_data(data: ReportData) -> list[str]:
             issues.append(f"REPORT_MEMBER_INCOMPLETE:{member.student_id or member.full_name}")
     if not data.metrics:
         issues.append("REPORT_METRICS_MISSING")
+    for member in data.members:
+        if not member.full_name.strip():
+            issues.append(f"REPORT_MEMBER_NAME_MISSING:{member.student_id or '?'}")
+        if not member.student_id.strip():
+            issues.append(f"REPORT_MEMBER_ID_MISSING:{member.full_name or '?'}")
+        if not member.email.strip():
+            issues.append(f"REPORT_MEMBER_EMAIL_MISSING:{member.student_id or member.full_name or '?'}")
+    book_ids = list(data.book_stats) or [m.book_id for m in data.metrics]
+    for book_id in book_ids:
+        st = data.book_stats.get(book_id)
+        declared = st["translation_declared"] if st else bool(
+            data.translation_types.get(book_id, data.translation_types.get("default"))
+        )
+        if not declared:
+            issues.append(f"REPORT_TRANSLATION_TYPE_MISSING:{book_id}")
+        if st and st["null_rows"] and not st["null_justification"].strip():
+            issues.append(f"REPORT_NULL_JUSTIFICATION_MISSING:{book_id}")
+        if st:
+            for problem in st.get("placeholder_problems", []):
+                issues.append(f"REPORT_{problem.split(':', 1)[0]}:{book_id}")
+            for code in st.get("placeholder_codes", {}):
+                if code != "unknown" and not data.placeholder_descriptions.get(code, "").strip():
+                    issues.append(f"REPORT_PLACEHOLDER_DESCRIPTION_MISSING:{book_id}:{code}")
     for screenshot in data.screenshots:
         if screenshot.required and not screenshot.path.exists():
             issues.append(f"REPORT_SCREENSHOT_MISSING:{screenshot.caption}:{screenshot.path}")
@@ -439,5 +686,9 @@ def report_summary_json(data: ReportData) -> dict[str, Any]:
             {"caption": s.caption, "path": str(s.path), "book_id": s.book_id, "exists": s.path.exists()}
             for s in data.screenshots
         ],
+        "book_stats": data.book_stats,
+        "translation_types": data.translation_types,
+        "missing_pages": data.missing_pages,
+        "confidence_note": data.confidence_note or _default_confidence_note(),
         "validation": validate_report_data(data),
     }

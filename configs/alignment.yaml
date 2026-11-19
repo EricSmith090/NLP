@@ -12,7 +12,11 @@ alignment:
     T1_CamPhong_Tap1:
       segmentation: charalign
     T1_CamPhong_Tap2:
-      segmentation: cosegment
+      # 2026-11-19: charalign (was cosegment). With the Vintern-1B-v3.5 QN text and
+      # the upside-down pages fixed, charalign aligns Tap2 in ~80 s with 0 null and
+      # 0 one-sided rows, SYNC clean, v2.4 score 87.38; the cosegment DP ran > 85 min
+      # without finishing and its last run left 718/1315 null rows.
+      segmentation: charalign
   # Length ratio is a weak but cheap prior for phonetic translation.
   expected_syllables_per_nom_char: 1.0
   max_group: 4

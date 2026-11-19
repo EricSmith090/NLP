@@ -58,3 +58,31 @@ citations:
   - "Hướng dẫn sử dụng API Kim Hán Nôm, phiên bản 2026-10-10."
   - "Mô tả dữ liệu từ điển Hán Nôm và Quốc ngữ, v1 03/11/2026 (nguồn tùy chọn)."
   - "PyMuPDF 1.28.2; Vintern-1B-v2 (5CD-AI); PaddleOCR 3.7.0; PPOCRLabel; Streamlit 1.51.0; openpyxl 3.1.5."
+
+# v2.4: translation-type declaration per book (ranges in CSV row order, inclusive).
+# Each item: {images: [first_img_id, last_img_id]} or {sentence_ids: [first, last]}
+# or no range key for the whole book, plus type: phonetic | meaning.
+# "default" applies to every book without its own entry. Empty = not declared
+# (validate_report_data reports it). Example:
+#   translation_types:
+#     default:
+#       - {type: phonetic}
+#     T1_CamPhong_Tap1:
+#       - {type: phonetic}
+#       - {sentence_ids: ["0001.1", "0001.4"], type: meaning}
+translation_types: {}
+
+# Justification for rows whose text_diff is null, per book (required if any exist).
+null_row_justification: {}
+
+# Optional override for the Label.txt `confidence` explanation (a default text is built in).
+confidence_note: ""
+# Quy định v2.4: every 〓 must be listed with its position and a description of
+# the glyph's composition. Positions and the original Kim Hán Nôm code of each
+# 〓 are computed automatically; write ONE description per code here, e.g.
+#   "U+F047C": "<cấu tạo chữ, ví dụ ⿰ + bộ thủ + thành phần; âm đọc theo văn cảnh>"
+# Find the codes, counts, contexts and glyph crops with:
+#   python tools/placeholder_catalog.py
+# A code whose glyph turns out to be an encoded Unicode character belongs in
+# configs/khn_pua_map.yaml instead (then it is no longer a 〓).
+placeholder_descriptions: {}

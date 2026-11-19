@@ -48,10 +48,10 @@ class QuotaLedger:
     def __init__(self, state: State, limits: Mapping[str, int], min_delay_seconds: float = 3.0):
         self.state = state
         self.limits = {
-            "minute": int(limits.get("per_minute", limits.get("minute", 25))),
-            "hour": int(limits.get("per_hour", limits.get("hour", 50))),
-            "day": int(limits.get("per_day", limits.get("day", 200))),
-            "week": int(limits.get("per_week", limits.get("week", 600))),
+            "minute": int(limits.get("per_minute", limits.get("minute", 500))),
+            "hour": int(limits.get("per_hour", limits.get("hour", 3000))),
+            "day": int(limits.get("per_day", limits.get("day", 10000))),
+            "week": int(limits.get("per_week", limits.get("week", 70000))),
         }
         self.min_delay_seconds = float(min_delay_seconds)
 

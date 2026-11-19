@@ -208,12 +208,18 @@ def charalign_cmd(
 
 
 @app.command()
-def labels(config: str = "configs/project.yaml", book: Optional[str] = None):
+def labels(
+    config: str = "configs/project.yaml",
+    book: Optional[str] = None,
+    overwrite_reviewed: bool = typer.Option(
+        False, "--overwrite-reviewed", help="Regenerate Label.txt even if reviewer text edits exist (discards them)"
+    ),
+):
     """Generate PPOCRLabel Label.txt and fileState.txt."""
     project = _project(config)
     with open_state(project) as state:
         for item in _books(project, book):
-            counts = stage_labels(project, item, state)
+            counts = stage_labels(project, item, state, overwrite_reviewed=overwrite_reviewed)
             console.print(f"[green]{item.book_id}[/]: {counts}")
 
 

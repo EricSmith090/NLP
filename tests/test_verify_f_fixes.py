@@ -154,7 +154,7 @@ def test_recompute_replaces_stale_diff_flags():
             "ALIGNED",
         ]
     )
-    out = recompute_text_diff([row], lexicon=lex, dictionary=None)[0]
+    out = recompute_text_diff([row], lexicon=lex, dictionary=None, alignment_config={"text_diff_policy": "legacy"})[0]
     flags = set(out.flags)
     # Stale re-derivable flags are gone.
     assert "DIFF_READING_MISMATCH" not in flags
@@ -172,10 +172,22 @@ def test_recompute_replaces_stale_diff_flags():
 def test_recompute_clears_stale_textdiff_invalid_when_recomputed_clean():
     lex = _FakeLexicon({})  # no evidence -> valid empty diff
     row = _row(["TEXT_DIFF_INVALID", "IMAGE_REC_FALLBACK"])
-    out = recompute_text_diff([row], lexicon=lex, dictionary=None)[0]
+    out = recompute_text_diff([row], lexicon=lex, dictionary=None, alignment_config={"text_diff_policy": "legacy"})[0]
     assert "TEXT_DIFF_INVALID" not in out.flags
     assert "IMAGE_REC_FALLBACK" in out.flags
     assert "DIFF_UNVERIFIED_NO_BOOK_READINGS" in out.flags
+
+
+def test_recompute_spec_policy_replaces_stale_flags_and_reds_unknown():
+    # v2.4 (default policy): stale re-derivable flags are replaced; a Nôm
+    # character with no known reading is red, never silently black.
+    row = _row(["DIFF_READING_MISMATCH", "REVIEW:DICT_MISS", "TEXT_DIFF_INVALID", "IMAGE_REC_FALLBACK", "ALIGNED"])
+    out = recompute_text_diff([row], lexicon=_FakeLexicon({"一": ["một"]}), dictionary=None)[0]
+    flags = set(out.flags)
+    assert "TEXT_DIFF_INVALID" not in flags and "REVIEW:DICT_MISS" not in flags
+    assert "DIFF_POLICY_SPEC_V24" in flags and {"IMAGE_REC_FALLBACK", "ALIGNED"} <= flags
+    unknown = recompute_text_diff([_row(["ALIGNED"])], lexicon=_FakeLexicon({}), dictionary=None)[0]
+    assert unknown.text_diff and all(e.type == "error" for e in unknown.text_diff)
 
 
 def test_recompute_keeps_non_one_to_one_null_row():

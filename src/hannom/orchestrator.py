@@ -42,7 +42,7 @@ from .report import (
     report_summary_json,
     validate_report_data,
 )
-from .review.patches import apply_patches, read_patches
+from .review.patches import apply_patches, apply_patches_checked, read_patches
 from .review_decisions import apply_decisions, decision_path, parse_decisions
 from .review_metadata import load_rows_with_metadata
 from .state import State, iso, utc_now
@@ -141,29 +141,150 @@ def _sort_lines(lines: Sequence[OCRLine], script: str) -> list[OCRLine]:
     return sorted(lines, key=key)
 
 
-def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict[str, Any]:
+def _union_points(lines: Sequence[OCRLine]) -> tuple[tuple[float, float], ...]:
+    xs = [p[0] for line in lines for p in line.points]
+    ys = [p[1] for line in lines for p in line.points]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    return ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+
+
+def order_and_clean_page(
+    book_id: str,
+    page: PageRecord,
+    script: str,
+    ocr_lines: Sequence[OCRLine],
+    running_lines: set[str] | None,
+    *,
+    reverse_nom: bool = False,
+    strip_texts: frozenset[str] = frozenset(),
+) -> tuple[CleanedPage, list[OCRLine]]:
+    """One canonical text per page, shared by the labels and clean stages.
+
+    Doc/FIX_PLAN_v24.md T1.1-T1.3 (RC1-RC3): Label.txt, data/clean and the
+    CSV must carry the same text. Nôm boxes keep the API reading order
+    (reversed for pages scanned upside-down, RC10); the whole page is cleaned
+    once and each box's transcription is the concatenation of the cleaned
+    lines that came from it. QN pages become one box (the OCR box, or the
+    union of the boxes) whose transcription is the whole cleaned page text.
+    Invariant: "".join(box texts) == cleaned.text for Nôm, and the single QN
+    box text == cleaned.text.
+    """
+    if script == "nom":
+        from .clean import nom_box_noise, trim_repeat_runs
+
+        ordered = []
+        box_drops: list[dict] = []
+        for line in (reversed(ocr_lines) if reverse_nom else ocr_lines):
+            reason = nom_box_noise(
+                line.text, line.points, line.confidence, float(page.width or 0), float(page.height or 0),
+                mirrored=reverse_nom, strip_texts=strip_texts,
+            )
+            if reason:
+                box_drops.append({"reason": reason, "text": line.text, "confidence": line.confidence})
+                continue
+            text, runs = trim_repeat_runs(line.text, line.confidence)
+            for run in runs:
+                box_drops.append({"reason": "repeat_run", "text": run, "confidence": line.confidence})
+            if runs and not text.strip():
+                continue
+            ordered.append(line if not runs else OCRLine(
+                text=text, points=line.points, confidence=line.confidence, script=line.script,
+                difficult=line.difficult, extra=line.extra,
+            ))
+        cleaned = clean_page_lines(
+            book_id, page.page_no, page.image_name, "nom", [line.text for line in ordered],
+            running_lines=running_lines,
+        )
+        per_box: dict[int, list[str]] = {}
+        for text, src in zip(cleaned.lines, cleaned.line_sources):
+            per_box.setdefault(src, []).append(text)
+        boxes = [
+            OCRLine(
+                text="".join(per_box[i]),
+                points=line.points,
+                confidence=line.confidence,
+                script=script,
+                difficult=line.difficult,
+                extra=line.extra,
+            )
+            for i, line in enumerate(ordered)
+            if i in per_box
+        ]
+        if reverse_nom and "NOM_ORDER_REVERSED" not in cleaned.flags:
+            cleaned.flags = sorted(set(cleaned.flags) | {"NOM_ORDER_REVERSED"})
+        if box_drops:
+            cleaned.box_drops = box_drops
+            cleaned.flags = sorted(set(cleaned.flags) | {f"{d['reason'].upper()}_REMOVED" for d in box_drops})
+        if "".join(b.text for b in boxes) != cleaned.text:
+            raise RuntimeError(f"{book_id} p{page.page_no}: Nôm label boxes do not rebuild the cleaned text")
+        return cleaned, boxes
+    ordered = _sort_lines(ocr_lines, script)
+    cleaned = clean_page_lines(
+        book_id, page.page_no, page.image_name, script, [line.text for line in ordered],
+        running_lines=running_lines,
+    )
+    source = [line for line in ordered if line.text.strip()]
+    if not cleaned.text or not source:
+        return cleaned, []
+    single = len(source) == 1
+    box = OCRLine(
+        text=cleaned.text,
+        points=source[0].points if single else _union_points(source),
+        confidence=source[0].confidence if single else None,
+        script=script,
+        difficult=source[0].difficult if single else None,
+        extra=source[0].extra if single else {},
+    )
+    return cleaned, [box]
+
+
+def _nom_strip_texts(project: ProjectConfig, book: BookConfig) -> frozenset[str]:
+    """Exact Nôm box texts that are page furniture (e.g. the SLQ running title
+    所𥚇卷), from alignment.per_book.<book>.strip_texts / alignment.strip_texts.
+    Applied at clean time so Label.txt and the CSV drop the same boxes."""
+    import unicodedata as _ud
+
+    raw = project.alignment_config or {}
+    cfg = raw.get("alignment", raw) or {}
+    per_book = (cfg.get("per_book") or {}).get(book.book_id, {}) or {}
+    texts = list(per_book.get("strip_texts") or cfg.get("strip_texts") or [])
+    return frozenset(_ud.normalize("NFC", str(t)).strip() for t in texts if str(t).strip())
+
+
+def _running_lines(pages: Sequence[PageRecord], router: OCRRouter) -> dict[str, set[str]]:
+    """Header/footer lines repeated across pages, keyed by script (nom/qn)."""
+    raw = _raw_lines_by_script(pages, router)
+    return {
+        ("nom" if folder == "ch" else "qn"): detect_running_lines(lines_by_page)
+        for folder, lines_by_page in raw.items()
+        if lines_by_page
+    }
+
+
+def _reviewed_text_edits(project: ProjectConfig, book: BookConfig) -> int:
+    path = project.data_dir / "review" / f"{book.book_id}.patches.jsonl"
+    return sum(1 for p in read_patches(path) if p.field in ("ch_txt", "vi_txt")) if path.exists() else 0
+
+
+def stage_labels(
+    project: ProjectConfig, book: BookConfig, state: State, *, overwrite_reviewed: bool = False
+) -> dict[str, Any]:
+    # Reviewer edits live in Label.txt + CSV (review app). Regenerating
+    # Label.txt from OCR would silently discard them while the CSV keeps them
+    # (patches are re-applied by align) -> SYNC failure and lost work.
+    edits = _reviewed_text_edits(project, book)
+    if edits and not overwrite_reviewed:
+        raise PipelineError(
+            f"{book.book_id}: {edits} reviewer text edit(s) exist (data/review/{book.book_id}.patches.jsonl); "
+            "re-running labels would discard them from Label.txt. Pass --overwrite-reviewed only if that is intended."
+        )
     router = OCRRouter(project, book, state)
     pages = state.pages(book.book_id)
-    # Running-line detection needs cross-page evidence; compute once here so
-    # the label path and the clean path drop the same headers/footers.
-    running: dict[str, set[str]] = {}
-    try:
-        from .clean import detect_running_lines as _detect
-
-        for _script, _folder in (("nom", "ch"), ("qn", "vi")):
-            _lines_by_page = []
-            for _p in pages:
-                if str(_p.folder) != _folder:
-                    continue
-                _res = router.load_result(_p)
-                _lines_by_page.append(
-                    [line.text for line in _res.lines if line.text.strip()] if _res else []
-                )
-            if _lines_by_page:
-                running[_script] = _detect(_lines_by_page)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[hannom] labels: running-lines detection disabled for {book.book_id}: {exc}")
-        running = {}
+    # Running-line detection needs cross-page evidence; the label path and
+    # the clean path share one helper so they drop the same headers/footers.
+    running = _running_lines(pages, router)
+    reversed_pages = set(book.nom_reversed_pages)
+    strip_texts = _nom_strip_texts(project, book)
     by_folder: dict[str, list[PageRecord]] = {}
     for page in pages:
         by_folder.setdefault(str(page.folder), []).append(page)
@@ -193,28 +314,11 @@ def stage_labels(project: ProjectConfig, book: BookConfig, state: State) -> dict
                 boxes_by_image[page.image_name] = []
                 continue
             script = _label_script(folder)
-            lines = _sort_lines(result.lines, script)
-            cleaned_lines: list[OCRLine] = []
-            for line in lines:
-                if not line.text.strip():
-                    continue
-                cleaned = clean_page_lines(
-                    book.book_id, page.page_no, page.image_name, script, [line.text],
-                    running_lines=running.get(script),
-                )
-                text = cleaned.lines[0] if cleaned.lines else ""
-                if not text:
-                    continue
-                cleaned_lines.append(
-                    OCRLine(
-                        text=text,
-                        points=line.points,
-                        confidence=line.confidence,
-                        script=script,
-                        difficult=line.difficult,
-                        extra=line.extra,
-                    )
-                )
+            _cleaned, cleaned_lines = order_and_clean_page(
+                book.book_id, page, script, result.lines, running.get(script),
+                reverse_nom=script == "nom" and page.page_no in reversed_pages,
+                strip_texts=strip_texts,
+            )
             boxes_by_image[page.image_name] = [
                 line_to_box(line, page.width, page.height) for line in cleaned_lines
             ]
@@ -264,13 +368,11 @@ def _raw_lines_by_script(pages: Sequence[PageRecord], router: OCRRouter) -> dict
 def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[str, Any]:
     router = OCRRouter(project, book, state)
     pages = state.pages(book.book_id)
-    raw = _raw_lines_by_script(pages, router)
-    running = {
-        script: detect_running_lines(lines_by_page)
-        for script, lines_by_page in raw.items()
-        if lines_by_page
-    }
+    running = _running_lines(pages, router)
+    reversed_pages = set(book.nom_reversed_pages)
+    strip_texts = _nom_strip_texts(project, book)
     out_dir = _book_stage(project, book, state, "clean")
+    dropped_log: list[dict] = []
     count = 0
     flags: dict[str, int] = {}
     for page in pages:
@@ -280,14 +382,13 @@ def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[
         if result is None:
             continue
         script = "nom" if page.folder == "ch" else "qn"
-        cleaned = clean_page_lines(
-            book.book_id,
-            page.page_no,
-            page.image_name,
-            script,
-            [line.text for line in result.lines],
-            running_lines=running.get("ch" if script == "nom" else "vi"),
+        cleaned, _boxes = order_and_clean_page(
+            book.book_id, page, script, result.lines, running.get(script),
+            reverse_nom=script == "nom" and page.page_no in reversed_pages,
+            strip_texts=strip_texts,
         )
+        for drop in cleaned.box_drops:
+            dropped_log.append({"page_no": page.page_no, "image_name": page.image_name, **drop})
         text_issues = validate_clean_text(cleaned.text, script)
         if text_issues:
             if "CLEAN_TEXT_INVALID" not in cleaned.flags:
@@ -301,6 +402,10 @@ def stage_clean(project: ProjectConfig, book: BookConfig, state: State) -> dict[
             merged = sorted(set(page.review_flags + cleaned.flags))
             state.update_page(book.book_id, page.page_no, review_flags=merged)
     summary = {"pages": count, "flags": dict(sorted(flags.items())), "running_lines": {k: len(v) for k, v in running.items()}}
+    summary["box_drops"] = {r: sum(1 for d in dropped_log if d["reason"] == r) for r in sorted({d["reason"] for d in dropped_log})}
+    with (out_dir / "dropped.jsonl").open("w", encoding="utf-8", newline="\n") as fh:
+        for item in dropped_log:
+            fh.write(json.dumps(item, ensure_ascii=False) + "\n")
     write_json(out_dir / "summary.json", summary)
     return summary
 
@@ -404,9 +509,11 @@ def recompute_text_diff(
     force_recompute: bool = False,
     alignment_config: dict | None = None,
 ) -> list[AlignmentRow]:
-    from .textdiff import auto_text_diff, validate_text_diff, variant_fold_from_config
+    from .textdiff import auto_text_diff, spec_text_diff, validate_text_diff, variant_fold_from_config
 
     single_fold = variant_fold_from_config(alignment_config)
+    _cfg = (alignment_config or {}).get("alignment", alignment_config or {}) or {}
+    policy = str(_cfg.get("text_diff_policy", "spec"))
     out: list[AlignmentRow] = []
     for row in rows:
         if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
@@ -433,20 +540,24 @@ def recompute_text_diff(
             # finds.
             out.append(row)
             continue
-        diff = auto_text_diff(
-            row.ch_txt,
-            row.vi_txt,
-            lexicon=lexicon,
-            dictionary=dictionary,
-            readings_cache=readings_cache,
-            strict_reading_mismatch=False,
-            # Book 3's Quốc ngữ translation is transcribed in modern/mixed
-            # orthography; hvdic readings are recorded archaically, so exact
-            # matching under-rejects. Flat matching is still a 1-1 phonetic
-            # claim — it does not invent readings.
-            allow_flat_match=True,
-            allow_variant_fold=single_fold,
-        )
+        if policy == "legacy":
+            diff = auto_text_diff(
+                row.ch_txt,
+                row.vi_txt,
+                lexicon=lexicon,
+                dictionary=dictionary,
+                readings_cache=readings_cache,
+                strict_reading_mismatch=False,
+                # Legacy only: flat (all-diacritic) matching is more lenient
+                # than Quy định v2.4, which removes only the 5 tone marks.
+                allow_flat_match=True,
+                allow_variant_fold=single_fold,
+            )
+        else:
+            # v2.4 / official checker semantics (FIX_PLAN T3.2, RC5/RC7).
+            diff = spec_text_diff(
+                row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+            )
         row.text_diff = diff.elements
         row.flags = sorted(
             {flag for flag in row.flags if not _rederivable_text_diff_flag(flag)}
@@ -539,7 +650,13 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     # (see review_decisions.apply_decisions); a log-wide integrity failure
     # fails the learning step closed for the whole book.
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    rows = apply_patches(rows, patches)
+    rows, rejected_patches = apply_patches_checked(rows, patches)
+    if rejected_patches:
+        print(
+            f"[hannom] align: {book.book_id}: {len(rejected_patches)} review patch(es) no longer match "
+            f"their row and were NOT applied (see summary.json review_patches_rejected)",
+            flush=True,
+        )
     decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
     rows, review_issues, review_audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
     learned = learn_for_book(lexicon, rows, dictionary, failures)
@@ -553,7 +670,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     )
     # Apply patches and decisions again so human content and review
     # decisions always win over the automatic recomputation.
-    rows = apply_patches(rows, patches)
+    rows, _ = apply_patches_checked(rows, patches)
     rows, _, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
@@ -566,12 +683,25 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         "lexicon_revocation": revocation,
         "review_decision_issues": review_issues,
         "review_decision_audit": review_audit,
+        "review_patches_rejected": [
+            {"sentence_id": r.patch.sentence_id, "field": r.patch.field, "reason": r.reason} for r in rejected_patches
+        ],
         "stats": align_stats or None,
         "flags": {
             flag: sum(1 for row in rows if flag in row.flags)
             for flag in sorted({flag for row in rows for flag in row.flags})
         },
     }
+    # Label.txt <-> CSV SYNC with the official normalisation (FIX_PLAN T1.4).
+    # Reported here for diagnosis; packaging refuses a book that is out of sync.
+    from .sync_check import check_book_dir
+
+    label_root = project.data_dir / "labels" / book.book_id
+    sync_errors = check_book_dir(label_root, csv_path, pairs) if (label_root / "ch" / "Label.txt").exists() else ["labels missing"]
+    summary["sync_errors"] = sync_errors
+    write_json(csv_path.parent / "sync_check.json", {"book_id": book.book_id, "errors": sync_errors})
+    if sync_errors:
+        print(f"[hannom] align: {book.book_id} Label.txt/CSV out of SYNC: {sync_errors[0]}", flush=True)
     write_json(csv_path.parent / "summary.json", summary)
     state.set_artifact(book.book_id, "align", "csv", csv_path, meta={"rows": len(rows)})
     return rows, summary

@@ -10,6 +10,7 @@ import csv
 import hashlib
 import json
 import shutil
+import unicodedata
 import warnings
 import zipfile
 from dataclasses import dataclass
@@ -380,6 +381,31 @@ def split_submission_zip(project: ProjectConfig, zip_path: Path, output_dir: Pat
     return created
 
 
+# v2.4 fixed colour sets (either pair is legal): red FF0000 or D32F2F,
+# yellow FFFF00 or D99A00, black 000000. Theme/indexed colours are not
+# allowed (their RGB depends on the viewer). FIX_PLAN validator item.
+_RED_RGB = frozenset({"FF0000", "D32F2F"})
+_YELLOW_RGB = frozenset({"FFFF00", "D99A00"})
+_BLACK_RGB = frozenset({"000000"})
+
+
+def _colour_kind(color: Any) -> str:
+    """'error' | 'warn' | 'black' | 'invalid' for one rich-text font colour."""
+    if color is None:
+        return "black"
+    rgb = getattr(color, "rgb", color)
+    if getattr(color, "type", "rgb") not in (None, "rgb") or not isinstance(rgb, str):
+        return "invalid"
+    hex6 = rgb[-6:].upper()
+    if hex6 in _RED_RGB:
+        return "error"
+    if hex6 in _YELLOW_RGB:
+        return "warn"
+    if hex6 in _BLACK_RGB:
+        return "black"
+    return "invalid"
+
+
 def read_xlsx_spans(path: str | Path) -> list[dict[str, Any]]:
     """Read rich-text colour spans from the ch/vi columns for validation."""
     from openpyxl import load_workbook
@@ -393,18 +419,20 @@ def read_xlsx_spans(path: str | Path) -> list[dict[str, Any]]:
             value = cell.value
             if column in {"C", "D"} and isinstance(value, CellRichText):
                 spans = []
+                bad: list[list[int]] = []
                 cursor = 0
                 for block in value:
                     text = block.text if hasattr(block, "text") else str(block)
                     color = None
                     if hasattr(block, "font") and block.font is not None:
                         color = block.font.color
-                        if hasattr(color, "rgb"):
-                            color = color.rgb
-                    if color in {RED, YELLOW, "FFFF0000", "FFFFFF00"}:
-                        spans.append([cursor, cursor + len(text), "error" if color in {RED, "FFFF0000"} else "warn"])
+                    kind = _colour_kind(color)
+                    if kind in {"error", "warn"}:
+                        spans.append([cursor, cursor + len(text), kind])
+                    elif kind == "invalid" and text.strip():
+                        bad.append([cursor, cursor + len(text)])
                     cursor += len(text)
-                record[column] = {"text": str(value), "spans": spans}
+                record[column] = {"text": str(value), "spans": spans, "invalid_colours": bad}
             else:
                 record[column] = "" if value is None else str(value)
         rows.append(record)
@@ -484,6 +512,12 @@ def validate_book_package(
                 vi_to_nom_offset=getattr(book, "vi_to_nom_offset", None),
             ):
                 issues.append(PackageIssue("IMAGE_MAP_INVALID", msg, path=str(book_dir)))
+            # Label.txt <-> CSV SYNC, official normalisation (FIX_PLAN T1.4): blocking.
+            if csv_path.exists() and (book_dir / "ch" / "Label.txt").exists():
+                from .sync_check import check_book_dir
+
+                for msg in check_book_dir(book_dir, csv_path, img_map_pairs):
+                    issues.append(PackageIssue("SYNC", msg, path=str(book_dir)))
         except Exception as exc:  # noqa: BLE001
             issues.append(PackageIssue("IMAGE_MAP_INVALID", str(exc), path=str(book_dir)))
 
@@ -550,6 +584,26 @@ def validate_book_package(
                 issues.append(PackageIssue("EMPTY_CSV_KEY", "img_id/sentence_id is empty", path=str(csv_path)))
             if "\n" in row.ch_txt or "\n" in row.vi_txt:
                 issues.append(PackageIssue("CSV_NEWLINE", row.sentence_id, path=str(csv_path)))
+            # v2.4 row rules the instructors' checker enforces (FIX_PLAN validator item).
+            if bool(row.ch_txt.strip()) != bool(row.vi_txt.strip()):
+                issues.append(PackageIssue("CSV_ONE_SIDED_ROW", row.sentence_id, path=str(csv_path)))
+            for label, cell in (("ch_txt", row.ch_txt), ("vi_txt", row.vi_txt)):
+                if unicodedata.normalize("NFC", cell) != cell:
+                    issues.append(PackageIssue("CSV_NOT_NFC", f"{row.sentence_id} {label}", path=str(csv_path)))
+                if any(0xFE00 <= ord(c) <= 0xFE0F or 0xE0100 <= ord(c) <= 0xE01EF for c in cell):
+                    issues.append(PackageIssue("CSV_VARIATION_SELECTOR", f"{row.sentence_id} {label}", path=str(csv_path)))
+            if "TEXT_DIFF_EMPTY_CELL" in row.flags:
+                issues.append(PackageIssue("CSV_TEXT_DIFF_EMPTY", row.sentence_id, path=str(csv_path)))
+            for element in row.text_diff or []:
+                if element.type == "warn" and element.suggest is not None:
+                    issues.append(
+                        PackageIssue("CSV_SUGGEST_PENDING", f"{row.sentence_id}: {element.nom_sub_text}", path=str(csv_path))
+                    )
+                if element.type == "warn" and element.reviewed != 1:
+                    issues.append(
+                        PackageIssue("CSV_WARN_UNREVIEWED", f"{row.sentence_id}: {element.nom_sub_text}",
+                                     path=str(csv_path), severity="warning")
+                    )
             from .textdiff import validate_text_diff
 
             for problem in validate_text_diff(row.ch_txt, row.vi_txt, row.text_diff):
@@ -592,6 +646,15 @@ def validate_book_package(
                 for column in ("C", "D"):
                     cell = xlsx_row.get(column)
                     spans = cell.get("spans", []) if isinstance(cell, dict) else []
+                    if isinstance(cell, dict) and cell.get("invalid_colours"):
+                        issues.append(
+                            PackageIssue(
+                                "XLSX_COLOUR_INVALID",
+                                f"{csv_row.sentence_id} column {column}: colour outside 000000/FF0000/FFFF00 "
+                                f"or D32F2F/D99A00 (theme colours are not allowed)",
+                                path=str(xlsx_path),
+                            )
+                        )
                     csv_spans = []
                     if column == "C" and expected["C"]:
                         for element in expected["C"]:
@@ -629,7 +692,13 @@ def validate_source_zip(path: Path) -> list[PackageIssue]:
             parts = set(Path(name).parts)
             if parts & {"data", "models", "artifacts", ".git", "CV20-24127189"}:
                 issues.append(PackageIssue("SOURCE_CONTAINS_DATA", name, path=str(path)))
-            if Path(name).name in forbidden_names:
+            base = Path(name).name
+            if (
+                base in forbidden_names
+                or (base.startswith(".env") and base != ".env.example")
+                or ".sqlite3" in base  # state.sqlite3 and its .bak-* copies
+                or base.lower() == "hannom_api.md"  # plaintext account credentials
+            ):
                 issues.append(PackageIssue("SOURCE_CONTAINS_SECRET_OR_STATE", name, path=str(path)))
             if name.lower().endswith(".pdf"):
                 issues.append(PackageIssue("SOURCE_CONTAINS_PDF", name, path=str(path)))
@@ -637,7 +706,7 @@ def validate_source_zip(path: Path) -> list[PackageIssue]:
             if required not in names:
                 issues.append(PackageIssue("SOURCE_MISSING", required, path=str(path)))
         for name in names:
-            if not name.lower().endswith((".py", ".md", ".toml", ".yaml", ".yml", ".txt", ".example")):
+            if not name.lower().endswith((".py", ".md", ".toml", ".yaml", ".yml", ".txt", ".example", ".json", ".cfg", ".ini")):
                 continue
             try:
                 text = zf.read(name).decode("utf-8", errors="ignore")
@@ -649,4 +718,8 @@ def validate_source_zip(path: Path) -> list[PackageIssue]:
                 # source code are not secrets.
                 if value and not value.startswith("<") and "package.py" not in name:
                     issues.append(PackageIssue("SOURCE_CONTAINS_TOKEN", name, path=str(path)))
+            import re as _re
+
+            if _re.search(r"Bearer\s+[A-Za-z0-9._\-]{20,}", text) and "package.py" not in name:
+                issues.append(PackageIssue("SOURCE_CONTAINS_TOKEN", f"{name}: bearer token", path=str(path)))
     return issues

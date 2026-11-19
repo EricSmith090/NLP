@@ -79,15 +79,27 @@ class DiffElement:
     vi_pos: tuple[tuple[int, int], ...]
     vi_sub_text: str
     type: Literal["warn", "error"]
+    # v2.4: only `warn` elements may carry these (reviewed 0/1, a one-char
+    # suggestion and its source); `error` elements keep exactly 5 keys.
+    reviewed: int | None = None
+    suggest: str | None = None
+    suggest_by: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "nom_pos": [list(p) for p in self.nom_pos],
             "nom_sub_text": self.nom_sub_text,
             "vi_pos": [list(p) for p in self.vi_pos],
             "vi_sub_text": self.vi_sub_text,
             "type": self.type,
         }
+        if self.type == "warn":
+            out["reviewed"] = 1 if self.reviewed == 1 else 0
+            if self.suggest is not None:
+                out["suggest"] = self.suggest
+                if self.suggest_by is not None:
+                    out["suggest_by"] = self.suggest_by
+        return out
 
 
 @dataclass

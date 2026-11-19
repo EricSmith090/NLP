@@ -159,7 +159,9 @@ def make_element(
 
 
 def _is_letter(ch: str) -> bool:
-    return is_nom_char(ch) or ch.isalpha()
+    """A character allowed at the edge of a span (v2.4, official `EDGE`):
+    a letter of either script, a digit, or the placeholder 〓."""
+    return is_nom_char(ch) or ch == "\u3013" or ch.isalpha() or ch.isdigit()
 
 
 def validate_element(nom: str, vi: str, element: DiffElement) -> list[str]:
@@ -579,6 +581,191 @@ def auto_text_diff(
     )
 
 
+# --- v2.4 / official-checker text_diff (FIX_PLAN T3.2, RC5/RC7) ----------
+#
+# Same semantics as ocr-nom-align v0.2.0 `diff.text_diff` with its defaults
+# (independent implementation over this repo's readings): a weighted
+# Levenshtein between Nôm characters and QN tokens (syllables and numbers);
+# a character matches a syllable when the syllable, with the five tone marks
+# removed, equals one of the character's readings with the tone marks removed
+# (breve, circumflex, horn and đ still count); 〓 and characters with no known
+# reading are red; every maximal run of unmatched characters, unmatched
+# syllables and extra tokens on either side becomes one element; a run that
+# holds a number is yellow (`warn`, reviewed 0), everything else is red.
+
+SPEC_TONE_MARKS = frozenset("\u0300\u0301\u0303\u0309\u0323")
+_SPEC_VI_TOKEN_RE = re.compile(r"\d+|[^\W\d_]+")
+_SPEC_HAN = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0x20000, 0x323AF),
+             (0xE000, 0xF8FF), (0xF0000, 0xFFFFD))
+_SPEC_COST = {"match": 0.0, "mismatch": 1.0, "placeholder": 1.0, "unknown": 0.5, "num": 0.5}
+_SPEC_GAP = 1.0
+_EPS = 1e-9
+
+
+def tone_key(syllable: str) -> str:
+    """NFC, lower-case, the five tone marks removed (keeps ă â ê ô ơ ư đ)."""
+    s = unicodedata.normalize("NFD", unicodedata.normalize("NFC", syllable).lower())
+    return unicodedata.normalize("NFC", "".join(c for c in s if c not in SPEC_TONE_MARKS))
+
+
+def spec_is_nom_char(ch: str) -> bool:
+    cp = ord(ch)
+    return ch == "\u3013" or any(a <= cp <= b for a, b in _SPEC_HAN)
+
+
+def _spec_segments(nom: str, vi: str) -> list[tuple[list[tuple[int, int, str, str]], list[tuple[int, int, str, str]]]]:
+    def nom_tokens(a: int, b: int):
+        return [(i, i + 1, nom[i], "han") for i in range(a, b) if spec_is_nom_char(nom[i])]
+
+    def vi_tokens(a: int, b: int):
+        return [(m.start(), m.end(), m.group(), "num" if m.group()[0].isdigit() else "syl")
+                for m in _SPEC_VI_TOKEN_RE.finditer(vi, a, b)]
+
+    cs, vs = mask_spans_official(nom), mask_spans_official(vi)
+    if len(cs) != len(vs):  # masks do not pair up: align the cells jointly
+        return [([t for a, b in cs for t in nom_tokens(a, b)], [t for a, b in vs for t in vi_tokens(a, b)])]
+    return [(nom_tokens(a, b), vi_tokens(c, d)) for (a, b), (c, d) in zip(cs, vs)]
+
+
+def mask_spans_official(text: str) -> list[tuple[int, int]]:
+    """Text between [MASK] markers (empty spans kept, so both cells pair by index)."""
+    out, pos = [], 0
+    while True:
+        k = text.find(MASK, pos)
+        if k < 0:
+            out.append((pos, len(text)))
+            return out
+        out.append((pos, k))
+        pos = k + len(MASK)
+
+
+def spec_text_diff(
+    nom: str,
+    vi: str,
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    warn_numbers: bool = True,
+) -> DiffResult:
+    nom = nfc(nom)
+    vi = nfc(vi)
+    keys_cache: dict[str, frozenset[str]] = {}
+    sources: dict[str, str] = {}
+
+    def keys(ch: str) -> frozenset[str]:
+        if ch not in keys_cache:
+            readings, source = gather_readings(ch, lexicon=lexicon, dictionary=dictionary, readings=readings_cache)
+            keys_cache[ch] = frozenset(tone_key(r) for r in readings if r and r.strip())
+            sources[ch] = source
+        return keys_cache[ch]
+
+    def classify(c: tuple, t: tuple) -> str:
+        if c[2] == "\u3013":
+            return "placeholder"
+        if t[3] == "num":
+            return "num"
+        ks = keys(c[2])
+        if not ks:
+            return "unknown"
+        return "match" if tone_key(t[2]) in ks else "mismatch"
+
+    elements: list[DiffElement] = []
+    flags: list[str] = []
+    review: list[str] = []
+    n_nom = matched = unknown_chars = placeholders = 0
+    for nt, vt in _spec_segments(nom, vi):
+        n_nom += len(nt)
+        n, m = len(nt), len(vt)
+        d = [[0.0] * (m + 1) for _ in range(n + 1)]
+        for i in range(1, n + 1):
+            d[i][0] = i * _SPEC_GAP
+        for j in range(1, m + 1):
+            d[0][j] = j * _SPEC_GAP
+        kinds: dict[tuple[int, int], str] = {}
+        for i in range(1, n + 1):
+            prev, row = d[i - 1], d[i]
+            for j in range(1, m + 1):
+                kind = classify(nt[i - 1], vt[j - 1])
+                kinds[(i - 1, j - 1)] = kind
+                row[j] = min(prev[j - 1] + _SPEC_COST[kind], prev[j] + _SPEC_GAP, row[j - 1] + _SPEC_GAP)
+        ops: list[tuple[str, int | None, int | None]] = []
+        i, j = n, m
+        while i > 0 or j > 0:  # ties prefer a gap (surplus tokens land last)
+            if i > 0 and abs(d[i][j] - (d[i - 1][j] + _SPEC_GAP)) < _EPS:
+                ops.append(("d", i - 1, None))
+                i -= 1
+            elif j > 0 and abs(d[i][j] - (d[i][j - 1] + _SPEC_GAP)) < _EPS:
+                ops.append(("i", None, j - 1))
+                j -= 1
+            else:
+                ops.append(("s", i - 1, j - 1))
+                i, j = i - 1, j - 1
+        ops.reverse()
+        run_n: list[tuple] = []
+        run_v: list[tuple] = []
+
+        def flush() -> None:
+            if not run_n and not run_v:
+                return
+            if any(t[2] == "\u3013" for t in run_n):
+                kind = "error"
+            elif warn_numbers and run_n and any(t[3] == "num" for t in run_v):
+                kind = "warn"
+            else:
+                kind = "error"
+            nom_spans = [[run_n[0][0], run_n[-1][1]]] if run_n else []
+            vi_spans = [[run_v[0][0], run_v[-1][1]]] if run_v else []
+            el = make_element(nom, vi, nom_spans, vi_spans, kind)
+            if kind == "warn":
+                el = DiffElement(el.nom_pos, el.nom_sub_text, el.vi_pos, el.vi_sub_text, "warn", reviewed=0)
+            elements.append(el)
+            run_n.clear()
+            run_v.clear()
+
+        for op, a, b in ops:
+            if op == "s":
+                kind = kinds[(a, b)]
+                if kind == "unknown":
+                    unknown_chars += 1
+                if kind == "placeholder":
+                    placeholders += 1
+                if kind == "match":
+                    matched += 1
+                    flush()
+                    continue
+                run_n.append(nt[a])
+                run_v.append(vt[b])
+            elif op == "d":
+                run_n.append(nt[a])
+            else:
+                run_v.append(vt[b])
+        flush()
+    if unknown_chars:
+        flags.append("DIFF_UNKNOWN_NOM_CHARS")
+        review.append("DICT_MISS")
+    if placeholders:
+        flags.append("DIFF_PLACEHOLDER_RED")
+    if any(e.type == "error" for e in elements):
+        flags.append("DIFF_READING_MISMATCH")
+        review.append("DIFF_SEMANTIC")
+    if any(e.type == "warn" for e in elements):
+        flags.append("DIFF_NUMBER_WARN")
+    flags.append("DIFF_POLICY_SPEC_V24")
+    known = sum(1 for c, ks in keys_cache.items() if ks)
+    return DiffResult(
+        elements=elements,
+        flags=sorted(set(flags)),
+        review_reasons=sorted(set(review)),
+        matched_readings=matched,
+        known_nom_chars=known,
+        unknown_nom_chars=len(keys_cache) - known,
+        dictionary_matched_readings=0,
+        dictionary_known_nom_chars=sum(1 for c in keys_cache if "dictionary" in sources.get(c, "")),
+        matched_exact_readings=matched,
+    )
+
+
 def diff_summary(elements: Sequence[DiffElement] | None) -> dict[str, int]:
     if elements is None:
         return {"null": 1}
@@ -604,15 +791,26 @@ def mask_character_count(text: str) -> int:
     return text.count(MASK)
 
 
+def spec_count_nom(text: str) -> int:
+    """Nôm characters as the official checker counts them (Han, PUA, 〓)."""
+    return sum(1 for ch in text if spec_is_nom_char(ch))
+
+
+def spec_count_vi(text: str) -> int:
+    """QN tokens as the official checker counts them (syllables and numbers)."""
+    return len(_SPEC_VI_TOKEN_RE.findall(text))
+
+
 def scoreable_nom_chars(text: str, elements: Sequence[DiffElement] | None = None) -> int:
-    """Count Nôm characters excluding masks and yellow-covered chars."""
-    total = count_nom_chars(text)
+    """Denominator (v2.4): Nôm characters (〓 and PUA included) minus yellow
+    ones; punctuation and [MASK] are not Nôm characters."""
+    total = spec_count_nom(text)
     if elements:
         for element in elements:
             if element.type != "warn":
                 continue
             for start, end in element.nom_pos:
-                total -= sum(1 for ch in text[start:end] if is_nom_char(ch))
+                total -= spec_count_nom(text[start:end])
     return max(0, total)
 
 
@@ -624,7 +822,5 @@ def red_penalty(elements: Sequence[DiffElement] | None) -> int:
     for element in elements:
         if element.type != "error":
             continue
-        nom_chars = count_nom_chars(element.nom_sub_text)
-        qn_syllables = len(QN_TOKEN_RE.findall(element.vi_sub_text))
-        penalty += max(nom_chars, qn_syllables)
+        penalty += max(spec_count_nom(element.nom_sub_text), spec_count_vi(element.vi_sub_text))
     return penalty

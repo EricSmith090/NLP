@@ -22,7 +22,11 @@ engines:
   vintern_1b_v2:
     kind: local
     adapter: "hannom.ocr.local_vintern:VinternEngine"
-    description: "Full-page Vintern-1B-v2 transcription for archaic Vietnamese (benchmark 2026-11-08; ~35 s/page, 2.3 GB VRAM); one full-page box per image"
+    description: "Full-page Vintern-1B-v2 transcription for archaic Vietnamese (benchmark 2026-11-08; ~35 s/page, 2.3 GB VRAM); one full-page box per image. Superseded by vintern_1b_v3_5 (2026-11-19)."
+  vintern_1b_v3_5:
+    kind: local
+    adapter: "hannom.ocr.local_vintern:Vintern35Engine"
+    description: "Full-page Vintern-1B-v3.5 (beams 3, repetition_penalty 2.5, 6 tiles; 2-halves retry on short/looping output). Benchmark 2026-11-19 on 25 QN pages: phonetic recall 0.218 -> 0.707 (failing pages), 0.855 -> 0.897 (normal); ~15-20 s/page, 1.8 GB VRAM. Doc/FIX_PLAN_v24.md T2.1"
 
 routing:
   nom:
@@ -31,10 +35,10 @@ routing:
     low_confidence_threshold: 0.70
     agreement_threshold: 0.85
   quoc_ngu:
-    primary: vintern_1b_v2
+    primary: vintern_1b_v3_5
     # The Kim Hán Nôm API is Hán/Nôm-only and must not receive QN pages.
     second_opinion: none
-    # No fallback configured for QN: Vintern-1B-v2 is the QN engine.
+    # No fallback configured for QN: Vintern-1B-v3.5 is the QN engine.
     low_confidence_threshold: 0.75
     agreement_threshold: 0.85
   api_mode: api_first

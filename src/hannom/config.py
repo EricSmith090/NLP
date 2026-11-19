@@ -22,7 +22,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class OCRSettings:
     nom: tuple[str, ...] = ("paddleocr_vl", "kimhannom")
-    quoc_ngu: tuple[str, ...] = ("vintern_1b_v2",)
+    quoc_ngu: tuple[str, ...] = ("vintern_1b_v3_5",)
     api_mode: str = "api_first"
     sample_pages: int = 12
 
@@ -50,6 +50,10 @@ class BookConfig:
     # built as a deterministic bijection Nôm PDF = vi_to_nom_offset − vi PDF
     # instead of the heuristic DP. Empirical per-book constant.
     vi_to_nom_offset: int | None = None
+    # Nôm PDF pages scanned upside-down (RC10, Doc/FIX_PLAN_v24.md T2.4): the
+    # API reads the characters but returns the columns in reverse reading
+    # order, so the label/clean stages reverse the box order of these pages.
+    nom_reversed_pages: tuple[int, ...] = ()
     ocr: OCRSettings = field(default_factory=OCRSettings)
     review_profile: str = "strict"
 
@@ -178,11 +182,12 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
                     and int(b["vi_to_nom_offset"]) > 0
                     else None
                 ),
+                nom_reversed_pages=tuple(int(x) for x in (b.get("nom_reversed_pages", []) or [])),
                 ocr=OCRSettings(
                     nom=tuple(ocr_raw.get("nom", ["paddleocr_vl", "kimhannom"])),
-                    # quoc_ngu is Vintern-1B-v2 full-page transcription since 2026-11-08
-    # (benchmark verified). The API must stay out of QN.
-    quoc_ngu=tuple(ocr_raw.get("quoc_ngu", ["vintern_1b_v2"])),
+                    # quoc_ngu is Vintern-1B-v3.5 full-page transcription since
+                    # 2026-11-19 (benchmark verified). The API must stay out of QN.
+                    quoc_ngu=tuple(ocr_raw.get("quoc_ngu", ["vintern_1b_v3_5"])),
                     api_mode=str(ocr_raw.get("api_mode", "api_first")),
                     sample_pages=int(ocr_raw.get("sample_pages", 12)),
                 ),

@@ -65,12 +65,14 @@ def test_structurally_plausible_but_unverified_pairing_remains_candidate():
     assert metrics.verified_match_rows == 0
 
 
-def test_unmatched_segments_remain_explicitly_unmatched():
+def test_unmatched_segments_are_absorbed_and_flagged():
+    # v2.4: no one-sided rows; the absorbed residue keeps an explicit flag.
     nom = [_seg("之", "B.001.jpg", 1, 0, "nom"), _seg("其其其其", "B.002.jpg", 2, 1, "nom")]
     qn = [_seg("thì", "B.101.jpg", 1, 0, "qn")]
     rows = align_segments(nom, qn, lexicon=StubLexicon({"之": ["thì"], "其": ["thế"]}))
-    unmatched = [r for r in rows if "UNMATCHED_NOM" in r.flags]
-    assert unmatched and unmatched[0].semantic_confidence == 0.0
+    assert all(r.ch_txt and r.vi_txt for r in rows)
+    merged = [r for r in rows if "MERGED_ONE_SIDED" in r.flags]
+    assert merged and "NON_ONE_TO_ONE" in merged[0].flags
 
 
 def test_semantic_evidence_helper_distinguishes_none_and_coverage():

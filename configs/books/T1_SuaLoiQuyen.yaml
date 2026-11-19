@@ -23,7 +23,7 @@ inventory_misc: [2, 3, 5, 7, 8, 9, 62, 63, 64, 117, 118]
 ocr:
   # API first for Nôm; local engines take over when the quota is reached.
   nom: [kimhannom, paddleocr_vl]
-  quoc_ngu: [vintern_1b_v2]
+  quoc_ngu: [vintern_1b_v3_5]
   api_mode: api_first
   sample_pages: 12
 review_profile: strict

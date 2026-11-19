@@ -96,3 +96,37 @@ def test_submission_zip_contains_books_report_and_source(tmp_path: Path):
     assert "Book/Book.csv" in names
     assert "report.pdf" in names
     assert "source.zip" in names
+
+
+def test_colour_kinds_accept_both_legal_sets_and_reject_theme():
+    from openpyxl.styles.colors import Color
+
+    from hannom.package import _colour_kind
+
+    assert _colour_kind(Color(rgb="FFFF0000")) == "error"
+    assert _colour_kind(Color(rgb="FFD32F2F")) == "error"
+    assert _colour_kind(Color(rgb="FFFFFF00")) == "warn"
+    assert _colour_kind(Color(rgb="00D99A00")) == "warn"
+    assert _colour_kind(Color(rgb="FF000000")) == "black"
+    assert _colour_kind(None) == "black"
+    assert _colour_kind(Color(theme=1)) == "invalid"
+    assert _colour_kind(Color(rgb="FF00FF00")) == "invalid"
+
+
+def test_source_zip_rejects_state_backups_env_variants_and_credentials(tmp_path):
+    import zipfile
+
+    from hannom.package import validate_source_zip
+
+    z = tmp_path / "source.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        for name in ("README.md", "USER_GUIDE.md", "pyproject.toml", ".env.example"):
+            zf.writestr(name, "x")
+        zf.writestr("data_copy/state.sqlite3.bak-2026-11-08", "x")
+        zf.writestr(".env.local", "KIMHANNOM_TOKEN=abc")
+        zf.writestr("hannom_API.md", "user/pass")
+        zf.writestr("notes/cfg.json", '{"auth": "Bearer abcdefghijklmnopqrstuvwxyz0123"}')
+    codes = [(i.code, i.message) for i in validate_source_zip(z)]
+    flagged = {m.split(":")[0] for c, m in codes if c.startswith("SOURCE_CONTAINS")}
+    assert {"data_copy/state.sqlite3.bak-2026-11-08", ".env.local", "hannom_API.md", "notes/cfg.json"} <= flagged
+    assert ".env.example" not in flagged

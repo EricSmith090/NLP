@@ -300,6 +300,11 @@ class KimHanNomClient(OCREngine):
                 raise
             except Exception as exc:  # noqa: BLE001 - transport/parse errors are retried
                 last_error = exc
+                # A timed-out or dropped request may still have reached the
+                # server and used quota: count it (FIX_PLAN T0.3).
+                self.ledger.record(
+                    endpoint, image_sha256, "transport_error", note=f"attempt={attempt}: {type(exc).__name__}"
+                )
                 if attempt >= self.project.api.max_retries:
                     break
                 time.sleep(min(60.0, 2.0**attempt))

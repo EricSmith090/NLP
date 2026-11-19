@@ -18,7 +18,7 @@ import json
 import math
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -27,7 +27,7 @@ from .dictionary.book_lexicon import qn_syllables
 from .models import AlignmentRow, DiffElement
 from .review_metadata import write_review_metadata
 from .t1_map import Pair
-from .textdiff import auto_text_diff, validate_text_diff, variant_fold_from_config
+from .textdiff import auto_text_diff, spec_text_diff, validate_text_diff, variant_fold_from_config
 
 QN_SENTENCE_SPLIT_RE = re.compile(
     r"(?<=[.!?;:\u2026])\s+(?=[" + VIETNAMESE_UPPER_CLASS + r"\"“(\[\d])"
@@ -62,6 +62,10 @@ class TextSegment:
 
 @dataclass
 class AlignConfig:
+    # "spec": text_diff per Quy định v2.4 / official checker (tone-insensitive
+    # readings, unknown and 〓 red, extra syllables red, numbers yellow).
+    # "legacy": the pre-2026-11-19 conservative diff (kept for comparison).
+    text_diff_policy: str = "spec"
     expected_syllables_per_nom_char: float = 1.0
     max_group: int = 4
     max_nm_group: int = 2
@@ -122,6 +126,7 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
     raw = raw_config.get("alignment", raw_config) or {}
     defaults = AlignConfig()
     return AlignConfig(
+        text_diff_policy=str(raw.get("text_diff_policy", defaults.text_diff_policy)),
         expected_syllables_per_nom_char=float(
             raw.get("expected_syllables_per_nom_char", defaults.expected_syllables_per_nom_char)
         ),
@@ -487,6 +492,132 @@ def _group_cost(
     return max(0.0, ratio_cost + group_cost - reading_bonus)
 
 
+# v2.4 forbids rows with one empty side (official `EMPTY` check). The official
+# aligner groups at most 3 sentences per side (ocr_nom_align align.py:250-258);
+# absorbed rows respect the same limit. FIX_PLAN T3.3 / RC6.
+MAX_SENTENCES_PER_SIDE = 3
+
+
+def _merge_segments(first: TextSegment, second: TextSegment) -> TextSegment:
+    """Concatenate two segments of one script; ``first`` keeps its identity."""
+    sep = "" if first.script == "nom" else " "
+    text = first.text + sep + second.text if first.text and second.text else (first.text or second.text)
+    return replace(
+        first,
+        text=text,
+        page_numbers=tuple(dict.fromkeys(first.page_numbers + second.page_numbers)),
+        image_names=tuple(dict.fromkeys(first.image_names + second.image_names)),
+        flags=sorted(set(first.flags) | set(second.flags) | {"MERGED_ONE_SIDED"}),
+    )
+
+
+def absorb_one_sided_segments(
+    nom_segments: Sequence[TextSegment],
+    qn_segments: Sequence[TextSegment],
+    max_side: int = MAX_SENTENCES_PER_SIDE,
+) -> tuple[list[TextSegment], list[TextSegment]]:
+    """Index-aligned 1:1 segment lists (charalign): fold every pair with one
+    empty side into the previous pair, or the next one when the previous is
+    full or absent, so no row has an empty cell. A pair that cannot be folded
+    keeps its own row and is flagged ``ONE_SIDED_UNRESOLVED``."""
+    items = [
+        [n, q, int(bool(n.text)), int(bool(q.text)), True]
+        for n, q in zip(nom_segments, qn_segments)
+        if n.text or q.text
+    ]
+
+    def fits(t: list, n_add: int, q_add: int) -> bool:
+        return t[2] + n_add <= max_side and t[3] + q_add <= max_side
+
+    for i, it in enumerate(items):
+        n, q, cn, cq, alive = it
+        if not alive or bool(n.text) == bool(q.text):
+            continue
+        prev = next((items[k] for k in range(i - 1, -1, -1) if items[k][4]), None)
+        nxt = next((items[k] for k in range(i + 1, len(items)) if items[k][4]), None)
+        if prev is not None and fits(prev, cn, cq):
+            if n.text:
+                prev[0] = _merge_segments(prev[0], n)
+            if q.text:
+                prev[1] = _merge_segments(prev[1], q)
+            prev[2] += cn
+            prev[3] += cq
+            it[4] = False
+        elif nxt is not None and fits(nxt, cn, cq):
+            # This pair comes first in reading order; when it carries the Nôm
+            # text, the merged row starts on its Nôm image.
+            if n.text:
+                nxt[0] = _merge_segments(n, nxt[0])
+            if q.text:
+                nxt[1] = _merge_segments(q, nxt[1])
+            nxt[2] += cn
+            nxt[3] += cq
+            it[4] = False
+        elif prev is not None or nxt is not None:
+            # An empty cell is a hard v2.4 error; the 3-sentence limit is the
+            # official aligner's habit, not a checker rule. Merge anyway and
+            # flag the oversized row for review.
+            target, before = (prev, True) if prev is not None else (nxt, False)
+            over = {"MERGED_OVER_LIMIT"}
+            if n.text:
+                target[0] = _merge_segments(target[0], n) if before else _merge_segments(n, target[0])
+            if q.text:
+                target[1] = _merge_segments(target[1], q) if before else _merge_segments(q, target[1])
+            target[0] = replace(target[0], flags=sorted(set(target[0].flags) | over))
+            target[1] = replace(target[1], flags=sorted(set(target[1].flags) | over))
+            target[2] += cn
+            target[3] += cq
+            it[4] = False
+        else:
+            it[0] = replace(n, flags=sorted(set(n.flags) | {"ONE_SIDED_UNRESOLVED"}))
+            it[1] = replace(q, flags=sorted(set(q.flags) | {"ONE_SIDED_UNRESOLVED"}))
+    kept = [it for it in items if it[4]]
+    return [it[0] for it in kept], [it[1] for it in kept]
+
+
+def absorb_one_sided_groups(
+    groups: Sequence[tuple[int, int, int, int, float, str, int, int]],
+    max_side: int = MAX_SENTENCES_PER_SIDE,
+) -> list[tuple[int, int, int, int, float, str, int, int]]:
+    """DP path: fold every group with an empty side (``skip_nom``/``skip_qn``)
+    into the previous group, or the next one, keeping both index ranges
+    contiguous. Groups that cannot be folded are returned unchanged."""
+    out = [list(g) for g in groups]
+    alive = [True] * len(out)
+
+    def one_sided(g: list) -> bool:
+        return (g[1] - g[0] == 0) != (g[3] - g[2] == 0)
+
+    def merged(first: list, second: list) -> list | None:
+        a = (second[1] - first[0])
+        b = (second[3] - first[2])
+        if a > max_side or b > max_side:
+            return None
+        return [first[0], second[1], first[2], second[3], first[4] + second[4], "absorbed", a, b]
+
+    for k in range(len(out)):
+        if not alive[k] or not one_sided(out[k]):
+            continue
+        prev = next((x for x in range(k - 1, -1, -1) if alive[x]), None)
+        nxt = next((x for x in range(k + 1, len(out)) if alive[x]), None)
+        if prev is not None and (m := merged(out[prev], out[k])) is not None:
+            out[prev] = m
+            alive[k] = False
+        elif nxt is not None and (m := merged(out[k], out[nxt])) is not None:
+            out[nxt] = m
+            alive[k] = False
+        elif prev is not None or nxt is not None:
+            # Over the 3-sentence habit, but never leave an empty cell.
+            if prev is not None:
+                a, b = out[prev], out[k]
+                out[prev] = [a[0], b[1], a[2], b[3], a[4] + b[4], "absorbed", b[1] - a[0], b[3] - a[2]]
+            else:
+                a, b = out[k], out[nxt]
+                out[nxt] = [a[0], b[1], a[2], b[3], a[4] + b[4], "absorbed", b[1] - a[0], b[3] - a[2]]
+            alive[k] = False
+    return [tuple(g) for g, ok in zip(out, alive) if ok]  # type: ignore[misc]
+
+
 def align_segments(
     nom_segments: Sequence[TextSegment],
     qn_segments: Sequence[TextSegment],
@@ -596,6 +727,7 @@ def _dp_solve(
         i -= a
         j -= b
     groups.reverse()
+    groups = absorb_one_sided_groups(groups)
     return _emit_rows(
         groups,
         nom_segments,
@@ -631,6 +763,9 @@ def _emit_rows(
         vi_txt = nfc(" ".join(s.text for s in qn_group).strip()) if qn_group else ""
         if not ch_txt and not vi_txt:
             continue
+        absorbed = kind == "absorbed"
+        if absorbed:
+            kind = "group"
         if kind == "group":
             # A grouped row with an empty side is semantically an unmatched
             # row (the stream carried a whole-sentence gap on one side);
@@ -684,6 +819,10 @@ def _emit_rows(
             flags.extend(segment.flags)
         if evidence_flag:
             flags.append(evidence_flag)
+        if absorbed:
+            flags.append("MERGED_ONE_SIDED")
+        if kind in ("skip_nom", "skip_qn"):
+            flags.append("ONE_SIDED_UNRESOLVED")
         if kind == "skip_nom":
             flags.extend(["UNMATCHED_NOM", "NON_ONE_TO_ONE"])
         elif kind == "skip_qn":
@@ -705,15 +844,20 @@ def _emit_rows(
 
         text_diff: list[DiffElement] | None
         if len(nom_group) == 1 and len(qn_group) == 1 and ch_txt and vi_txt:
-            diff = auto_text_diff(
-                ch_txt,
-                vi_txt,
-                lexicon=lexicon,
-                dictionary=dictionary,
-                readings_cache=readings_cache,
-                strict_reading_mismatch=False,
-                allow_variant_fold=config.variant_fold,
-            )
+            if config.text_diff_policy == "legacy":
+                diff = auto_text_diff(
+                    ch_txt,
+                    vi_txt,
+                    lexicon=lexicon,
+                    dictionary=dictionary,
+                    readings_cache=readings_cache,
+                    strict_reading_mismatch=False,
+                    allow_variant_fold=config.variant_fold,
+                )
+            else:
+                diff = spec_text_diff(
+                    ch_txt, vi_txt, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+                )
             text_diff = diff.elements
             flags.extend(diff.flags)
             if diff.review_reasons:
@@ -779,6 +923,7 @@ def align_book(
                 stats.setdefault("stream_sentences", len(nom_segments))
             if not nom_segments or not qn_segments:
                 return [], warnings + ["NO_SEGMENTS_FOR_ALIGNMENT"]
+            nom_segments, qn_segments = absorb_one_sided_segments(nom_segments, qn_segments)
             # Segments are index-aligned one per QN sentence; force a 1-1 row
             # per sentence. The DP is bypassed entirely for this book class.
             groups: list[tuple[int, int, int, int, float, str, int, int]] = []
@@ -828,31 +973,33 @@ CSV_COLUMNS = ["img_id", "sentence_id", "ch_txt", "vi_txt", "text_diff"]
 
 def row_from_dict(data: dict[str, Any]) -> AlignmentRow:
     raw_diff = data.get("text_diff")
+    extra_flags: list[str] = []
+
+    def element(item: dict[str, Any]) -> DiffElement:
+        warn = item.get("type") == "warn"
+        return DiffElement(
+            nom_pos=tuple(tuple(int(x) for x in p) for p in item.get("nom_pos", [])),
+            nom_sub_text=str(item.get("nom_sub_text", "")),
+            vi_pos=tuple(tuple(int(x) for x in p) for p in item.get("vi_pos", [])),
+            vi_sub_text=str(item.get("vi_sub_text", "")),
+            type=str(item.get("type", "error")),  # type: ignore[arg-type]
+            reviewed=int(item["reviewed"]) if warn and item.get("reviewed") is not None else None,
+            suggest=str(item["suggest"]) if warn and item.get("suggest") is not None else None,
+            suggest_by=str(item["suggest_by"]) if warn and item.get("suggest_by") is not None else None,
+        )
+
     if raw_diff is None:
         elements = None
     elif isinstance(raw_diff, str):
-        value = json.loads(raw_diff) if raw_diff.strip() else []
-        elements = None if value is None else [
-            DiffElement(
-                nom_pos=tuple(tuple(int(x) for x in p) for p in item.get("nom_pos", [])),
-                nom_sub_text=str(item.get("nom_sub_text", "")),
-                vi_pos=tuple(tuple(int(x) for x in p) for p in item.get("vi_pos", [])),
-                vi_sub_text=str(item.get("vi_sub_text", "")),
-                type=str(item.get("type", "error")),  # type: ignore[arg-type]
-            )
-            for item in value
-        ]
+        if not raw_diff.strip():
+            # v2.4: an empty cell is invalid; never read it as "fully matching" [].
+            elements = None
+            extra_flags.append("TEXT_DIFF_EMPTY_CELL")
+        else:
+            value = json.loads(raw_diff)
+            elements = None if value is None else [element(item) for item in value]
     else:
-        elements = [
-            DiffElement(
-                nom_pos=tuple(tuple(int(x) for x in p) for p in item.get("nom_pos", [])),
-                nom_sub_text=str(item.get("nom_sub_text", "")),
-                vi_pos=tuple(tuple(int(x) for x in p) for p in item.get("vi_pos", [])),
-                vi_sub_text=str(item.get("vi_sub_text", "")),
-                type=str(item.get("type", "error")),  # type: ignore[arg-type]
-            )
-            for item in raw_diff
-        ]
+        elements = [element(item) for item in raw_diff]
     return AlignmentRow(
         img_id=str(data.get("img_id", "")),
         sentence_id=str(data.get("sentence_id", "")),
@@ -860,7 +1007,7 @@ def row_from_dict(data: dict[str, Any]) -> AlignmentRow:
         vi_txt=str(data.get("vi_txt", "")),
         text_diff=elements,
         confidence=float(data["confidence"]) if data.get("confidence") is not None else None,
-        flags=list(data.get("flags", []) or []),
+        flags=list(data.get("flags", []) or []) + extra_flags,
     )
 
 

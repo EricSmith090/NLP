@@ -339,8 +339,19 @@ def evaluate_rows(
     if metrics.yellow_ratio is not None and metrics.yellow_ratio > yellow_ratio_warn:
         metrics.warnings.append(f"YELLOW_RATIO_HIGH:{metrics.yellow_ratio:.4f}")
 
+    # RC8 / FIX_PLAN T3.2: the gate uses the v2.4 formula over every non-null
+    # row (what the instructors' checker reports), not only verified rows.
+    spec_ok = (
+        metrics.spec_formula_similarity is not None
+        and metrics.spec_formula_similarity >= minimum_similarity
+    )
+    if metrics.spec_formula_similarity is not None and not spec_ok:
+        metrics.issues.append(
+            f"SPEC_SIMILARITY_BELOW_GATE:{metrics.spec_formula_similarity:.4f}<{minimum_similarity}"
+        )
     metrics.passed = bool(
-        metrics.similarity is not None
+        spec_ok
+        and metrics.similarity is not None
         and metrics.similarity >= minimum_similarity
         and metrics.total_nom_chars > 0
         and metrics.scored_rows > 0

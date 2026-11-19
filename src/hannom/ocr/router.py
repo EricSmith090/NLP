@@ -33,6 +33,9 @@ PROPAGATED_WARNING_CODES = {
     "API_CLASSIFIED_NOT_SINO_NOM",
     "OCR_ROUTING_UNKNOWN_MODE",
     "OCR_LINE_WITHOUT_BBOX",
+    "QN_HALVES_RETRY",
+    "QN_REPETITION",
+    "QN_LOOP_TRIMMED",
 }
 
 
@@ -401,7 +404,11 @@ class OCRRouter:
         self.save_result(result, local_fallback=local_fallback)
 
         confidence = page_confidence(results)
-        flags = promote_review_flags(result.warnings, page.review_flags)
+        # A fresh OCR result replaces the OCR-derived flags of the previous
+        # run (e.g. a v2 BAND_RETRY flag must not survive a v3.5 re-OCR);
+        # flags from other stages are kept.
+        kept = [f for f in (page.review_flags or []) if str(f).split(":", 1)[0] not in PROPAGATED_WARNING_CODES]
+        flags = promote_review_flags(result.warnings, kept)
         self.state.update_page(
             page.book_id,
             page.page_no,

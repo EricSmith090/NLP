@@ -106,6 +106,14 @@ class CleanedPage:
     dropped_lines: list[str] = field(default_factory=list)
     replacements: dict[str, int] = field(default_factory=dict)
     marker: int | None = None
+    # Nôm only: input OCR-line index of each entry in ``lines`` (same length),
+    # so Label.txt boxes can be rebuilt from the page-level clean result.
+    line_sources: list[int] = field(default_factory=list)
+    # Nôm only: original code point of each 〓 in ``text``, in order.
+    placeholder_origins: list[str] = field(default_factory=list)
+    # Whole OCR boxes (or runs inside one) removed before cleaning, with the
+    # reason (folio / ornament / running_title / repeat_run). FIX_PLAN T3.1.
+    box_drops: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -121,6 +129,12 @@ class CleanedPage:
         }
         if self.marker is not None:
             d["marker"] = self.marker
+        if self.line_sources:
+            d["line_sources"] = self.line_sources
+        if self.box_drops:
+            d["box_drops"] = self.box_drops
+        if self.placeholder_origins:
+            d["placeholder_origins"] = self.placeholder_origins
         return d
 
 
@@ -162,6 +176,11 @@ def is_safe_codepoint(ch: str) -> bool:
 
 
 def sanitize_nom_text(text: str) -> tuple[str, dict[str, int], list[str]]:
+    out, counts, flags, _origins = sanitize_nom_text_with_origins(text)
+    return out, counts, flags
+
+
+def sanitize_nom_text_with_origins(text: str) -> tuple[str, dict[str, int], list[str], list[str]]:
     """Replace unencodable/unsafe characters with 〓 and report them.
 
     Kim Hán Nôm PUA code points with a human-curated mapping (see
@@ -173,6 +192,11 @@ def sanitize_nom_text(text: str) -> tuple[str, dict[str, int], list[str]]:
     out: list[str] = []
     counts: dict[str, int] = {}
     flags: list[str] = []
+    # One entry per 〓 in the output, in order: the original code point it
+    # stands for ("U+F047C"), or "U+3013" when the OCR already gave 〓.
+    # v2.4 asks the report to list every 〓 with its position and a
+    # description of the glyph; this keeps what the glyph was.
+    origins: list[str] = []
     pua_mapped = False
     for ch in nfc(text):
         if ch.isspace():
@@ -184,14 +208,17 @@ def sanitize_nom_text(text: str) -> tuple[str, dict[str, int], list[str]]:
             continue
         if is_safe_codepoint(ch):
             out.append(ch)
+            if ch == REPLACEMENT:
+                origins.append(f"U+{ord(ch):04X}")
         else:
             out.append(REPLACEMENT)
             counts[ch] = counts.get(ch, 0) + 1
+            origins.append(f"U+{ord(ch):04X}")
     if pua_mapped:
         flags.append("NOM_PUA_MAPPED")
     if counts:
         flags.append("NOM_UNENCODABLE_REPLACED")
-    return "".join(out), counts, flags
+    return "".join(out), counts, flags, origins
 
 
 def normalize_mask(text: str) -> str:
@@ -201,7 +228,15 @@ def normalize_mask(text: str) -> str:
     return text
 
 
+# Format characters (Cf: ZWJ, ZWSP, BOM, soft hyphen) and variation
+# selectors are invisible: v2.4 requires removing them (the official checker
+# fails on a selector), never turning them into 〓. FIX_PLAN T3.1.
+VARIATION_SELECTOR_RE = re.compile("[\uFE00-\uFE0F\U000E0100-\U000E01EF]")
+
+
 def remove_control(text: str) -> str:
+    text = VARIATION_SELECTOR_RE.sub("", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     return CONTROL_RE.sub("", text)
 
 
@@ -227,8 +262,16 @@ def looks_like_footnote(line: str) -> bool:
     return bool(FOOTNOTE_RE.match(line))
 
 
+# Footnote reference marks printed in the running text: "lây(7)." or
+# "địa ngục (1) tôi". Only 1-3 digits in parentheses right after a letter
+# (optionally one space); page headers such as "(260)" at line start are
+# handled by the page-marker rules. FIX_PLAN T3.1.
+INLINE_PAREN_REF_RE = re.compile(r"(?<=[^\W\d_]) ?\(\d{1,3}\)(?=[\s.,;:!?)\]]|$)")
+
+
 def _strip_inline_refs(text: str) -> tuple[str, bool]:
     new = INLINE_REF_RE.sub("", text)
+    new = INLINE_PAREN_REF_RE.sub("", new)
     return new, new != text
 
 
@@ -391,6 +434,71 @@ def normalize_for_running_key(text: str) -> str:
     return MULTISPACE_RE.sub(" ", text).strip()
 
 
+# --- Nôm box-level noise (FIX_PLAN T3.1, RC9) ------------------------------
+# Thresholds measured on the three T1 books (2026-11-19); positions are
+# normalised by the page's own size and mirrored for upside-down pages.
+NOM_NUMERALS = frozenset("〇零一二三四五六七八九十百千廿卄卅")
+_REPEAT_RUN_RE = re.compile(r"(.)\1{3,}")
+
+
+def nom_box_noise(
+    text: str,
+    points: Sequence[Sequence[float]],
+    confidence: float | None,
+    width: float,
+    height: float,
+    *,
+    mirrored: bool = False,
+    strip_texts: frozenset[str] = frozenset(),
+) -> str | None:
+    """Reason a whole Nôm OCR box is page furniture, or None.
+
+    folio: only Chinese numerals, in the outer margin (x0 <= 0.2 W or
+    x0 >= 0.72 W) and in the printed folio band (0.62 H <= y0 <= 0.70 H);
+    body-text numerals (Tap2 pp.312-346 at y0 < 0.25 H, Tap1 p.234 at 0.725 H,
+    the index pages 269-273 inside the body) stay.
+    ornament: <= 2 chars, API confidence < 0.7, not numerals, entirely inside
+    a corner zone (x outside 0.2-0.8 W and y outside 0.2-0.8 H).
+    running_title: the box text is listed in the book's strip_texts.
+    """
+    t = nfc(str(text or "")).strip()
+    if not t:
+        return None
+    if t in strip_texts:
+        return "running_title"
+    if not points or not width or not height:
+        return None
+    xs = [float(p[0]) / width for p in points]
+    ys = [float(p[1]) / height for p in points]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    if mirrored:
+        x0, x1, y0, y1 = 1.0 - x1, 1.0 - x0, 1.0 - y1, 1.0 - y0
+    numeral = all(c in NOM_NUMERALS for c in t)
+    if numeral and (x0 <= 0.2 or x0 >= 0.72) and 0.62 <= y0 <= 0.70:
+        return "folio"
+    if (
+        not numeral
+        and len(t) <= 2
+        and confidence is not None
+        and float(confidence) < 0.7
+        and (x1 < 0.2 or x0 > 0.8)
+        and (y1 < 0.2 or y0 > 0.8)
+    ):
+        return "ornament"
+    return None
+
+
+def trim_repeat_runs(text: str, confidence: float | None) -> tuple[str, list[str]]:
+    """Remove runs of >= 4 identical characters from a low-confidence box
+    (e.g. 无无无无无无无, 嘉嘉嘉嘉 frame patterns); the rest of the box stays."""
+    if confidence is None or float(confidence) >= 0.8:
+        return text, []
+    runs = [m.group(0) for m in _REPEAT_RUN_RE.finditer(text)]
+    if not runs:
+        return text, []
+    return _REPEAT_RUN_RE.sub("", text), runs
+
+
 def detect_running_lines(
     lines_by_page: Sequence[Sequence[str]],
     *,
@@ -442,10 +550,29 @@ def clean_nom_lines(
     For direct use this function accepts no metadata and returns a tuple; the
     public page-level wrapper is clean_nom_page().
     """
+    normalized, _sources, dropped, replacements, flags, _origins = _clean_nom_indexed(
+        lines, running_lines=running_lines, drop_page_numbers=drop_page_numbers
+    )
+    return normalized, dropped, replacements, flags
+
+
+def _clean_nom_indexed(
+    lines: Sequence[str],
+    *,
+    running_lines: set[str] | None = None,
+    drop_page_numbers: bool = True,
+) -> tuple[list[str], list[int], list[str], dict[str, int], list[str], list[str]]:
+    """Page-level Nôm cleaning that remembers which input line each output came from."""
     normalized: list[str] = []
+    sources: list[int] = []
     dropped: list[str] = []
     flags: list[str] = []
-    pieces = _split_embedded_newlines(lines)
+    pieces: list[str] = []
+    piece_src: list[int] = []
+    for src, raw in enumerate(lines):
+        for piece in str(raw).split("\n"):
+            pieces.append(piece)
+            piece_src.append(src)
     total = len(pieces)
     for index, raw in enumerate(pieces):
         line = nfc(remove_control(str(raw))).strip()
@@ -470,30 +597,44 @@ def clean_nom_lines(
         if not line:
             continue
         normalized.append(line)
-    normalized, dupes = _dedupe_consecutive(normalized)
+        sources.append(piece_src[index])
+    deduped: list[str] = []
+    deduped_src: list[int] = []
+    dupes: list[str] = []
+    for line, src in zip(normalized, sources):
+        if deduped and line == deduped[-1]:
+            dupes.append(line)
+            continue
+        deduped.append(line)
+        deduped_src.append(src)
+    normalized, sources = deduped, deduped_src
     if dupes:
         dropped.extend(dupes)
         flags.append("DUPLICATE_LINES_REMOVED")
     # Replace unencodable/unsafe code points with 〓 (the guideline's marker).
     sanitized: list[str] = []
+    sanitized_src: list[int] = []
+    origins: list[str] = []
     replacements: dict[str, int] = {}
     sanitized_any = False
-    for line in normalized:
-        cleaned_line, repl, _ = sanitize_nom_text(line)
+    for line, src in zip(normalized, sources):
+        cleaned_line, repl, _, line_origins = sanitize_nom_text_with_origins(line)
+        origins.extend(line_origins)
         if cleaned_line:
             sanitized.append(cleaned_line)
+            sanitized_src.append(src)
         for code, count in repl.items():
             replacements[code] = replacements.get(code, 0) + count
         sanitized_any = sanitized_any or bool(repl)
     if sanitized_any:
         flags.append("NOM_UNENCODABLE_REPLACED")
-    normalized = sanitized
+    normalized, sources = sanitized, sanitized_src
     text = "".join(normalized)
     for match in re.finditer(r"\[[^\]]*MASK[^\]]*\]", text, flags=re.IGNORECASE):
         if match.group(0) != MASK:
             flags.append("MASK_LENGTH_INVALID")
             break
-    return normalized, dropped, replacements, sorted(set(flags))
+    return normalized, sources, dropped, replacements, sorted(set(flags)), origins
 
 
 def clean_nom_page(
@@ -504,9 +645,7 @@ def clean_nom_page(
     *,
     running_lines: set[str] | None = None,
 ) -> CleanedPage:
-    cleaned = clean_nom_lines(lines, running_lines=running_lines)
-    assert isinstance(cleaned, tuple)
-    normalized, dropped, replacements, flags = cleaned
+    normalized, sources, dropped, replacements, flags, origins = _clean_nom_indexed(lines, running_lines=running_lines)
     text = "".join(normalized)
     if not text:
         flags = sorted(set(flags) | {"EMPTY_AFTER_CLEAN"})
@@ -521,6 +660,8 @@ def clean_nom_page(
         dropped_lines=dropped,
         replacements=replacements,
         marker=extract_qn_marker(dropped),
+        line_sources=sources,
+        placeholder_origins=origins,
     )
 
 
