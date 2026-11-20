@@ -92,3 +92,11 @@ def test_empty_text_diff_cell_is_not_read_as_fully_matching():
     assert row.text_diff is None and "TEXT_DIFF_EMPTY_CELL" in row.flags
     ok = row_from_dict({"img_id": "B.001.jpg", "sentence_id": "B.001.1", "ch_txt": "天", "vi_txt": "thiên", "text_diff": json.dumps([])})
     assert ok.text_diff == []
+
+
+def test_missing_type_is_invalid_not_silently_red():
+    row = row_from_dict({"img_id": "B.001.jpg", "sentence_id": "B.001.1", "ch_txt": "天", "vi_txt": "x",
+                         "text_diff": json.dumps([{"nom_pos": [[0, 1]], "nom_sub_text": "天", "vi_pos": [[0, 1]], "vi_sub_text": "x"}])})
+    assert row.text_diff[0].type == ""
+    assert validate_text_diff("天", "x", row.text_diff)  # reported as invalid
+    assert red_penalty(row.text_diff) == 0

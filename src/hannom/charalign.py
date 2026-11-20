@@ -230,6 +230,11 @@ class Matcher:
         return cached
 
     def kind(self, ch: str, token: QnToken) -> str:
+        if ch == "〓":
+            # 〓 stands for a different unencodable glyph each time: it has no
+            # reading of its own (nor a learnable one), so it is always
+            # "unknown", never a mismatch (SLQ 阿綿/Amen boundary, 2026-11-20).
+            return "unknown"
         exact, folded, lex = self.sets(ch)
         if token.norm in exact:
             return "exact"

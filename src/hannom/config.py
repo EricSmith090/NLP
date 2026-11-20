@@ -54,13 +54,20 @@ class BookConfig:
     # API reads the characters but returns the columns in reverse reading
     # order, so the label/clean stages reverse the box order of these pages.
     nom_reversed_pages: tuple[int, ...] = ()
+    # Extra clockwise rotation (degrees) applied at extraction on top of the
+    # PDF page /Rotate, for pages scanned in the wrong orientation that the
+    # PDF does not mark (v2.4: submitted images must be "đúng hướng").
+    rotation_overrides: dict[int, int] = field(default_factory=dict)
     ocr: OCRSettings = field(default_factory=OCRSettings)
     review_profile: str = "strict"
 
     @property
     def book_name(self) -> str:
-        """Exact assigned filename stem, including Unicode and spaces."""
-        return self.pdf.stem
+        """Exact assigned filename stem, including Unicode and spaces (NFC,
+        so a PDF saved with decomposed accents still yields NFC names)."""
+        import unicodedata
+
+        return unicodedata.normalize("NFC", self.pdf.stem)
 
     @property
     def source_pdf(self) -> Path:
@@ -183,6 +190,9 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
                     else None
                 ),
                 nom_reversed_pages=tuple(int(x) for x in (b.get("nom_reversed_pages", []) or [])),
+                rotation_overrides={
+                    int(k): int(v) % 360 for k, v in (b.get("rotation_overrides", {}) or {}).items()
+                },
                 ocr=OCRSettings(
                     nom=tuple(ocr_raw.get("nom", ["paddleocr_vl", "kimhannom"])),
                     # quoc_ngu is Vintern-1B-v3.5 full-page transcription since

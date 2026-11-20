@@ -37,11 +37,11 @@ screenshots:
 method_notes:
   - "Pipeline cục bộ: trích ảnh gốc, phân loại trang, OCR, PPOCRLabel, làm sạch, căn hàng, text_diff, đánh giá và đóng gói."
   - "923/950 ảnh được sao chép nguyên byte từ JPEG nhúng; 27 ảnh xoay được chuyển hướng lossless ở độ phân giải gốc (không upscale)."
-  - "Hai file <Book>_updated.pdf (Tập 1 và Tập 2; Sách 3 không cần) đã tạo bằng tools/build_updated_pdf.py từ ảnh trích xuất: ảnh nhúng nguyên byte, một ảnh/trang, số trang giữ nguyên (282/550, trang xoay: 263+274 / 287+295+296+305+310+335+339+345+349+364+386+392+405+414+416+419+426+447+452+459+461+499+505+515+525). HÀNH ĐỘNG CẦN LÀM TRƯỚC KHI NỘP: thông báo cho người giao sách về hai file _updated.pdf và danh sách trang xoay."
-  - "Kim Hán Nôm API chỉ dùng như ý kiến thứ hai có đo lường; không dùng nhiều tài khoản và không gửi ảnh mặc định."
-  - "Từ điển là tùy chọn; ký tự không có trong từ điển không bị tự động tô đỏ mà vào hàng đợi review."
-  - "Yellow không bao giờ được tạo tự động; chỉ dùng cho các trường hợp đặc biệt trong quy định và luôn được ghi lý do."
-  - "image_map.json ban đầu là phân hoạch theo khối lượng mực; phải đối chiếu lại với OCR/căn hàng trước khi nộp."
+  - "Hai file <Book>_updated.pdf (Tập 1 và Tập 2; Sách 3 không cần) đã tạo bằng tools/build_updated_pdf.py từ ảnh trích xuất: ảnh nhúng nguyên byte, một ảnh/trang, số trang giữ nguyên (282/550, trang xoay: 263+274 / 287+295+296+305+310+335+339+345+349+364+386+388+392+398+405+406+414+416+419+426+438+444+447+452+459+461+479+499+505+515+525; trong đó 388, 398, 406, 438, 444, 479 là 6 trang Nôm bị scan ngược 180° mà PDF không đánh dấu, được xoay khi trích ảnh và OCR lại ở hướng đúng). HÀNH ĐỘNG CẦN LÀM TRƯỚC KHI NỘP: thông báo cho người giao sách về hai file _updated.pdf và danh sách trang xoay."
+  - "OCR chữ Nôm: Kim Hán Nôm API (một tài khoản, có sổ theo dõi quota); OCR Quốc ngữ: Vintern-1B-v3.5 chạy cục bộ trên GPU (một box toàn trang), có đọc lại theo hai nửa trang chồng lấn khi kết quả ngắn hoặc lặp."
+  - "text_diff theo Quy định v2.4, cùng ngữ nghĩa với công cụ chấm ocr-nom-align v0.2.0: so âm đọc sau khi bỏ 5 dấu thanh; chữ 〓 và chữ không có âm đọc trong mọi từ điển được bàn giao bị tô đỏ; âm tiết Quốc ngữ thừa bị tô đỏ; đoạn có chứa số được tô vàng (reviewed = 0 cho đến khi được duyệt)."
+  - "Label.txt và CSV dùng chung một văn bản đã làm sạch (kiểm tra SYNC theo chuẩn của công cụ chấm trước khi đóng gói); không có hàng chỉ có một vế."
+  - "image_map.json được dựng từ số trang in đối chiếu trên trang Quốc ngữ (Nôm PDF = offset − vi PDF) và đã được xác minh toàn bộ; 6 trang Nôm của Tập 2 bị scan ngược được xoay 180° cho đúng hướng và OCR lại."
 
 yellow_reasons:
   T1_CamPhong_Tap1: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."

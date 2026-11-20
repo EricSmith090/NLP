@@ -519,7 +519,13 @@ def recompute_text_diff(
         if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
             # Rows carrying an explicit review decision (any status) or a
             # human content edit are authoritative; the automatic
-            # recomputation must never overwrite them.
+            # recomputation must never overwrite them -- except the colouring
+            # of a re-applied text edit, which was computed on the old text.
+            if "TEXT_DIFF_STALE" in row.flags:
+                from .review.edit import recompute_row_diff
+
+                recompute_row_diff(row, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache)
+                row.flags = [f for f in row.flags if f != "TEXT_DIFF_STALE"]
             out.append(row)
             continue
         if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
@@ -650,13 +656,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
     # (see review_decisions.apply_decisions); a log-wide integrity failure
     # fails the learning step closed for the whole book.
     patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
-    rows, rejected_patches = apply_patches_checked(rows, patches)
-    if rejected_patches:
-        print(
-            f"[hannom] align: {book.book_id}: {len(rejected_patches)} review patch(es) no longer match "
-            f"their row and were NOT applied (see summary.json review_patches_rejected)",
-            flush=True,
-        )
+    rows, _first_pass_rejected = apply_patches_checked(rows, patches)
     decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
     rows, review_issues, review_audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
     learned = learn_for_book(lexicon, rows, dictionary, failures)
@@ -669,8 +669,17 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         alignment_config=project.alignment_config,
     )
     # Apply patches and decisions again so human content and review
-    # decisions always win over the automatic recomputation.
-    rows, _ = apply_patches_checked(rows, patches)
+    # decisions always win over the automatic recomputation. Report what is
+    # still rejected after this final pass (a text_diff patch made after a
+    # text edit only matches once the colouring has been recomputed).
+    rows, rejected_patches = apply_patches_checked(rows, patches)
+    if rejected_patches:
+        print(
+            f"[hannom] align: {book.book_id}: {len(rejected_patches)} review patch(es) no longer match "
+            f"their row and were NOT applied (see summary.json review_patches_rejected; "
+            f"tools/replay_review_edits.py re-applies text edits by substring)",
+            flush=True,
+        )
     rows, _, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
     csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
     write_alignment_csv(csv_path, rows)
@@ -832,16 +841,21 @@ def stage_package_all(
         metrics.append(stage_evaluate(project, book, state))
     report_path, report_issues, _ = build_report(project, metrics, strict=strict_report)
     source_zip = build_source_zip(project)
+    from .package import build_extras_zip
+
+    extras_zip = build_extras_zip(project)
     zip_path = build_submission_zip(
         project,
         book_dirs,
         report_path=report_path,
         source_zip=source_zip,
+        extras_zip=extras_zip,
     )
     return {
         "zip": str(zip_path),
         "report": str(report_path),
         "source_zip": str(source_zip),
+        "extras_zip": str(extras_zip),
         "books": [str(x) for x in book_dirs],
         "report_issues": report_issues,
     }

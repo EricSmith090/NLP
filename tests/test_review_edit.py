@@ -130,7 +130,11 @@ def test_recompute_marks_edited_and_queue():
         DiffElement(((0, 1),), "天", ((0, 1),), "a", "error")])
     assert red_density(hi) > red_density(lo)
     assert review_queue([lo, hi], "red") == [1, 0]
-    assert progress([lo, row]) == (1, 2)
+    # a saved edit without a decision is NOT counted as reviewed; it waits in its own queue
+    assert progress([lo, row]) == (0, 2)
+    assert review_queue([lo, row], "pending") == [1]
+    row.review_status = "accepted_difference"
+    assert progress([lo, row]) == (1, 2) and review_queue([lo, row], "pending") == []
 
 
 def test_atomic_saves_keep_a_backup_and_sidecar(tmp_path):
@@ -168,3 +172,105 @@ def test_labels_stage_refuses_to_discard_reviewer_edits(tmp_path):
     append_patch(project.data_dir / "review" / f"{book.book_id}.patches.jsonl", ReviewPatch(**{k: v for k, v in kw.items() if k in fields}))
     with pytest.raises(PipelineError, match="overwrite-reviewed"):
         stage_labels(project, book, state=None)
+
+
+def test_select_row_keeps_the_edited_row_pinned():
+    from types import SimpleNamespace
+
+    from hannom.review.edit import next_position, select_row
+
+    rows = [SimpleNamespace(sentence_id=f"B.1.{i}") for i in range(5)]
+    queue = [3, 1, 4]  # red-density order
+    assert select_row(rows, queue, 1, None) == (1, 1)
+    # after an edit the pinned row moved in the queue: still shown, new position reported
+    assert select_row(rows, [3, 4, 1], 1, "B.1.1") == (1, 2)
+    # after an edit removed all its red it left the queue: still shown, position None
+    assert select_row(rows, [3, 4], 1, "B.1.1") == (1, None)
+    # accepting: next row in the queue, or the row now in the old slot when it left
+    assert next_position([3, 1, 4], 1, 1, 1) == 2
+    assert next_position([3, 4], 1, None, 1) == 1
+
+
+def test_history_search_and_reviewed_order():
+    from types import SimpleNamespace
+
+    from hannom.review.edit import find_rows, review_history, reviewed_order
+
+    rows = [SimpleNamespace(sentence_id=f"B (T).487.{i}", ch_txt="天主" if i == 2 else "x", vi_txt=f"câu {i}",
+                            flags=["CONTENT_EDITED"] if i == 9 else [], review_status=None) for i in range(1, 11)]
+    patches = [SimpleNamespace(sentence_id="B (T).487.9", field="vi_txt", before="a", after="b", reviewer="r",
+                               timestamp="2026-11-20T01:20:22")]
+    decisions = [SimpleNamespace(sentence_id="B (T).487.3", status="unresolved", reviewer="r",
+                                 timestamp="2026-11-20T01:30:00", reason="")]
+    hist = review_history(patches, decisions)
+    assert [h["sentence_id"] for h in hist] == ["B (T).487.3", "B (T).487.9"]
+    assert [rows[i].sentence_id for i in reviewed_order(rows, hist)] == ["B (T).487.3", "B (T).487.9"]
+    assert [rows[i].sentence_id for i in find_rows(rows, "487.9")] == ["B (T).487.9"]
+    assert [rows[i].sentence_id for i in find_rows(rows, "天主")] == ["B (T).487.2"]
+    assert find_rows(rows, "CÂU 5") == [4]
+
+
+def test_reapplied_text_patch_gets_its_text_diff_recomputed():
+    from hannom.models import AlignmentRow, DiffElement
+    from hannom.orchestrator import recompute_text_diff
+    from hannom.review.patches import apply_patches_checked, make_patch
+    from hannom.textdiff import validate_text_diff
+
+    class Lex:
+        def readings(self, ch):
+            return {"天": ["thiên"], "主": ["chúa"]}.get(ch, [])
+
+    stale = [DiffElement(((1, 2),), "主", ((6, 7),), "x", "error")]
+    row = AlignmentRow("B.001.jpg", "B.001.1", "天主", "Thiên x", stale)
+    p = make_patch(row, book_id="B", field="vi_txt", after="Thiên Chúa", reviewer="r", reason="ocr")
+    fresh = AlignmentRow("B.001.jpg", "B.001.1", "天主", "Thiên x", list(stale))
+    rows, rejected = apply_patches_checked([fresh], [p])
+    assert not rejected and "TEXT_DIFF_STALE" in rows[0].flags
+    out = recompute_text_diff(rows, lexicon=Lex(), dictionary=None)[0]
+    assert out.text_diff == [] and validate_text_diff(out.ch_txt, out.vi_txt, out.text_diff) == []
+    assert "TEXT_DIFF_STALE" not in out.flags and "CONTENT_EDITED" in out.flags
+
+
+def test_row_locations_point_to_boxes_and_page_share():
+    from types import SimpleNamespace
+
+    from hannom.review.edit import row_locations
+    from hannom.t1_map import Pair
+
+    pairs = [Pair(ch=("B.276.jpg",), vi=("B.013.jpg",))]
+    ch = {"ch/B.276.jpg": [{"transcription": "天主"}, {"transcription": "聖神"}, {"transcription": "阿綿"}]}
+    vi = {"vi/B.013.jpg": [{"transcription": "Thiên Chúa Thánh Thần A-men"}]}
+    rows = [SimpleNamespace(ch_txt="天主聖", vi_txt="Thiên Chúa Thánh"), SimpleNamespace(ch_txt="神阿綿", vi_txt="Thần A-men")]
+    loc = row_locations(pairs, ch, vi, rows, 1)
+    assert loc["ch"] == {"B.276.jpg": [1, 2]}
+    a, b = loc["vi"]["B.013.jpg"]
+    assert 0.5 < a < 0.7 and b == 1.0
+
+
+def test_mark_as_warn_and_text_diff_patch_survives_realignment():
+    import copy
+
+    from hannom.models import AlignmentRow, DiffElement
+    from hannom.review.edit import mark_as_warn
+    from hannom.review.patches import apply_patches_checked, make_patch
+
+    err = DiffElement(((0, 2),), "阿綿", ((0, 4),), "Amen", "error")
+    row = AlignmentRow("B.067.jpg", "B.067.1", "阿綿", "Amen.", [err])
+    snap = copy.deepcopy(row)
+    mark_as_warn(row, 0)
+    assert row.text_diff[0].type == "warn" and row.text_diff[0].reviewed == 1
+    p = make_patch(snap, book_id="B", field="text_diff", after=row.text_diff_json(), reviewer="r")
+    fresh = AlignmentRow("B.067.jpg", "B.067.1", "阿綿", "Amen.", [err])  # what a re-alignment produces
+    out, rejected = apply_patches_checked([fresh], [p])
+    assert not rejected and out[0].text_diff[0].type == "warn" and out[0].text_diff[0].reviewed == 1
+
+
+def test_superseded_and_in_place_patches_are_not_reported_stale():
+    from hannom.models import AlignmentRow
+    from hannom.review.patches import ReviewPatch, apply_patches_checked
+
+    row = AlignmentRow("B.067.jpg", "B.067.1", "綿", "Men.", [])
+    p1 = ReviewPatch(book_id="B", sentence_id="B.067.1", field="vi_txt", before="Amen.", after="Lưỡi.", reviewer="r", timestamp="2026-11-20T01:38:27")
+    p2 = ReviewPatch(book_id="B", sentence_id="B.067.1", field="vi_txt", before="Lưỡi.", after="Men.", reviewer="r", timestamp="2026-11-20T01:42:58")
+    _rows, rejected = apply_patches_checked([row], [p1, p2])
+    assert rejected == []

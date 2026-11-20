@@ -239,6 +239,25 @@ def stream_segments_by_charalign(
             current = token_sentence[op.j]
             seen_token = True
         op_sentence.append(current if seen_token else first_token_sentence)
+    # Nôm-only chars sitting between two sentences go with the FOLLOWING
+    # sentence when that sentence opens with an unmatched token: e.g. 阿綿 =
+    # "Amen." after "...chẳng cùng." -- 阿 has no partner of its own and
+    # belongs to the transliterated word that starts the next sentence
+    # (SLQ 067.1, 2026-11-20). Runs longer than 3 chars stay put.
+    k = 0
+    while k < len(ops):
+        if ops[k].j is not None:
+            k += 1
+            continue
+        start = k
+        while k < len(ops) and ops[k].j is None:
+            k += 1
+        if k < len(ops) and start > 0 and k - start <= 3:
+            nxt = ops[k]
+            # "lex" = a reading learned from this unreviewed stream, not evidence
+            if op_sentence[k] > op_sentence[start - 1] and nxt.kind not in {"exact", "fold"}:
+                for m in range(start, k):
+                    op_sentence[m] = op_sentence[k]
     by_sentence: dict[int, list[Op]] = {}
     for op, sidx in zip(ops, op_sentence):
         by_sentence.setdefault(sidx, []).append(op)

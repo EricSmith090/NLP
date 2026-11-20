@@ -413,6 +413,38 @@ def prefer_retry(full: dict, halves: dict) -> bool:
     return halves["effective"] >= 1.2 * max(1, full["effective"])
 
 
+def dedupe_adjacent_repeats(text: str, min_len: int = 12, max_gap: int = 6) -> tuple[str, int]:
+    """Remove a repeated span of >= ``min_len`` syllables whose second copy
+    starts right after the first (within ``max_gap`` syllables): a short
+    generation loop or a halves seam stitched twice. Legitimate repeats far
+    apart on the page are kept. Characters outside the removed copies are
+    kept exactly (line breaks, hyphens). Returns (text, copies removed)."""
+    removed = 0
+    while True:
+        matches = list(_SYLLABLE_RE.finditer(text or ""))
+        words = [m.group(0).lower() for m in matches]
+        cut = None
+        for i in range(len(words) - min_len + 1):
+            gram = words[i : i + min_len]
+            for j in range(i + min_len, min(len(words) - min_len, i + 150) + 1):
+                if words[j : j + min_len] != gram:
+                    continue
+                # extend the copy as far as it keeps matching
+                k = min_len
+                while j + k < len(words) and i + k < j and words[i + k] == words[j + k]:
+                    k += 1
+                # adjacent: the first copy runs (almost) up to where the second starts
+                if k >= (j - i) - max_gap:
+                    cut = (matches[j].start(), matches[j + k - 1].end())
+                    break
+            if cut:
+                break
+        if not cut:
+            return text, removed
+        text = (text[: cut[0]].rstrip(" ") + " " + text[cut[1]:].lstrip(" ,.;:")).strip()
+        removed += 1
+
+
 def trim_loop(text: str, repeats: int = 3) -> tuple[str, bool]:
     """Cut a repetition loop: keep the text up to the second occurrence of
     the first 8-gram that occurs ``repeats``+ times. The original characters

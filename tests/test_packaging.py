@@ -130,3 +130,42 @@ def test_source_zip_rejects_state_backups_env_variants_and_credentials(tmp_path)
     flagged = {m.split(":")[0] for c, m in codes if c.startswith("SOURCE_CONTAINS")}
     assert {"data_copy/state.sqlite3.bak-2026-11-08", ".env.local", "hannom_API.md", "notes/cfg.json"} <= flagged
     assert ".env.example" not in flagged
+
+
+def test_validator_missing_and_optional_folder_rules(tmp_path):
+    import json as _json
+    from types import SimpleNamespace
+
+    from hannom.package import validate_book_package
+
+    book = SimpleNamespace(book_id="B", book_name="B", vi_to_nom_offset=None)
+    project = SimpleNamespace(data_dir=tmp_path / "data", root=tmp_path, quality={})
+    d = tmp_path / "B"
+    for sub in ("ch", "vi", "intro", "missing/ch", "missing/vi"):
+        (d / sub).mkdir(parents=True)
+    (d / "intro" / "B.001.jpg").write_bytes(b"x")
+    (d / "missing" / "ch" / "B.276.jpg").write_bytes(b"x")  # not also in ch/
+    (d / "missing" / "vi" / "B.013.jpg").write_bytes(b"x")
+    (d / "vi" / "B.013.jpg").write_bytes(b"x")  # must not be in vi/
+    (d / "missing" / "vi" / "Label.txt").write_text("", encoding="utf-8")
+    (d / "B_image_map.json").write_text(_json.dumps({"pairs": [{"ch": ["B.275.jpg"], "vi": ["B.013.jpg"]}]}), encoding="utf-8")
+    codes = {i.code for i in validate_book_package(project, book, d, require_labels=False)}
+    assert {"OPTIONAL_FOLDER_INCOMPLETE", "MISSING_CH_NOT_IN_CH", "MISSING_VI_ALSO_IN_VI",
+            "MISSING_HAS_LABELS", "MISSING_NOT_IN_IMAGE_MAP"} <= codes
+
+
+def test_extras_zip_collects_review_artefacts(tmp_path):
+    import zipfile
+    from types import SimpleNamespace
+
+    from hannom.package import build_extras_zip
+
+    data = tmp_path / "data"
+    (data / "review").mkdir(parents=True)
+    (data / "review" / "B.patches.jsonl").write_text("{}\n", encoding="utf-8")
+    (data / "clean" / "B").mkdir(parents=True)
+    (data / "clean" / "B" / "dropped.jsonl").write_text("{}\n", encoding="utf-8")
+    project = SimpleNamespace(data_dir=data, output_dir=tmp_path / "out",
+                              books=[SimpleNamespace(book_id="B", book_name="B")])
+    names = zipfile.ZipFile(build_extras_zip(project)).namelist()
+    assert names == ["B/review/patches.jsonl", "B/clean/dropped.jsonl"]

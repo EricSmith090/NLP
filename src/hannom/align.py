@@ -982,7 +982,7 @@ def row_from_dict(data: dict[str, Any]) -> AlignmentRow:
             nom_sub_text=str(item.get("nom_sub_text", "")),
             vi_pos=tuple(tuple(int(x) for x in p) for p in item.get("vi_pos", [])),
             vi_sub_text=str(item.get("vi_sub_text", "")),
-            type=str(item.get("type", "error")),  # type: ignore[arg-type]
+            type=str(item.get("type", "")),  # type: ignore[arg-type]  # missing type is invalid (v2.4 KEYS), never silently red
             reviewed=int(item["reviewed"]) if warn and item.get("reviewed") is not None else None,
             suggest=str(item["suggest"]) if warn and item.get("suggest") is not None else None,
             suggest_by=str(item["suggest_by"]) if warn and item.get("suggest_by") is not None else None,
@@ -1011,7 +1011,7 @@ def row_from_dict(data: dict[str, Any]) -> AlignmentRow:
     )
 
 
-def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
+def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow], *, metadata: bool = True) -> Path:
     """Write the five-column CSV and its review-metadata sidecar.
 
     The CSV keeps the stable ``img_id, sentence_id, ch_txt, vi_txt,
@@ -1036,7 +1036,8 @@ def write_alignment_csv(path: str | Path, rows: Iterable[AlignmentRow]) -> Path:
                     row.text_diff_json(),
                 ]
             )
-    write_review_metadata(path, rows)
+    if metadata:
+        write_review_metadata(path, rows)
     return path
 
 

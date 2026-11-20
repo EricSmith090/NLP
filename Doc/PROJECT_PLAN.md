@@ -4,9 +4,9 @@
 **Created:** 2026-11-08  
 **Deadline:** 2026-11-30  
 **Workspace:** `C:\Users\MSI VN\Desktop\NLP` (previously `C:\Users\MSI VN\Desktop\NLP Project`; renamed — stored absolute paths in `data/state.sqlite3` and the raw manifests were rebased on 2026-11-08)  
-**Entry point:** This document. No pipeline code exists yet.
+**Entry point (historical):** this was the original plan, written before any pipeline code existed. The pipeline now exists; the current plan and task status are in `Doc/FIX_PLAN_v24.md`.
 
-**TL;DR:** Three T1 books (950 pages) are due 2026-11-30. Build a local-first OCR/alignment pipeline; use Kim Hán Nôm API only as a measured second opinion. Deliver one ZIP with three book folders, one report, PPOCRLabel labels, CSV/XLSX alignment, and `image_map.json`. Enforce ≥95% per book. No pipeline code exists yet; start with §13.
+**TL;DR:** Three T1 books (950 pages) are due 2026-11-30. Build a local-first OCR/alignment pipeline; use Kim Hán Nôm API only as a measured second opinion. Deliver one ZIP with three book folders, one report, PPOCRLabel labels, CSV/XLSX alignment, and `image_map.json`. Enforce ≥95% per book. (Historical: at the time no pipeline code existed.)
 
 ---
 

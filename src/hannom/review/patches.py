@@ -128,7 +128,7 @@ def _elements_from_json(value: str) -> list[DiffElement] | None:
             nom_sub_text=str(item.get("nom_sub_text", "")),
             vi_pos=tuple(tuple(int(x) for x in span) for span in item.get("vi_pos", [])),
             vi_sub_text=str(item.get("vi_sub_text", "")),
-            type=str(item.get("type", "error")),  # type: ignore[arg-type]
+            type=str(item.get("type", "")),  # type: ignore[arg-type]  # missing type is invalid (v2.4 KEYS), never silently red
             reviewed=item.get("reviewed"),
             suggest=item.get("suggest"),
             suggest_by=item.get("suggest_by"),
@@ -172,7 +172,24 @@ def apply_patches_checked(
         register(row_content_hash(row.img_id, row.ch_txt, row.vi_txt), row)
         by_sid.setdefault(row.sentence_id, row)
     rejected: list[RejectedPatch] = []
+    patches = list(patches)
+    # A patch followed by another edit of the same field of the same row
+    # (its `after` is the next one's `before`) is superseded: only the chain's
+    # last state matters, so the intermediate never counts as stale.
+    superseded = {
+        id(p) for p in patches
+        for q in patches
+        if q is not p and q.sentence_id == p.sentence_id and q.field == p.field
+        and p.field in ("ch_txt", "vi_txt") and q.before == p.after and str(q.timestamp) > str(p.timestamp)
+    }
     for patch in patches:
+        if patch.field in ("ch_txt", "vi_txt") and patch.after and any(
+            patch.after in _current(r, patch.field) and patch.before not in _current(r, patch.field)
+            for r in rows if not patch.img_id or r.img_id == patch.img_id
+        ):
+            continue  # the edited text is already in place (re-segmented row / replayed edit)
+        if id(patch) in superseded:
+            continue
         if patch.row_hash:
             cands = [r for r in index.get(patch.row_hash, []) if not patch.img_id or r.img_id == patch.img_id]
             if not cands and patch.after_hash:
@@ -201,10 +218,12 @@ def apply_patches_checked(
         if current != patch.before:
             rejected.append(RejectedPatch(patch, f"stale: {patch.field} changed since the patch was made"))
             continue
-        if patch.field == "ch_txt":
-            row.ch_txt = patch.after
-        elif patch.field == "vi_txt":
-            row.vi_txt = patch.after
+        if patch.field in ("ch_txt", "vi_txt"):
+            setattr(row, patch.field, patch.after)
+            # The stored text_diff was computed on the pre-edit text; the
+            # pipeline recomputes it (orchestrator.recompute_text_diff).
+            if "TEXT_DIFF_STALE" not in row.flags:
+                row.flags.append("TEXT_DIFF_STALE")
         else:
             try:
                 row.text_diff = _elements_from_json(patch.after)

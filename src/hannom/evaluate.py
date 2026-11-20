@@ -23,7 +23,7 @@ from typing import Any, Iterable
 
 from .clean import MASK, count_nom_chars, nfc
 from .models import AlignmentRow, BookMetrics, DiffElement
-from .textdiff import red_penalty, scoreable_nom_chars, validate_text_diff, yellow_spans
+from .textdiff import red_penalty, scoreable_nom_chars, spec_count_nom, validate_text_diff, yellow_spans
 from .review_decisions import (
     STATUS_ACCEPTED_DIFFERENCE,
     STATUS_ACCEPTED_MATCH,
@@ -59,7 +59,7 @@ def _elements(row: Any) -> list[DiffElement] | None:
                         nom_sub_text=str(item.get("nom_sub_text", "")),
                         vi_pos=tuple(tuple(int(x) for x in p) for p in item.get("vi_pos", [])),
                         vi_sub_text=str(item.get("vi_sub_text", "")),
-                        type=str(item.get("type", "error")),  # type: ignore[arg-type]
+                        type=str(item.get("type", "")),  # type: ignore[arg-type]  # missing type is invalid (v2.4 KEYS), never silently red
                     )
                 )
         return out
@@ -214,6 +214,8 @@ def evaluate_rows(
     semantic_evidence_rows = 0
     evidence_insufficient_rows = 0
     spec_red = 0
+    spec_nom_total = 0
+    spec_yellow = 0
     spec_denom = 0
     spec_scored = 0
     for row in rows:
@@ -227,6 +229,8 @@ def evaluate_rows(
             spec_scored += 1
             spec_denom += scoreable_nom_chars(ch_txt, elements)
             spec_red += red_penalty(elements)
+            spec_nom_total += spec_count_nom(ch_txt)
+            spec_yellow += sum(spec_count_nom(e.nom_sub_text) for e in elements if e.type == "warn")
         flags = {str(flag) for flag in (_row_value(row, "flags", []) or [])}
         review_status = _row_value(row, "review_status", None)
         review_status = str(review_status) if review_status else None
@@ -314,7 +318,8 @@ def evaluate_rows(
     else:
         metrics.structural_confidence_mean = None
     if metrics.total_nom_chars:
-        metrics.yellow_ratio = metrics.yellow_chars / metrics.total_nom_chars
+        # Official definition: yellow Nôm chars / Nôm chars of the non-null rows.
+        metrics.yellow_ratio = (spec_yellow / spec_nom_total) if spec_nom_total else 0.0
     if metrics.denominator > 0:
         metrics.similarity = (
             1.0 - metrics.red_mismatch_chars / metrics.denominator

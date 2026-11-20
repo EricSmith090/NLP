@@ -259,7 +259,9 @@ def build_book_folder(
         )
 
     csv_path = book_dir / f"{book.book_name}.csv"
-    write_alignment_csv(csv_path, rows)
+    # The submission folder holds only the files the guideline lists; the
+    # review-metadata sidecar stays in data/align (it ships in extras.zip).
+    write_alignment_csv(csv_path, rows, metadata=False)
     write_alignment_xlsx(book_dir / f"{book.book_name}.xlsx", rows)
 
     # Regenerate pages.jsonl from the final in-memory page state so the
@@ -313,6 +315,7 @@ def build_source_zip(project: ProjectConfig, output_path: Path | None = None) ->
         "USER_GUIDE.md",
         "pyproject.toml",
         "uv.lock",
+        "requirements-lock.txt",
         ".env.example",
         ".gitignore",
     ]
@@ -333,6 +336,49 @@ def build_source_zip(project: ProjectConfig, output_path: Path | None = None) ->
                 if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
                     continue
                 zf.write(path, path.relative_to(project.root).as_posix())
+    return output_path
+
+
+def extras_entries(project: ProjectConfig) -> list[tuple[Path, str]]:
+    """(source file, name inside extras.zip) for the review/reproducibility
+    artefacts: reviewer patches and decisions, review metadata, SYNC report,
+    clean-time drops, the book lexicons, QN quality queues, the 〓 catalogue
+    and the official-checker report. No images, no secrets, no state DB."""
+    from .review_decisions import decision_path
+
+    data = project.data_dir
+    out: list[tuple[Path, str]] = []
+    for book in project.books:
+        b = book.book_id
+        candidates = [
+            (data / "review" / f"{b}.patches.jsonl", f"{b}/review/patches.jsonl"),
+            (decision_path(data, b), f"{b}/review/review_decisions.jsonl"),
+            (data / "align" / b / f"{book.book_name}.review_metadata.jsonl", f"{b}/align/review_metadata.jsonl"),
+            (data / "align" / b / "sync_check.json", f"{b}/align/sync_check.json"),
+            (data / "align" / b / "summary.json", f"{b}/align/summary.json"),
+            (data / "clean" / b / "dropped.jsonl", f"{b}/clean/dropped.jsonl"),
+            (data / "clean" / b / "summary.json", f"{b}/clean/summary.json"),
+            (data / "dictionary" / "book_lexicons" / f"{b}.json", f"{b}/lexicon/{b}.json"),
+            (data / "diagnostics" / "qn_quality" / f"{b}.csv", f"{b}/qn_quality.csv"),
+            (data / "evaluation" / b / "metrics.json", f"{b}/metrics.json"),
+        ]
+        out += [(src, name) for src, name in candidates if src.exists()]
+    for src, name in (
+        (data / "diagnostics" / "official_check" / "report.json", "official_check_report.json"),
+        (data / "diagnostics" / "placeholders" / "catalog.csv", "placeholders/catalog.csv"),
+        (data / "diagnostics" / "placeholders" / "placeholder_descriptions.yaml", "placeholders/placeholder_descriptions.yaml"),
+    ):
+        if src.exists():
+            out.append((src, name))
+    return out
+
+
+def build_extras_zip(project: ProjectConfig, output_path: Path | None = None) -> Path:
+    output_path = output_path or (project.output_dir / "extras.zip")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for src, name in extras_entries(project):
+            zf.write(src, name)
     return output_path
 
 
@@ -567,6 +613,43 @@ def validate_book_package(
                             path=str(folder_dir / "Label.txt"),
                         )
                     )
+
+    # v2.4: intro/ref/toc are optional, but a shipped folder needs both files.
+    for folder in ("intro", "ref", "toc"):
+        folder_dir = book_dir / folder
+        if folder_dir.exists() and any(folder_dir.glob("*.jpg")):
+            for name in ("Label.txt", "fileState.txt"):
+                if not (folder_dir / name).exists():
+                    issues.append(PackageIssue("OPTIONAL_FOLDER_INCOMPLETE", f"{folder}/{name} missing", path=str(folder_dir)))
+    # v2.4 missing/: a Nôm page whose QN page was lost lives in ch/ AND
+    # missing/ch; a QN page whose Nôm page was lost lives only in missing/vi;
+    # missing/ never carries Label.txt / fileState.txt; every lost image is
+    # referenced by the image map.
+    missing_dir = book_dir / "missing"
+    if missing_dir.exists():
+        map_names: set[str] = set()
+        map_file = book_dir / f"{book.book_name}_image_map.json"
+        if map_file.exists():
+            try:
+                for pair in json.loads(map_file.read_text(encoding="utf-8")).get("pairs", []):
+                    map_names.update(pair.get("ch", []) + pair.get("vi", []))
+            except (OSError, ValueError, AttributeError):
+                pass
+        for side in ("ch", "vi"):
+            side_dir = missing_dir / side
+            if not side_dir.exists():
+                continue
+            for name in ("Label.txt", "fileState.txt"):
+                if (side_dir / name).exists():
+                    issues.append(PackageIssue("MISSING_HAS_LABELS", f"missing/{side}/{name}", path=str(side_dir)))
+            for img in sorted(side_dir.glob("*.jpg")):
+                in_main = (book_dir / side / img.name).exists()
+                if side == "ch" and not in_main:
+                    issues.append(PackageIssue("MISSING_CH_NOT_IN_CH", img.name, path=str(side_dir)))
+                if side == "vi" and in_main:
+                    issues.append(PackageIssue("MISSING_VI_ALSO_IN_VI", img.name, path=str(side_dir)))
+                if map_names and img.name not in map_names:
+                    issues.append(PackageIssue("MISSING_NOT_IN_IMAGE_MAP", img.name, path=str(side_dir)))
 
     # CSV must be readable and internally consistent.
     if csv_path.exists():

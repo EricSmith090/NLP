@@ -72,3 +72,25 @@ def test_qn_multiple_boxes_become_one_union_box():
 def test_qn_empty_page_has_no_box():
     cleaned, boxes = order_and_clean_page("T1_Test", _page("qn", "vi", 13), "qn", [_box("- 3 -", 0, 0, 800, 1135, None)], None)
     assert boxes == [] and cleaned.text == ""
+
+
+def test_extract_page_applies_rotation_override(tmp_path):
+    import io
+
+    import pymupdf
+    from PIL import Image
+
+    from hannom.pages import extract_page
+
+    img = Image.new("RGB", (40, 60), "white")
+    img.paste((255, 0, 0), (0, 0, 10, 10))  # red mark top-left
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    doc = pymupdf.open()
+    page = doc.new_page(width=40, height=60)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    w, h, method, rotation = extract_page(doc, 1, tmp_path / "p.jpg", extra_rotation=180)
+    assert (w, h, rotation) == (40, 60, 180)
+    with Image.open(tmp_path / "p.jpg") as out:
+        r, g, b = out.convert("RGB").getpixel((35, 55))  # mark now bottom-right
+        assert r > 200 and g < 80 and b < 80

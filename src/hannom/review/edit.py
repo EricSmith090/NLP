@@ -200,7 +200,17 @@ def needs_manual(row: AlignmentRow) -> bool:
 
 
 def is_reviewed(row: AlignmentRow) -> bool:
-    return getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags
+    """A reviewer recorded a decision for the row (accept / unresolved / unmatched)."""
+    return getattr(row, "review_status", None) is not None
+
+
+def is_edited(row: AlignmentRow) -> bool:
+    return "CONTENT_EDITED" in row.flags
+
+
+def awaiting_decision(row: AlignmentRow) -> bool:
+    """Saved edits but no decision yet: easy to forget, so it has its own queue."""
+    return is_edited(row) and not is_reviewed(row)
 
 
 def pending_suggests(row: AlignmentRow) -> int:
@@ -212,6 +222,8 @@ def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_review
     idx = list(range(len(rows)))
     if not include_reviewed:
         idx = [i for i in idx if not is_reviewed(rows[i])]
+    if mode == "pending":
+        return [i for i in range(len(rows)) if awaiting_decision(rows[i])]
     if mode == "manual":
         return [i for i in idx if needs_manual(rows[i])]
     if mode == "warn":
@@ -223,6 +235,7 @@ def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_review
 
 
 def progress(rows: Sequence[AlignmentRow]) -> tuple[int, int]:
+    """(rows with a decision, all rows); saved-but-undecided rows do not count."""
     return sum(1 for r in rows if is_reviewed(r)), len(rows)
 
 
@@ -278,3 +291,121 @@ def atomic_save_labels(labels: Labels, path, folder: str) -> None:
         label_paths_save(labels, tmp_path, folder)
         _backup(path)
         os.replace(tmp_path, path)
+
+
+def select_row(
+    rows: Sequence[AlignmentRow], queue: Sequence[int], row_index: int, pinned_sid: str | None
+) -> tuple[int, int | None]:
+    """Which row to show: (index into rows, its position in the queue or None).
+
+    The row under review stays pinned by sentence_id across reruns, so saving
+    an edit never swaps the displayed row for another one even when the edit
+    moves the row in (or removes it from) a red-density queue.
+    """
+    if pinned_sid is not None:
+        for i, r in enumerate(rows):
+            if r.sentence_id == pinned_sid:
+                return i, (queue.index(i) if i in queue else None)
+    pos = max(0, min(int(row_index), len(queue) - 1))
+    return queue[pos], pos
+
+
+def next_position(queue: Sequence[int], current: int, current_pos: int | None, row_index: int) -> int:
+    """Queue position after accepting the current row: the following row, or
+    (when the current row already left the queue) the row now at its old slot."""
+    if current_pos is not None:
+        return min(len(queue) - 1, current_pos + 1)
+    return max(0, min(int(row_index), len(queue) - 1))
+
+
+def review_history(patches: Sequence[Any], decisions: Sequence[Any]) -> list[dict[str, str]]:
+    """Edits (patches) and decisions, newest first, for the review app."""
+    items: list[dict[str, str]] = []
+    for p in patches:
+        items.append({
+            "sentence_id": p.sentence_id, "kind": "edit", "what": f"sửa {p.field}",
+            "reviewer": p.reviewer, "timestamp": str(p.timestamp),
+            "detail": f"{str(p.before)[:80]} → {str(p.after)[:80]}",
+        })
+    for d in decisions:
+        items.append({
+            "sentence_id": d.sentence_id, "kind": "decision", "what": str(d.status),
+            "reviewer": d.reviewer, "timestamp": str(d.timestamp), "detail": str(getattr(d, "reason", "") or ""),
+        })
+    return sorted(items, key=lambda h: h["timestamp"], reverse=True)
+
+
+def reviewed_order(rows: Sequence[AlignmentRow], history: Sequence[Mapping[str, str]]) -> list[int]:
+    """Reviewed/edited rows, most recent activity first (rows without history last, in book order)."""
+    latest: dict[str, str] = {}
+    for h in history:
+        latest.setdefault(h["sentence_id"], h["timestamp"])
+    idx = [i for i, r in enumerate(rows) if is_reviewed(r) or is_edited(r) or r.sentence_id in latest]
+    return sorted(idx, key=lambda i: (latest.get(rows[i].sentence_id, ""), -i), reverse=True)
+
+
+def find_rows(rows: Sequence[AlignmentRow], query: str, limit: int = 30) -> list[int]:
+    """Rows whose sentence_id ends with the query (e.g. '487.9') or whose text contains it."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    by_id = [i for i, r in enumerate(rows) if r.sentence_id.endswith(q) or r.sentence_id.endswith("." + q)]
+    if by_id:
+        return by_id[:limit]
+    ql = q.lower()
+    return [i for i, r in enumerate(rows) if q in r.ch_txt or ql in r.vi_txt.lower()][:limit]
+
+
+def row_locations(
+    pairs: Sequence[Any], ch_labels: Labels, vi_labels: Labels, rows: Sequence[AlignmentRow], index: int
+) -> dict[str, dict[str, Any]]:
+    """Where row ``index`` sits in Label.txt, using the SYNC streams.
+
+    Returns {"ch": {image: sorted box indices}, "vi": {image: (start, end)}}
+    where (start, end) is the row's share of that QN page box as fractions
+    of its text (the QN page is one full-page box, so on the image this is
+    only an estimate of the vertical position).
+    """
+    from ..sync_check import _labels_by_image, _stream
+
+    out: dict[str, dict[str, Any]] = {"ch": {}, "vi": {}}
+    ch_order, vi_order = page_orders(list(pairs))
+    for side, labels, order, norm, col in (
+        ("ch", ch_labels, ch_order, norm_nom, "ch_txt"),
+        ("vi", vi_labels, vi_order, norm_vi, "vi_txt"),
+    ):
+        pages = _labels_by_image(labels)
+        _text, origin = _stream(pages, order, norm)
+        start = sum(len(norm(getattr(r, col))) for r in rows[:index])
+        end = start + len(norm(getattr(rows[index], col)))
+        span = origin[start:end]
+        if side == "ch":
+            boxes: dict[str, set[int]] = {}
+            for image, box in span:
+                boxes.setdefault(image, set()).add(box)
+            out["ch"] = {img: sorted(b) for img, b in boxes.items()}
+        else:
+            box_len: dict[tuple[str, int], int] = {}
+            first: dict[tuple[str, int], int] = {}
+            for pos, key in enumerate(origin):
+                box_len[key] = box_len.get(key, 0) + 1
+                first.setdefault(key, pos)
+            seen: dict[tuple[str, int], list[int]] = {}
+            for pos in range(start, min(end, len(origin))):
+                key = origin[pos]
+                seen.setdefault(key, []).append(pos - first[key])
+            for (image, _box), offs in seen.items():
+                n = box_len[(image, _box)] or 1
+                out["vi"][image] = (min(offs) / n, (max(offs) + 1) / n)
+    return out
+
+
+def mark_as_warn(row: AlignmentRow, element_index: int) -> AlignmentRow:
+    """Reviewer decision (v2.4 yellow): an error element whose Nôm and QN
+    differ in length but agree in meaning -- a proper name or a year, e.g.
+    阿綿 = "Amen" -- becomes a reviewed warn element."""
+    els = list(row.text_diff or [])
+    if 0 <= element_index < len(els) and els[element_index].type == "error":
+        els[element_index] = dataclasses.replace(els[element_index], type="warn", reviewed=1)
+        row.text_diff = els
+    return row

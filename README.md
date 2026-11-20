@@ -7,7 +7,15 @@ and submission packaging.
 
 **Deadline:** 2026-11-30  
 **Scope:** 3 books, 950 PDF pages, ≥95% similarity per book (not aggregate)  
-**Current status (2026-11-13):** deterministic stages (0–2) complete and re-verified.
+**Current status (2026-11-20, branch `fix/v24-conformance`):** all three books
+are aligned under Quy định v2.4 and pass the instructors' checker
+(`ocr-nom-align` v0.2.0) `check-diff --final` with 0 errors. Official
+similarity before human review: SLQ 90.81 %, Tap1 87.23 %, Tap2 87.38 %
+(target ≥ 95 % needs the review phase). QN OCR is Vintern-1B-v3.5. Plan and
+task status: `Doc/FIX_PLAN_v24.md` (§0.1); operator notes: `USER_GUIDE.md` §13.
+The paragraph below is the 2026-11-13 status, kept for history.
+
+**Status 2026-11-13 (historical):** deterministic stages (0–2) complete and re-verified.
 OCR: Tap1 (all 282 targets) and Tap3 (110) complete — Tap1 89.96%, Tap3 93.74%
 similarity (gates FAIL: coverage <0.9, unverified >0.05 and similarity <95 for
 both; closing requires human review, not code). Tap2 is only 6/550 pages OCR'd
@@ -183,7 +191,10 @@ stages, hashes, and metrics so a rerun resumes rather than redoing work.
   API-handled files in `data/ocr/<book>/`. `load_result` prefers the
   API-handled file and falls back to the local fallback file. Local-only
   runs remain available via `api_mode: local_only`.
-- QN OCR: Vintern-1B-v2 (Vietnamese-native VLM) is primary. benchmark on
+- QN OCR: Vintern-1B-v3.5 (`vintern_1b_v3_5`) is primary since 2026-11-19
+  (benchmark on 25 pages: phonetic recall vs the Nôm partner 0.218 → 0.707 on
+  pages v2 failed, 0.855 → 0.897 on normal pages; 10–20 s/page, ≈1.8 GB VRAM).
+  Vintern-1B-v2 stays available for comparison. Earlier v2 notes: benchmark on
   pages 11/41 gave near-perfect transcription of the archaic spelling,
   ~35 s/page, peak 2.3 GB VRAM (RTX 4060, 8 GB). Forces 1 full-page box
   per image (guideline p.12 allows one box per page). The Kim Hán Nôm API
@@ -233,6 +244,18 @@ are missing.
 
 ## Quality gate
 
+The gate and the report headline use the **Quy định v2.4 formula**, which is
+exactly what the instructors' `score` command computes:
+
+```text
+similarity (%) = (1 - red / scored) × 100   over every row with text_diff ≠ null
+red    = Σ over error elements of max(Nôm characters, QN tokens)
+scored = Nôm characters (〓 and PUA included) − yellow characters
+```
+
+`python tools/official_check.py` runs the official checker offline. The older
+internal "verified rows only" accuracy is still reported, as a secondary number:
+
 ```text
 accuracy (similarity %, verified rows only) =
   (1 - mismatched_red_characters / scored_nom_characters) × 100
@@ -253,8 +276,8 @@ coverage = (verified_match_rows + verified_difference_rows) / total_rows
 - The report records yellow-character ratio, null-row ratio, coverage, and
   per-class row counts (verified/unverified/unmatched).
 
-No final similarity is claimed yet. It will be measured after OCR and
-review; drafts are never used as evidence.
+Pre-review official similarity (2026-11-20): SLQ 90.81, Tap1 87.23,
+Tap2 87.38. Final numbers are measured after human review.
 
 ## Documentation
 
@@ -267,14 +290,14 @@ review; drafts are never used as evidence.
 ## Environment used for verification
 
 - Windows 11, Python 3.13.9 (`D:\anaconda3\python.exe`), 15.7 GB RAM.
-- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (used by Vintern-1B-v2 for QN OCR).
+- NVIDIA RTX 4060 Laptop GPU, 8 GB VRAM (used by Vintern-1B-v3.5 for QN OCR).
 - Local OCR (Nôm draft + geometry): paddlepaddle 3.3.1, paddleocr 3.7.0
   (+ opencv-contrib-python 4.10.0.84). paddlex defaults to oneDNN run mode,
   which crashes on this host (`pir::ArrayAttribute<pir::DoubleAttribute>` on
   the PIR path); the local adapter forces `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false`
   and uses PP-OCRv5 mobile det/rec. PyYAML stays at the pinned 6.0.3
   (paddlex 3.7.2 requests 6.0.2).
-- Vintern-1B-v2 (QN primary): torch 2.14.1+cu126, torchvision 0.29.1+cu126
+- Vintern (QN; v3.5 primary, v2 kept): torch 2.14.1+cu126, torchvision 0.29.1+cu126
   (install via `--index-url https://download.pytorch.org/whl/cu126`),
   transformers 4.46.3 (5.x incompatible), einops 0.8.2, timm 1.0.31,
   accelerate 1.15.0. A no-op `flash_attn` shim exists in site-packages; the

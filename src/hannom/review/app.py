@@ -40,7 +40,15 @@ from hannom.review.edit import (  # noqa: E402
     recompute_row_diff,
     red_density,
     reject_suggest,
+    awaiting_decision,
+    find_rows,
+    mark_as_warn,
+    review_history,
     review_queue,
+    reviewed_order,
+    row_locations,
+    select_row,
+    next_position,
     suggest_edit_text,
 )
 from hannom.review.patches import (  # noqa: E402
@@ -77,14 +85,33 @@ def _spans_html(text: str, spans: list[tuple[int, int, str]]) -> str:
     return "".join(out)
 
 
-def _overlay(image_path: Path, labels: dict, folder: str, image_name: str) -> Image.Image:
-    """Draw the boxes of ``<folder>/<image_name>`` from an already-read Label dict."""
+def _overlay(image_path: Path, labels: dict, folder: str, image_name: str,
+             highlight_boxes=(), band=None) -> Image.Image:
+    """Draw the boxes of ``<folder>/<image_name>``; the boxes holding the row
+    under review in thick red; for a QN page, a translucent band over the
+    estimated vertical position of the row (``band`` = (start, end) fractions)."""
     image = Image.open(image_path).convert("RGB")
+    boxes = labels.get(f"{folder}/{image_name}") or []
+    if band is not None and boxes:
+        pts = [tuple(float(v) for v in p) for p in (boxes[0].get("points") or [])]
+        if len(pts) == 4:
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            h = max(ys) - min(ys)
+            top = min(ys) + h * max(0.0, band[0] - 0.03)
+            bottom = min(ys) + h * min(1.0, band[1] + 0.03)
+            layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            ImageDraw.Draw(layer).rectangle([min(xs), top, max(xs), bottom], fill=(255, 200, 0, 70), outline=(230, 120, 0, 255), width=3)
+            image = Image.alpha_composite(image.convert("RGBA"), layer).convert("RGB")
     draw = ImageDraw.Draw(image)
-    for box in labels.get(f"{folder}/{image_name}") or []:
+    marked = set(highlight_boxes)
+    for k, box in enumerate(boxes):
         points = box.get("points") or []
         if len(points) == 4:
-            draw.polygon([tuple(float(v) for v in point) for point in points], outline=(0, 160, 0), width=2)
+            poly = [tuple(float(v) for v in point) for point in points]
+            if k in marked:
+                draw.polygon(poly, outline=(0, 90, 255), width=5)
+            else:
+                draw.polygon(poly, outline=(0, 160, 0), width=1)
     return image
 
 
@@ -147,6 +174,7 @@ def main() -> None:
     from hannom.review_decisions import apply_decisions  # noqa: E402
 
     decisions, failures, decision_issues = parse_decisions(decisions_file)
+    history = review_history(read_patches(patch_path), decisions)
     rows, decision_issues, _audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
     if decision_issues:
         st.warning(
@@ -163,36 +191,84 @@ def main() -> None:
     pairs = load_image_map(map_path) if map_path.exists() else []
 
     done, total = progress(rows)
-    st.sidebar.progress(done / total if total else 0.0, text=f"Đã review {done}/{total}")
+    st.sidebar.progress(done / total if total else 0.0, text=f"Đã chấp nhận/quyết định {done}/{total}")
+    pending = sum(1 for r in rows if awaiting_decision(r))
+    if pending:
+        st.sidebar.warning(f"{pending} câu đã lưu sửa nhưng CHƯA chấp nhận — xem hàng đợi \"Đã sửa, chưa chấp nhận\".")
     mode = st.sidebar.selectbox(
         "Hàng đợi",
-        ["red", "manual", "warn", "all"],
+        ["red", "pending", "manual", "warn", "reviewed", "all"],
         format_func={
             "red": "Mật độ đỏ giảm dần",
+            "pending": "Đã sửa, chưa chấp nhận",
             "manual": "Null / <5 ký tự (thủ công)",
             "warn": "Còn vàng chưa duyệt",
+            "reviewed": "Đã review / đã sửa (mới nhất trước)",
             "all": "Tất cả",
         }.get,
     )
-    hide_done = st.sidebar.checkbox("Ẩn dòng đã review", value=False)
-    queue = review_queue(rows, mode, include_reviewed=not hide_done)
-    if not queue:
+    hide_done = st.sidebar.checkbox("Ẩn dòng đã chấp nhận/quyết định", value=False)
+    if mode == "reviewed":
+        queue = reviewed_order(rows, history)
+    else:
+        queue = review_queue(rows, mode, include_reviewed=not hide_done)
+
+    # Jump to any sentence: by id (e.g. 487.9) or by a piece of its text.
+    query = st.sidebar.text_input("Tìm câu (mã câu, vd 487.9, hoặc đoạn chữ)", value="")
+    if query.strip():
+        hits = find_rows(rows, query)
+        if hits:
+            choice = st.sidebar.selectbox(
+                f"Kết quả ({len(hits)})", hits,
+                format_func=lambda i: f"{rows[i].sentence_id.rsplit(')', 1)[-1]} · {rows[i].vi_txt[:40]}",
+            )
+            if st.sidebar.button("Mở câu này"):
+                st.session_state.pinned_sid = rows[choice].sentence_id
+                st.rerun()
+        else:
+            st.sidebar.info("Không tìm thấy câu nào.")
+    if history:
+        with st.sidebar.expander("Sửa / quyết định gần đây", expanded=False):
+            for k, h in enumerate(history[:10]):
+                label = f"{h['sentence_id'].rsplit(')', 1)[-1]} · {h['what']} · {h['timestamp'][11:16]}"
+                if st.button(label, key=f"hist{k}"):
+                    st.session_state.pinned_sid = h["sentence_id"]
+                    st.rerun()
+    if not queue and not st.session_state.get("pinned_sid"):
         st.success("Hàng đợi trống.")
         return
+    if not queue:
+        queue = list(range(len(rows)))  # a pinned row outside an empty queue
     if "row_index" not in st.session_state:
         st.session_state.row_index = 0
+    if st.session_state.get("queue_key") != (book_id, mode, hide_done):
+        # A different book/queue: forget the pinned row.
+        st.session_state.queue_key = (book_id, mode, hide_done)
+        st.session_state.pinned_sid = None
     st.session_state.row_index = max(0, min(st.session_state.row_index, len(queue) - 1))
     position = st.sidebar.number_input(
         "Vị trí", min_value=1, max_value=len(queue), value=st.session_state.row_index + 1, step=1
     ) - 1
-    st.session_state.row_index = int(position)
-    row = rows[queue[st.session_state.row_index]]
+    if int(position) != st.session_state.row_index:  # the reviewer typed a position
+        st.session_state.row_index = int(position)
+        st.session_state.pinned_sid = None
+    # The row under review stays pinned by sentence_id: saving an edit that
+    # removes its red must not swap the displayed row for another one.
+    row_i, queue_pos = select_row(rows, queue, st.session_state.row_index, st.session_state.get("pinned_sid"))
+    row = rows[row_i]
+    st.session_state.pinned_sid = row.sentence_id
+    if queue_pos is not None:
+        st.session_state.row_index = queue_pos
     st.sidebar.write(f"`{row.sentence_id}` · đỏ {red_density(row):.0%}")
+    if queue_pos is None:
+        st.sidebar.info("Câu này đã rời hàng đợi sau khi sửa (vd. hết đỏ); vẫn giữ để bạn xem lại và chấp nhận.")
     if st.sidebar.button("← Câu trước"):
-        st.session_state.row_index = max(0, st.session_state.row_index - 1)
+        st.session_state.row_index = max(0, (queue_pos if queue_pos is not None else st.session_state.row_index) - 1)
+        st.session_state.pinned_sid = None
         st.rerun()
     if st.sidebar.button("Câu sau →"):
-        st.session_state.row_index = min(len(queue) - 1, st.session_state.row_index + 1)
+        st.session_state.row_index = next_position(queue, row_i, queue_pos, st.session_state.row_index)
+        st.session_state.pinned_sid = None
         st.rerun()
     reviewer = st.sidebar.text_input("Người review", value=os.environ.get("USERNAME", ""))
     reason = st.sidebar.text_input("Lý do", value="")
@@ -200,26 +276,36 @@ def main() -> None:
     nom_spans = [(s0, e0, el.type) for el in (row.text_diff or []) for s0, e0 in el.nom_pos]
     vi_spans = [(s0, e0, el.type) for el in (row.text_diff or []) for s0, e0 in el.vi_pos]
     native = project.data_dir / "pages" / book.book_id / "native"
+    try:
+        where = row_locations(pairs, ch_labels, vi_labels, rows, row_i)
+    except Exception:  # noqa: BLE001 - locating is a convenience, never a blocker
+        where = {"ch": {}, "vi": {}}
     left, right = st.columns([1, 1])
     with left:
         st.subheader("Ảnh")
         if (native / row.img_id).exists():
             # Folder-specific Label.txt: Nôm boxes come from ch/, QN boxes from vi/.
-            st.image(_overlay(native / row.img_id, ch_labels, "ch", row.img_id), caption=row.img_id,
-                     use_container_width=True)
+            st.image(_overlay(native / row.img_id, ch_labels, "ch", row.img_id,
+                              highlight_boxes=where["ch"].get(row.img_id, ())),
+                     caption=f"{row.img_id} — cột viền XANH DƯƠNG chứa câu đang xem (không phải lỗi)", width="stretch")
+            for other, other_boxes in where["ch"].items():  # the sentence continues on another Nôm page
+                if other != row.img_id and (native / other).exists():
+                    st.image(_overlay(native / other, ch_labels, "ch", other, highlight_boxes=other_boxes),
+                             caption=f"{other} — phần tiếp của câu", width="stretch")
         else:
             st.warning(f"Không thấy ảnh: {native / row.img_id}")
-        for pair in pairs:
-            if row.img_id in pair.ch:
-                for vi_img in pair.vi:
-                    if (native / vi_img).exists():
-                        st.image(_overlay(native / vi_img, vi_labels, "vi", vi_img), caption=vi_img,
-                                 use_container_width=True)
-                break
+        vi_images = list(where["vi"]) or next((list(p.vi) for p in pairs if row.img_id in p.ch), [])
+        for vi_img in vi_images:
+            if (native / vi_img).exists():
+                st.image(_overlay(native / vi_img, vi_labels, "vi", vi_img, band=where["vi"].get(vi_img)),
+                         caption=f"{vi_img} — dải vàng: vị trí ƯỚC LƯỢNG của câu (theo tỉ lệ chữ trên trang)",
+                         width="stretch")
         st.write(f"Confidence: {row.confidence if row.confidence is not None else 'N/A'}")
         st.code(", ".join(row.flags) or "(none)")
     with right:
         st.subheader("Căn hàng")
+        if row_i > 0:
+            st.caption(f"Câu trước: {rows[row_i - 1].vi_txt[-120:]}")
         st.markdown("**Nôm**")
         st.markdown(
             f"<div style='font-size:20px;line-height:1.8'>{_spans_html(row.ch_txt, nom_spans)}</div>",
@@ -230,7 +316,15 @@ def main() -> None:
             f"<div style='font-size:16px;line-height:1.8'>{_spans_html(row.vi_txt, vi_spans)}</div>",
             unsafe_allow_html=True,
         )
+        if row_i + 1 < len(rows):
+            st.caption(f"Câu sau: {rows[row_i + 1].vi_txt[:120]}")
         st.caption(f"text_diff: {diff_summary(row.text_diff)}")
+        mine = [h for h in history if h["sentence_id"] == row.sentence_id]
+        with st.expander(f"Lịch sử câu này ({len(mine)})", expanded=bool(mine)):
+            if not mine:
+                st.write("Chưa có sửa hay quyết định nào.")
+            for h in mine:
+                st.write(f"{h['timestamp'][:16].replace('T', ' ')} · {h['reviewer']} · **{h['what']}** · {h['detail']}")
 
     def _persist(edit_ch=None, edit_vi=None, mutate=None) -> bool:
         """Apply a text edit (Label.txt + CSV together) and/or a text_diff change to the row."""
@@ -268,11 +362,27 @@ def main() -> None:
             if edit_vi is not None:
                 atomic_save_labels(new_vi, label_dir / "vi" / "Label.txt", "vi")
         if mutate is not None:
+            import copy as _copy
+
+            snapshot = _copy.deepcopy(raw[idx])
             mutate(raw[idx])
+            after_diff = raw[idx].text_diff_json()
+            if after_diff != snapshot.text_diff_json():  # logged so the choice survives a re-alignment
+                patches.append(make_patch(snapshot, book_id=book.book_id, field="text_diff", after=after_diff,
+                                          reviewer=reviewer.strip(), reason=reason.strip() or "text_diff review"))
         atomic_save_csv(csv_path, raw)
         for patch in patches:  # audit trail; re-applying is a no-op thanks to after/hash checks
             append_patch(patch_path, patch)
         return True
+
+    reds = [(k, el) for k, el in enumerate(row.text_diff or []) if el.type == "error"]
+    if reds:
+        st.markdown("**Phần tử đỏ** — chỉ chuyển sang vàng khi khác số chữ nhưng đúng nghĩa (tên riêng, năm), theo v2.4")
+        for k, el in reds:
+            c1, c2 = st.columns([4, 1])
+            c1.write(f"{el.nom_sub_text or '∅'} ↔ {el.vi_sub_text or '∅'}")
+            if c2.button("→ Vàng (tên riêng/năm)", key=f"y{k}") and _persist(mutate=lambda r, k=k: mark_as_warn(r, k)):
+                st.rerun()
 
     st.markdown("**Cảnh báo vàng**")
     for k, el in enumerate(row.text_diff or []):
@@ -387,7 +497,11 @@ def main() -> None:
             # The decision hash binds the approval to the persisted content.
             _record_decision(status, row.ch_txt, row.vi_txt, row.text_diff_json())
             if accept_next:
-                st.session_state.row_index = min(len(queue) - 1, st.session_state.row_index + 1)
+                nxt = next_position(queue, row_i, queue_pos, st.session_state.row_index)
+                if hide_done and queue_pos is not None:
+                    nxt = queue_pos  # the accepted row leaves the queue; the next one takes its slot
+                st.session_state.row_index = nxt
+                st.session_state.pinned_sid = None
             st.rerun()
 
 

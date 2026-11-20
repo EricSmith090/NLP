@@ -129,3 +129,13 @@ def test_trim_loop_keeps_text_before_second_cycle():
     assert "\n" in text  # original line breaks are kept
     clean = head + cycle
     assert trim_loop(clean) == (clean, False)
+
+
+def test_dedupe_adjacent_repeats_removes_loop_copies_only():
+    from hannom.ocr.local_vintern import dedupe_adjacent_repeats
+
+    s = "Sau hết, chẳng làm thà vô cùng, lòng lành vô cùng, thì Người chẳng nói dối người ta được."
+    text, n = dedupe_adjacent_repeats("Đầu trang. " + s + " " + s + " Câu cuối.")
+    assert n == 1 and text == "Đầu trang. " + s + " Câu cuối."
+    far = s + " Một đoạn khác khá dài ở giữa trang có hơn mười hai chữ để tách hai lần lặp này ra xa nhau. " + s
+    assert dedupe_adjacent_repeats(far) == (far, 0)

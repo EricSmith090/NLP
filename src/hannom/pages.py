@@ -134,13 +134,15 @@ def extract_page(
     doc: pymupdf.Document,
     page_no: int,
     dest: Path,
+    extra_rotation: int = 0,
 ) -> tuple[int, int, str, int]:
     """Extract PDF page *page_no* (1-based) to *dest*.
 
-    Returns (width, height, method, pdf_rotation).
+    ``extra_rotation`` (clockwise degrees, book config ``rotation_overrides``)
+    is added to the PDF /Rotate. Returns (width, height, method, rotation).
     """
     page = doc[page_no - 1]
-    rotation = int(page.rotation or 0)
+    rotation = (int(page.rotation or 0) + int(extra_rotation)) % 360
     candidates = _image_candidates(page)
 
     if len(candidates) == 1 and not _matrix_is_rotated(candidates[0]):
@@ -167,6 +169,13 @@ def extract_page(
         fallback = max(page.rect.width * 2.0, 1600.0)
         target_width = min(fallback, float(largest)) if largest > 0 else fallback
     w, h = _render_page(page, dest, target_width)
+    if int(extra_rotation) % 360:
+        # The renderer applies the PDF /Rotate itself; apply the override.
+        with Image.open(dest) as im:
+            turned = im.transpose({90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
+                                   270: Image.Transpose.ROTATE_90}[int(extra_rotation) % 360])
+            turned.save(dest, format="JPEG", quality=95, subsampling=0, optimize=False)
+            w, h = turned.size
     return w, h, "rendered", rotation
 
 
@@ -225,12 +234,27 @@ def extract_book(
         for page_no in range(1, doc.page_count + 1):
             dest = out_dir / image_name(book.book_name, page_no)
             digest: str | None = None
+            extra = int(book.rotation_overrides.get(page_no, 0)) % 360
+            wanted_rotation = (int(doc[page_no - 1].rotation or 0) + extra) % 360
+            old = state.page(book.book_id, page_no)
+            if dest.exists() and not force and old is not None and int(old.rotation or 0) != wanted_rotation:
+                # Orientation override added/changed: re-extract this page but
+                # keep its downstream state (folder, script, OCR status); the
+                # new sha makes the cached OCR stale so it is re-run.
+                width, height, method, rotation = extract_page(doc, page_no, dest, extra)
+                digest = sha256_file(dest)
+                state.stage1_update(
+                    book.book_id, page_no, image_name=dest.name, pdf_page=page_no, sha256=digest,
+                    width=width, height=height, path=dest, extraction_method=method, rotation=rotation,
+                )
+                records.append(replace(old, width=width, height=height, path=dest, extraction_method=method,
+                                       rotation=rotation, sha256=digest, image_name=dest.name))
+                continue
             if dest.exists() and not force:
                 with Image.open(dest) as im:
                     width, height = im.size
-                rotation = int(doc[page_no - 1].rotation or 0)
+                rotation = wanted_rotation
                 digest = sha256_file(dest)
-                old = state.page(book.book_id, page_no)
                 if old is not None and old.sha256 == digest:
                     # The file is unchanged: refresh only Stage-1 columns
                     # so downstream state (status/OCR/flags/features) is
@@ -263,7 +287,7 @@ def extract_book(
                     continue
                 method = "existing"
             else:
-                width, height, method, rotation = extract_page(doc, page_no, dest)
+                width, height, method, rotation = extract_page(doc, page_no, dest, extra)
             if digest is None:
                 digest = sha256_file(dest)
             record = PageRecord(
