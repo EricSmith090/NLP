@@ -158,6 +158,30 @@ def previous_rows_for_pinning(csv_path: Path, decisions, decision_issues, failur
     return rows
 
 
+def toc_nom_images(alignment_config: dict[str, Any] | None, book_id: str, pairs: Sequence[Any]) -> set[str]:
+    """Nôm images paired with the book's QN table-of-contents pages
+    (``alignment.per_book.<book>.toc_qn_pages``).
+
+    Rows there are cut by the TOC rule (instructor, 2026-11-21) and are not
+    pinned: reviews made before the rule existed judged rows the rule
+    replaces. A decision whose row comes out of the new cut unchanged still
+    verifies (by sentence_id, or relocated by content).
+    """
+    raw = alignment_config or {}
+    cfg = raw.get("alignment", raw) or {}
+    pages = {int(p) for p in (((cfg.get("per_book") or {}).get(book_id) or {}).get("toc_qn_pages") or ())}
+    if not pages:
+        return set()
+
+    def number(name: str) -> int | None:
+        try:
+            return int(str(name).split(".")[-2])
+        except (ValueError, IndexError):
+            return None
+
+    return {ch for pair in pairs if any(number(v) in pages for v in pair.vi) for ch in pair.ch}
+
+
 def pinned_indices(rows: Sequence[AlignmentRow]) -> list[int]:
     """Rows whose review decision verifies with an accepting status."""
     return [

@@ -20,6 +20,12 @@ alignment:
       strip_texts: ["所𥚇卷"]
     T1_CamPhong_Tap1:
       segmentation: charalign
+      # Table of contents: QN PDF 15–20 (↔ Nôm PDF 263, 273–269). Instructor
+      # 2026-11-21: TOC pages are aligned too, one row per entry with its page
+      # number ("Ban sớm mai[...]. 206"; a bare "206" row is under 5 words and
+      # means nothing). Rows end after each page number, never at ":"
+      # (hannom.charstream.toc_sentence_spans).
+      toc_qn_pages: [15, 16, 17, 18, 19, 20]
       # Quy định v2.4 "chữ Nôm nghi ngờ bị nhận dạng sai nhưng có gợi ý thay thế
       # (bảng chữ giống hình)": the Kim Hán Nôm API reads these glyphs of this
       # book's typeface as a similar-looking wrong char (raw API output, not the

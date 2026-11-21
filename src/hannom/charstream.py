@@ -20,14 +20,15 @@ This module is a *segmentation provider*: it only decides where rows are cut.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Collection, Sequence
 
 from .charalign import Matcher, Op, QnToken, NomChar, align_streams, fold
 from .anchors import gather_readings
 from .clean import is_nom_char, nfc
-from .cosegment import qn_sentence_spans
+from .cosegment import QN_TOKEN_RE, qn_sentence_spans
 from .dictionary.readings import norm_reading
 
 
@@ -90,6 +91,117 @@ class _EntryReadingsAdapter:
         return len(self._cache)
 
 
+# A page number in a table of contents: digits not inside a word or "(267)".
+TOC_NUMBER_RE = re.compile(r"(?<![\w(])\d{1,4}(?![\w)])")
+TOC_MIN_TOKENS = 3  # a shorter TOC piece ("Tựa 1") is part of the line before it
+
+
+def toc_sentence_spans(
+    text: str, spans: Sequence[tuple[int, int, int]], ranges: Sequence[tuple[int, int]]
+) -> list[tuple[int, int, int]]:
+    """Re-cut QN sentences inside table-of-contents pages (instructor, 2026-11-21).
+
+    One row per entry, the page number with its title ("Ban sớm mai[...]. 206"):
+    the QN prints the number after the title ("… mà ra. 58 - Ban chiều hôm …"),
+    the Nôm at the foot of the title's column. Inside ``ranges`` (offsets of the
+    TOC pages in ``text``):
+
+    - a cut goes right after every page number (a number followed by the end,
+      a bullet/dash or a capital: not "đủ 10 ngày", not "(267)");
+    - the sentence stop just before a page number is dropped (the number
+      belongs to the sentence it follows), and so is a stop after ":" ("Bài
+      thứ tám: Phải xưng …" is one title);
+    - a piece with fewer than ``TOC_MIN_TOKENS`` words joins the piece before it
+      ("Cấm phòng cho bổn đạo đủ 10 ngày. Tựa 1" is one printed line).
+    Cuts outside the ranges are untouched.
+    """
+    if not ranges or not spans:
+        return list(spans)
+
+    def in_toc(pos: int) -> bool:
+        return any(a <= pos < b for a, b in ranges)
+
+    page_number_ends: set[int] = set()
+    for m in TOC_NUMBER_RE.finditer(text):
+        if not in_toc(m.start()):
+            continue
+        rest = text[m.end():].lstrip()
+        if not rest or rest[0] in "-–+•✣" or rest[0].isupper() or rest[0].isdigit():
+            page_number_ends.add(m.end())
+
+    cuts: set[int] = set()
+    for _start, end, _n in spans[:-1]:
+        if not in_toc(end - 1):
+            cuts.add(end)
+            continue
+        if text[:end].rstrip().endswith(":"):
+            continue
+        after = text[end:]
+        nxt = TOC_NUMBER_RE.match(text, end + len(after) - len(after.lstrip()))
+        if nxt and nxt.end() in page_number_ends:
+            continue
+        cuts.add(end)
+    cuts |= page_number_ends
+    # The table of contents starts a row of its own (e.g. after a title page
+    # whose last line has no sentence stop).
+    for a, _b in ranges:
+        before = text[:a].rstrip()
+        if before and not in_toc(len(before) - 1):
+            cuts.add(a)
+
+    def build(points: list[int]) -> list[tuple[int, int, int]]:
+        out = []
+        for a, b in zip([0] + points, points + [len(text)]):
+            seg = text[a:b].strip()
+            if seg:
+                real = a + text[a:b].find(seg)
+                out.append((real, real + len(seg), len(QN_TOKEN_RE.findall(seg))))
+        return out
+
+    out = build(sorted(cuts))
+    merged: list[tuple[int, int, int]] = []
+    for span in out:
+        if merged and span[2] < TOC_MIN_TOKENS and in_toc(span[0]) and in_toc(merged[-1][1] - 1):
+            a, _b, n = merged.pop()
+            merged.append((a, span[1], n + span[2]))
+        else:
+            merged.append(span)
+    return merged
+
+
+TOC_NUMERALS = frozenset("〇零一二三四五六七八九十百千廿卄卅")
+
+
+def keep_numeral_runs_together(nom_chars: Sequence[Any], ops: Sequence[Any], op_sentence: list[int],
+                               pages: Collection[str]) -> list[int]:
+    """On TOC Nôm pages a page number (二百六十四) is never cut in two.
+
+    A run of consecutive Nôm numerals whose ops fall in different sentences
+    goes whole to the earliest one: in a table of contents the number ends
+    its entry. Returns the new sentence index per op.
+    """
+    out = list(op_sentence)
+    if not pages:
+        return out
+    by_i = {op.i: k for k, op in enumerate(ops) if op.i is not None}
+    i = 0
+    n = len(nom_chars)
+    while i < n:
+        if nom_chars[i].ch in TOC_NUMERALS and nom_chars[i].page in pages and i in by_i:
+            j = i
+            while j + 1 < n and nom_chars[j + 1].ch in TOC_NUMERALS and nom_chars[j + 1].page in pages and j + 1 in by_i:
+                j += 1
+            ks = [by_i[x] for x in range(i, j + 1)]
+            first = min(out[k] for k in ks)
+            if max(out[k] for k in ks) != first:
+                for k in ks:
+                    out[k] = first
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
 def nom_ideograph_positions(text: str) -> list[int]:
     """Global offsets of ideographs (incl. Kim Hán Nôm PUA + 〓) in the Nôm stream."""
     out: list[int] = []
@@ -108,12 +220,14 @@ def stream_segments_by_charalign(
     readings_cache: Any | None = None,
     strip_texts: Sequence[str] = (),
     band: int = 400,
+    toc_qn_pages: Collection[int] = (),
 ) -> tuple[list[Any], list[Any], list[str]] | None:
     """Align the Nôm and Quốc ngữ reading streams, then cut at QN punctuation.
 
     Returns ``(nom_segments, qn_segments, warnings)`` with ``TextSegment``
     entries; index i of each list is one aligned sentence pair. Returns None
-    when the streams are too small to align.
+    when the streams are too small to align. ``toc_qn_pages``: PDF page
+    numbers of QN table-of-contents pages, cut by ``toc_sentence_spans``.
     """
     from hannom.align import TextSegment  # lazy import to avoid a module cycle
 
@@ -150,6 +264,10 @@ def stream_segments_by_charalign(
 
     # QN sentence spans from the shared sentence splitter (hannom.cosegment.qn_sentence_spans).
     sentences = qn_sentence_spans(qn_text)
+    if toc_qn_pages:
+        toc = {int(p) for p in toc_qn_pages}
+        ranges = [(start, end) for name, _no, start, end in qn_spans if _page_number(name) in toc]
+        sentences = toc_sentence_spans(qn_text, sentences, ranges)
     if len(sentences) < 2:
         return None
 
@@ -159,7 +277,6 @@ def stream_segments_by_charalign(
         return None
 
     # QN tokens with global offsets (page-joined text shares one coordinate system).
-    import re
     token_re = re.compile(r"[^\W_]+", re.UNICODE)
     qn_tokens = [
         QnToken(match.group(0), norm_reading(match.group(0)), fold(match.group(0)), match.start(), match.end(), "")
@@ -258,6 +375,9 @@ def stream_segments_by_charalign(
             if op_sentence[k] > op_sentence[start - 1] and nxt.kind not in {"exact", "fold"}:
                 for m in range(start, k):
                     op_sentence[m] = op_sentence[k]
+    if toc_qn_pages:
+        toc_nom = {name for pair in pairs if any(_page_number(v) in toc for v in pair.vi) for name in pair.ch}
+        op_sentence = keep_numeral_runs_together(nom_chars, ops, op_sentence, toc_nom)
     by_sentence: dict[int, list[Op]] = {}
     for op, sidx in zip(ops, op_sentence):
         by_sentence.setdefault(sidx, []).append(op)

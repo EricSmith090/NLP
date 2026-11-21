@@ -694,7 +694,9 @@ def compute_alignment(
     reviewed Label.txt text and keep the previous rows wherever a reviewer
     accepted one. Returns (rows, summary without sync_errors, pairs).
     """
-    from .resegment import overlay_label_text, pin_reviewed_rows, pinned_indices, previous_rows_for_pinning
+    from .resegment import (
+        overlay_label_text, pin_reviewed_rows, pinned_indices, previous_rows_for_pinning, toc_nom_images,
+    )
 
     pairs = _load_pairs(project, book, state)
     cleaned = load_cleaned_pages(project, book)
@@ -750,8 +752,12 @@ def compute_alignment(
             )
     if reseg and previous_rows is not None:
         pinned = pinned_indices(previous_rows)
+        toc_images = toc_nom_images(project.alignment_config, book.book_id, pairs)
+        released = [previous_rows[k].sentence_id for k in pinned if previous_rows[k].img_id in toc_images]
+        pinned = [k for k in pinned if previous_rows[k].img_id not in toc_images]
         rows, pin_report = pin_reviewed_rows(previous_rows, rows, pinned)
         reseg_summary.update(pin_report)
+        reseg_summary["pins_released_on_toc_pages"] = released
         # Every text edit already sits in the Label.txt text the rows were cut
         # from; replaying text patches on re-cut rows could paste text twice.
         patches = [p for p in patches if p.field not in ("ch_txt", "vi_txt")]

@@ -118,6 +118,19 @@ def test_no_previous_csv_means_no_pinning_not_a_failure(tmp_path):
     assert previous_rows_for_pinning(tmp_path / "missing.csv", [], [], []) is None
 
 
+def test_toc_pages_are_not_pinned():
+    from types import SimpleNamespace as NS
+
+    from hannom.resegment import toc_nom_images
+
+    pairs = [NS(ch=["B.276.jpg"], vi=["Q.013.jpg"]), NS(ch=["B.263.jpg"], vi=["Q.015.jpg"]),
+             NS(ch=["B.273.jpg", "B.272.jpg"], vi=["Q.016.jpg", "Q.017.jpg"]), NS(ch=["B.268.jpg"], vi=["Q.021.jpg"])]
+    cfg = {"alignment": {"per_book": {"B": {"toc_qn_pages": [15, 16, 17]}}}}
+    assert toc_nom_images(cfg, "B", pairs) == {"B.263.jpg", "B.273.jpg", "B.272.jpg"}
+    assert toc_nom_images(cfg, "other", pairs) == set()
+    assert toc_nom_images(None, "B", pairs) == set()
+
+
 def test_overlay_joins_boxes_like_clean(tmp_path):
     # clean.py: Nôm page text = "".join(lines), QN page text = " ".join(lines).
     # A "\n" between Nôm column boxes reached the CSV cells (official FORM

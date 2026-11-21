@@ -910,6 +910,7 @@ def align_book(
     cfg = replace(cfg, text_diff_suggest_rules=suggest_rules_from_config(config, book_id))
     segmentation = str(per_book.get("segmentation") or cfg.segmentation or "cosegment")
     strip_texts = tuple(per_book.get("strip_texts") or cfg.strip_texts or ())
+    toc_qn_pages = tuple(int(p) for p in (per_book.get("toc_qn_pages") or ()))
     if segmentation == "charalign":
         from .charstream import stream_segments_by_charalign
         warnings: list[str] = []
@@ -919,6 +920,7 @@ def align_book(
                 lexicon=lexicon, dictionary=dictionary,
                 readings_cache=readings_cache,
                 strip_texts=strip_texts,
+                toc_qn_pages=toc_qn_pages,
             )
         except Exception as exc:  # fall back loudly, never crash the stage silently
             stream = None
