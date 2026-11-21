@@ -449,3 +449,15 @@ def test_all_statuses_are_known_constants():
         "unmatched",
         "rejected",
     }
+
+
+def test_same_reviewer_can_change_their_own_verdict():
+    row = _row("Book.001.1", ch="字", vi="thì")
+    kw = dict(book_id="b", sentence_id="Book.001.1", reviewer="Thiên Khanh", ch_txt=row.ch_txt,
+              vi_txt=row.vi_txt, text_diff_json=row.text_diff_json())
+    first = make_decision(status=STATUS_ACCEPTED_DIFFERENCE, timestamp="2026-11-20T07:58:48+00:00", **kw)
+    second = make_decision(status=STATUS_ACCEPTED_MATCH, timestamp="2026-11-20T07:58:49+00:00", **kw)
+    rows, issues, _audit = apply_decisions([row], [first, second])
+    (applied,) = rows
+    assert applied.review_status == STATUS_ACCEPTED_MATCH and applied.decision_integrity == "valid"
+    assert not any("REVIEW_DECISION_CONFLICT" in issue for issue in issues)

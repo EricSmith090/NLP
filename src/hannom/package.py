@@ -556,6 +556,7 @@ def validate_book_package(
                 ch_names=ch_names | missing_ch,
                 vi_names=vi_names | missing_vi,
                 vi_to_nom_offset=getattr(book, "vi_to_nom_offset", None),
+                marker_overrides=getattr(book, "marker_overrides", None),
             ):
                 issues.append(PackageIssue("IMAGE_MAP_INVALID", msg, path=str(book_dir)))
             # Label.txt <-> CSV SYNC, official normalisation (FIX_PLAN T1.4): blocking.

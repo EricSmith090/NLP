@@ -124,7 +124,9 @@ def apply_row_edit(
 # --- text_diff after an edit -------------------------------------------------
 
 def recompute_row_diff(
-    row: AlignmentRow, *, lexicon=None, dictionary=None, readings_cache=None, mark_edited: bool = True
+    row: AlignmentRow, *, lexicon=None, dictionary=None, readings_cache=None, mark_edited: bool = True,
+    warn_rules=(),
+    suggest_rules=(),
 ) -> AlignmentRow:
     """Spec-policy text_diff for one row; keeps accepted (reviewed=1) warns; flags CONTENT_EDITED."""
     from ..orchestrator import _rederivable_text_diff_flag
@@ -137,7 +139,7 @@ def recompute_row_diff(
     if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
         row.text_diff = None
     else:
-        diff = spec_text_diff(row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary,
+        diff = spec_text_diff(row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary, warn_rules=warn_rules, suggest_rules=suggest_rules,
                               readings_cache=readings_cache)
         row.text_diff = diff.elements
         row.flags = sorted(
@@ -166,8 +168,10 @@ def accept_warn(row: AlignmentRow, element_index: int, reviewed: int = 1) -> Ali
 
 
 def reject_suggest(row: AlignmentRow, element_index: int) -> AlignmentRow:
+    """Quy định v2.4 case (c): keep the OCR char, the element becomes a plain
+    red error (suggest, suggest_by and reviewed dropped)."""
     el = (row.text_diff or [])[element_index]
-    row.text_diff[element_index] = dataclasses.replace(el, suggest=None, suggest_by=None)
+    row.text_diff[element_index] = dataclasses.replace(el, type="error", reviewed=None, suggest=None, suggest_by=None)
     return row
 
 
@@ -178,6 +182,56 @@ def suggest_edit_text(row: AlignmentRow, element_index: int) -> str:
         raise EditError("element has no suggest to accept")
     s, e = el.nom_pos[0]
     return row.ch_txt[:s] + el.suggest + row.ch_txt[e:]
+
+
+def suggest_edit_text_all(row: AlignmentRow) -> str:
+    """ch_txt with every pending suggestion of the row accepted (one char each)."""
+    chars = list(row.ch_txt)
+    found = False
+    for el in row.text_diff or []:
+        if el.type == "warn" and el.suggest and el.nom_pos:
+            s, e = el.nom_pos[0]
+            if e - s != 1 or len(el.suggest) != 1:
+                raise EditError("a suggestion must replace exactly one Nôm char")
+            chars[s] = el.suggest
+            found = True
+    if not found:
+        raise EditError("row has no suggestion to accept")
+    return "".join(chars)
+
+
+def nom_stream_index(pairs: Sequence[Any], ch_labels: Labels, rows: Sequence[AlignmentRow]) -> dict[str, Any]:
+    """Precomputed Label.txt Nôm stream for ``nom_char_location`` (one pass per page view)."""
+    from ..sync_check import _labels_by_image, _stream
+
+    ch_order, _vi_order = page_orders(list(pairs))
+    _text, origin = _stream(_labels_by_image(ch_labels), ch_order, norm_nom)
+    starts, total = [], 0
+    for r in rows:
+        starts.append(total)
+        total += len(norm_nom(r.ch_txt))
+    first: dict[tuple[str, int], int] = {}
+    count: dict[tuple[str, int], int] = {}
+    for k, key in enumerate(origin):
+        first.setdefault(key, k)
+        count[key] = count.get(key, 0) + 1
+    return {"origin": origin, "starts": starts, "first": first, "count": count}
+
+
+def nom_char_location(
+    pairs: Sequence[Any], ch_labels: Labels, rows: Sequence[AlignmentRow], index: int, pos: int,
+    stream: dict[str, Any] | None = None,
+) -> tuple[str, int, int, int] | None:
+    """(image, box index, char index inside the box, chars in the box) of
+    ``rows[index].ch_txt[pos]``, from the Label.txt SYNC stream; None when the
+    row is not in SYNC with Label.txt at that point."""
+    stream = stream or nom_stream_index(pairs, ch_labels, rows)
+    origin = stream["origin"]
+    k = stream["starts"][index] + len(norm_nom(rows[index].ch_txt[:pos]))
+    if k >= len(origin):
+        return None
+    key = origin[k]
+    return key[0], key[1], k - stream["first"][key], stream["count"][key]
 
 
 # --- review queue ------------------------------------------------------------
@@ -224,10 +278,14 @@ def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_review
         idx = [i for i in idx if not is_reviewed(rows[i])]
     if mode == "pending":
         return [i for i in range(len(rows)) if awaiting_decision(rows[i])]
+    if mode == "undecided":
+        return [i for i in range(len(rows)) if not is_reviewed(rows[i])]
     if mode == "manual":
         return [i for i in idx if needs_manual(rows[i])]
     if mode == "warn":
         return [i for i in idx if any(e.type == "warn" and e.reviewed != 1 for e in (rows[i].text_diff or []))]
+    if mode == "suggest":
+        return [i for i in range(len(rows)) if pending_suggests(rows[i])]
     if mode == "red":
         idx = [i for i in idx if red_density(rows[i]) > 0 or needs_manual(rows[i])]
         return sorted(idx, key=lambda i: (-red_density(rows[i]), i))
@@ -398,6 +456,16 @@ def row_locations(
                 n = box_len[(image, _box)] or 1
                 out["vi"][image] = (min(offs) / n, (max(offs) + 1) / n)
     return out
+
+
+def normalize_cell(text: str, field: str) -> str:
+    """CSV/Label cells never hold line breaks (v2.4 FORM): QN line breaks become
+    one space, Nôm whitespace is removed (Nôm is written without spaces)."""
+    import re as _re
+
+    if field == "ch_txt":
+        return _re.sub(r"\s+", "", text)
+    return _re.sub(r"[ \t]*[\r\n]+[ \t]*", " ", text).strip()
 
 
 def mark_as_warn(row: AlignmentRow, element_index: int) -> AlignmentRow:

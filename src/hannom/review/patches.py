@@ -174,8 +174,10 @@ def apply_patches_checked(
     rejected: list[RejectedPatch] = []
     patches = list(patches)
     # A patch followed by another edit of the same field of the same row
-    # (its `after` is the next one's `before`) is superseded: only the chain's
-    # last state matters, so the intermediate never counts as stale.
+    # (its `after` is the next one's `before`) is superseded. On a CSV that
+    # already holds the chain's last state it cannot apply and is not stale;
+    # on a freshly regenerated CSV it must still be applied, in order, so the
+    # next link finds its `before`. So: try it, never report it as rejected.
     superseded = {
         id(p) for p in patches
         for q in patches
@@ -188,8 +190,6 @@ def apply_patches_checked(
             for r in rows if not patch.img_id or r.img_id == patch.img_id
         ):
             continue  # the edited text is already in place (re-segmented row / replayed edit)
-        if id(patch) in superseded:
-            continue
         if patch.row_hash:
             cands = [r for r in index.get(patch.row_hash, []) if not patch.img_id or r.img_id == patch.img_id]
             if not cands and patch.after_hash:
@@ -233,6 +233,7 @@ def apply_patches_checked(
         if "CONTENT_EDITED" not in row.flags:
             row.flags.append("CONTENT_EDITED")
         register(row_content_hash(row.img_id, row.ch_txt, row.vi_txt), row)
+    rejected = [r for r in rejected if id(r.patch) not in superseded]
     return rows, rejected
 
 

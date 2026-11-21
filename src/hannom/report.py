@@ -614,7 +614,11 @@ def load_report_config(project: ProjectConfig) -> ReportData:
 
                     map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
                     if map_path.exists():
-                        origins = stream_origins(load_image_map(map_path), load_cleaned_pages(project, book))
+                        from .labels import read_label_txt
+
+                        ch_label = project.data_dir / "labels" / book.book_id / "ch" / "Label.txt"
+                        origins = stream_origins(load_image_map(map_path), load_cleaned_pages(project, book),
+                                                 read_label_txt(ch_label) if ch_label.exists() else None)
                 except Exception:  # noqa: BLE001 - the report still lists positions
                     origins = None
                 data.book_stats[book.book_id] = compute_book_report_stats(

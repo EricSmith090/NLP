@@ -679,6 +679,12 @@ def apply_decisions(
             for prev in reversed(applied_valid):
                 if prev.content_sha256 != event.content_sha256:
                     continue
+                if str(prev.reviewer).strip().casefold() == str(event.reviewer).strip().casefold():
+                    # A reviewer may change their own verdict on the same
+                    # revision (e.g. a double click, or match -> difference):
+                    # the latest one wins. Only two different reviewers who
+                    # disagree are a conflict that needs adjudication.
+                    continue
                 conflict = _incompatible_transition(prev, event)
                 if conflict:
                     break

@@ -11,12 +11,53 @@ alignment:
       strip_texts: ["所𥚇卷"]
     T1_CamPhong_Tap1:
       segmentation: charalign
+      # Quy định v2.4 "chữ Nôm nghi ngờ bị nhận dạng sai nhưng có gợi ý thay thế
+      # (bảng chữ giống hình)": the Kim Hán Nôm API reads these glyphs of this
+      # book's typeface as a similar-looking wrong char (raw API output, not the
+      # pipeline). A red OCR char facing the listed syllable becomes yellow with
+      # suggest / suggest_by "similar" / reviewed 0; ch_txt and Label.txt keep the
+      # OCR char until a reviewer accepts (→ black) or rejects (→ red) it in the
+      # review app. Evidence (2026-11-20): 10 random crops per glyph across PDF
+      # 152–248 + a font rendering of the suggested char side by side, saved in
+      # data/diagnostics/ocr_suggest/T1_CamPhong_Tap1/.
+      # Exception seen: PDF 270 "仍事嚉詐逆" (dối trá) is a real 嚉, which is
+      # why every suggestion is confirmed one by one.
+      text_diff_suggest_rules: &camphong_suggest_rules
+        - {ocr: "𠯇", suggest: "吧", qn: "và", note: "in ⿰口巴; API trả ⿰口己 (10/10 mẫu)"}
+        - {ocr: "髀", suggest: "𪡔", qn: "ra", note: "in ⿰口⿱罒廾; API trả 髀 (10/10 mẫu)"}
+        - {ocr: "嚉", suggest: "𡂳", qn: "rồi", note: "in ⿰口磊; API trả ⿰口對 (10/10 mẫu)"}
+        - {ocr: "楼", suggest: "𢖕", qn: "sau", note: "in ⿰後娄 (không phải 𢖖 ⿰娄後 như SLQ)"}
+        - {ocr: "楼", suggest: "婪", qn: "lam", note: "in ⿱林女"}
+        # 〓 written for a Kim Hán Nôm private-use code whose glyph IS encoded
+        # (v2.4: 〓 only for chars not in Unicode / not in any font). Facing
+        # syllable ↔ origin code was 1:1 in this book (là: U+F047C 371/371,
+        # một: U+F070B 31/31); glyph = print, checked beside a font rendering.
+        # Not listed (no exact Unicode match or still uncertain, stay 〓):
+        # nay U+F0152 (⿸尸今), xem U+F03D9 (示 vs 礻 of 𫀅 — ask the TA), sách
+        # U+F000B, cửa U+F082E/U+F0607, sớm U+F0272.
+        - {ocr: "〓", suggest: "𦉼", qn: "là", note: "U+F047C = ⿱罒廾"}
+        - {ocr: "〓", suggest: "没", qn: "một", note: "U+F070B = ⿰氵殳"}
+        - {ocr: "〓", suggest: "羕", qn: "dường", note: "U+F07EF = 羕"}
+        - {ocr: "〓", suggest: "羕", qn: "đường", note: "U+F07EF = 羕; bản in QN ghi 'dường' (vd. PDF 120), Vintern đọc 'đường' — sửa QN theo ảnh"}
     T1_CamPhong_Tap2:
       # 2026-11-19: charalign (was cosegment). With the Vintern-1B-v3.5 QN text and
       # the upside-down pages fixed, charalign aligns Tap2 in ~80 s with 0 null and
       # 0 one-sided rows, SYNC clean, v2.4 score 87.38; the cosegment DP ran > 85 min
       # without finishing and its last run left 718/1315 null rows.
       segmentation: charalign
+      # Same typeface and printer as Tap1, same Kim Hán Nôm confusions; checked
+      # 2026-11-21 on 10 random crops per glyph/code across PDF 288–506
+      # (data/diagnostics/ocr_suggest/T1_CamPhong_Tap2/): 吧 10/10, 𪡔 10/10,
+      # 𢖕 9/10 (+1 婪), 𦉼/羕/没 10/10 each; 嚉 8/10 = 𡂳, 2 real 嚉 (dối trá,
+      # PDF 351, 392) that face other syllables. Origin codes facing là/một were
+      # 1:1 (U+F047C 718, U+F070B 87).
+      text_diff_suggest_rules: *camphong_suggest_rules
+  # Reading conventions for transliterated names agreed with the teaching
+  # assistant (2026-11-20): a one-char/one-syllable red element matching a rule
+  # becomes yellow (warn, reviewed: 1). Multi-token runs stay red.
+  text_diff_warn_rules:
+    - {nom: "秋", qn: "su", note: "支秋 = Giê-su (trợ giảng, 2026-11-20)"}
+    - {nom: "衣", qn: "ê", note: "衣 = Ê trong tên riêng, vd. Ê-li-siêu (trợ giảng, 2026-11-20)"}
   # Length ratio is a weak but cheap prior for phonetic translation.
   expected_syllables_per_nom_char: 1.0
   max_group: 4

@@ -220,10 +220,11 @@ def build_marker_map(
         return None
     ch_by_page = {p.page_no: p for p in pages if p.folder == "ch"}
     vi_pages = sorted([p for p in pages if p.folder == "vi"], key=lambda p: p.page_no)
+    overrides = dict(getattr(book, "marker_overrides", {}) or {})
     pairs: list[Pair] = []
     used_ch: set[int] = set()
     for page in vi_pages:
-        ch_no = offset - page.page_no
+        ch_no = overrides.get(page.page_no, offset - page.page_no)
         nom_page = ch_by_page.get(ch_no)
         if nom_page is None:
             pairs.append(
@@ -233,6 +234,16 @@ def build_marker_map(
             )
             continue
         used_ch.add(ch_no)
+        if page.page_no in overrides:
+            # The Nôm leaf sits out of printed order in the PDF: the pair
+            # follows the printed numbers (book config marker_overrides).
+            pairs.append(
+                Pair(ch=(nom_page.image_name,), vi=(page.image_name,),
+                     note=(f"Nôm PDF {ch_no} nằm sai thứ tự trong bản scan; ghép theo số trang in "
+                           f"(marker_overrides, thay cho {offset} − vi PDF = {offset - page.page_no})"),
+                     confidence=1.0, source="printed_marker_override", status="verified")
+            )
+            continue
         pairs.append(
             Pair(ch=(nom_page.image_name,), vi=(page.image_name,),
                  note=f"printed marker: Nôm PDF = {offset} − vi PDF",
@@ -404,8 +415,10 @@ def validate_image_map(
     vi_names: set[str] | None = None,
     *,
     vi_to_nom_offset: int | None = None,
+    marker_overrides: dict[int, int] | None = None,
 ) -> list[str]:
     issues: list[str] = []
+    overrides = dict(marker_overrides or {})
     seen_ch: set[str] = set()
     seen_vi: set[str] = set()
     for idx, pair in enumerate(pairs):
@@ -452,10 +465,14 @@ def validate_image_map(
 
     vi_ranks = [_vi_rank(pair) for pair in pairs]
     ch_ranks = [_ch_rank(pair) for pair in pairs]
+    # A Nôm leaf declared out of printed order breaks ch monotonicity by design.
+    exempt = [vi_ranks[i] in overrides for i in range(len(pairs))]
     for idx in range(len(pairs) - 1):
         if vi_ranks[idx] is not None and vi_ranks[idx + 1] is not None:
             if vi_ranks[idx] >= vi_ranks[idx + 1]:
                 issues.append(f"order: pairs {idx} and {idx + 1} are not vi-ascending")
+        if exempt[idx] or exempt[idx + 1]:
+            continue
         if ch_ranks[idx] is not None and ch_ranks[idx + 1] is not None:
             if ch_ranks[idx] <= ch_ranks[idx + 1]:
                 issues.append(f"order: pairs {idx} and {idx + 1} are not ch-descending")
@@ -468,7 +485,7 @@ def validate_image_map(
                 ch_page = image_name_page_no(pair.ch[0])
                 vi_page = image_name_page_no(pair.vi[0])
                 if ch_page is not None and vi_page is not None:
-                    if ch_page != vi_to_nom_offset - vi_page:
+                    if ch_page != overrides.get(vi_page, vi_to_nom_offset - vi_page):
                         issues.append(
                             f"marker: pair {idx} ({pair.vi[0]} ↔ {pair.ch[0]}) violates "
                             f"Nôm PDF = {vi_to_nom_offset} − vi PDF"
@@ -579,6 +596,7 @@ def build_image_map(
         ch_names={p.image_name for p in pages if p.folder in {"ch", "missing_ch"}},
         vi_names={p.image_name for p in pages if p.folder in {"vi", "missing_vi"}},
         vi_to_nom_offset=getattr(book, "vi_to_nom_offset", None),
+        marker_overrides=getattr(book, "marker_overrides", None),
     )
     if issues:
         raise ImageMapError(f"{book.book_id}: invalid image map: {issues[:5]}")

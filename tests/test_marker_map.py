@@ -240,3 +240,29 @@ def test_alignment_yaml_config_honored_in_dp():
 def test_pair_status_roundtrip(status):
     pair = Pair(ch=("a.jpg",), vi=("b.jpg",), status=status)
     assert pair.to_dict()["status"] == status
+
+
+def test_marker_overrides_pair_out_of_order_leaves_and_validate():
+    """Nôm leaves bound out of printed order (Tap1: PDF 263 prints 272, PDF 274
+    prints 261) pair by the printed numbers, and the map still validates."""
+    offset = 289
+    pages = _corpus(offset, 13, 16)  # vi 13..16 ↔ ch 276..273 by formula
+    import dataclasses
+
+    book = dataclasses.replace(_book(offset), marker_overrides={14: 273, 16: 275})  # 275/273 swapped in the scan
+    pairs = build_marker_map(book, pages)
+    assert pairs is not None
+    by_vi = {p.vi[0]: p for p in pairs if p.vi}
+    assert by_vi["Book.014.jpg"].ch == ("Book.273.jpg",)
+    assert by_vi["Book.016.jpg"].ch == ("Book.275.jpg",)
+    assert by_vi["Book.014.jpg"].source == "printed_marker_override"
+    assert by_vi["Book.013.jpg"].source == "printed_marker"
+    assert all(p.status == "verified" for p in pairs)
+    names = dict(ch_names={p.image_name for p in pages if p.folder == "ch"},
+                 vi_names={p.image_name for p in pages if p.folder == "vi"})
+    assert validate_image_map(pairs, **names, vi_to_nom_offset=offset,
+                              marker_overrides=book.marker_overrides) == []
+    # without the declared overrides the same map is rejected (marker + order)
+    issues = validate_image_map(pairs, **names, vi_to_nom_offset=offset)
+    assert any(i.startswith("marker:") for i in issues)
+    assert any("ch-descending" in i for i in issues)

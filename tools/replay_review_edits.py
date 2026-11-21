@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from hannom.config import load_config  # noqa: E402
 from hannom.labels import read_label_txt  # noqa: E402
-from hannom.review.edit import EditError, apply_row_edit, atomic_save_csv, atomic_save_labels, recompute_row_diff  # noqa: E402
+from hannom.review.edit import EditError, apply_row_edit, atomic_save_csv, atomic_save_labels, normalize_cell, recompute_row_diff  # noqa: E402
 from hannom.review.patches import read_patches  # noqa: E402
 from hannom.review_metadata import load_rows_with_metadata  # noqa: E402
 from hannom.sync_check import check_sync  # noqa: E402
@@ -58,6 +58,9 @@ def main() -> int:
             "lexicon": BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"),
             "dictionary": build_dictionary_index(project.root, project.dictionary_config or {}, book_id=book.book_id),
             "readings_cache": load_readings_cache(project),
+            "warn_rules": __import__("hannom.textdiff", fromlist=["x"]).warn_rules_from_config(project.alignment_config),
+            "suggest_rules": __import__("hannom.textdiff", fromlist=["x"]).suggest_rules_from_config(
+                project.alignment_config, book.book_id),
         }
     except Exception:  # noqa: BLE001
         context = {}
@@ -95,7 +98,7 @@ def main() -> int:
                   f"{p.before[:40]!r} -> {p.after[:40]!r}")
             continue
         i = hits[0]
-        new_text = getattr(rows[i], p.field).replace(p.before, p.after, 1)
+        new_text = normalize_cell(getattr(rows[i], p.field).replace(p.before, p.after, 1), p.field)
         try:
             ch_labels, vi_labels, rows = apply_row_edit(
                 pairs, ch_labels, vi_labels, rows, i,

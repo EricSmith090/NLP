@@ -47,6 +47,22 @@ def test_stitch_removes_overlap_and_keeps_short_coincidence():
     assert stitch_overlapping(["a b c", "b c d"]) == "a b c b c d"
 
 
+def test_stitch_overlap_read_twice_slightly_differently():
+    # the seam is read by both halves: a comma differs, the top's last line is cut
+    top = "Con phải suy những sự ấy cho kỹ, vì Đức Chúa Trời đã dựng nên con cho được làm tôi Người, mà con đã làm sự"
+    bottom = "Trời đã dựng nên con cho được làm tôi Người mà con đã làm sự gì cho Người bấy lâu nay."
+    out = stitch_overlapping([top, bottom])
+    assert out == ("Con phải suy những sự ấy cho kỹ, vì Đức Chúa Trời đã dựng nên con cho được làm tôi Người, "
+                   "mà con đã làm sự gì cho Người bấy lâu nay.")
+    # the top band ends inside a cut line ("Ng"): the longest shared block decides
+    top2 = "vì Đức Chúa Trời đã dựng nên con cho được làm tôi Người, mà con đã làm sự gì cho Ng"
+    bottom2 = "tôi Người mà con đã làm sự gì cho Người bấy lâu nay."
+    assert stitch_overlapping([top2, bottom2]) == (
+        "vì Đức Chúa Trời đã dựng nên con cho được làm tôi Người, mà con đã làm sự gì cho Người bấy lâu nay.")
+    # a refrain shorter than the trusted block is never taken for the seam
+    assert stitch_overlapping(["Thứ nhất, lạy Chúa tôi, tôi tin", "Thứ hai, lạy Chúa tôi, tôi cậy"]).count("lạy") == 2
+
+
 def test_retry_policy():
     short = {"syllables": 3, "effective": 3, "rep8": 0}
     good = {"syllables": 230, "effective": 230, "rep8": 1}

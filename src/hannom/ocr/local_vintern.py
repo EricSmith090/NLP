@@ -384,17 +384,42 @@ def strip_meta_lines(text: str) -> tuple[str, int]:
     return "\n".join(kept).strip(), dropped
 
 
-def stitch_overlapping(parts: list[str]) -> str:
-    """Join band transcriptions, removing the longest word overlap (≥3 words)."""
+def _stitch_key(word: str) -> str:
+    return "".join(ch for ch in word.lower() if ch.isalpha())
+
+
+def stitch_overlapping(parts: list[str], window: int = 70, min_block: int = 6) -> str:
+    """Join band transcriptions read on overlapping image halves.
+
+    1. The tail of what we have equals the head of the next part (≥3 words,
+       compared without punctuation/case): drop that head.
+    2. Otherwise the overlap was read twice slightly differently (a comma, a
+       misread word, a line cut through at the band edge): find the longest
+       block of equal words between the last ``window`` words and the next
+       part's first ``window`` words; keep our text up to the end of that
+       block and continue the next part after it. Blocks shorter than
+       ``min_block`` words are not trusted (refrains such as "lạy Chúa tôi").
+    """
+    import difflib
+
     out = (parts[0] if parts else "").split()
     for part in parts[1:]:
         words = part.split()
         best = 0
         for k in range(min(len(out), len(words), 60), 2, -1):
-            if [x.lower() for x in out[-k:]] == [x.lower() for x in words[:k]]:
+            if [_stitch_key(x) for x in out[-k:]] == [_stitch_key(x) for x in words[:k]]:
                 best = k
                 break
-        out += words[best:]
+        if best:
+            out += words[best:]
+            continue
+        tail, head = out[-window:], words[:window]
+        a, b = [_stitch_key(x) for x in tail], [_stitch_key(x) for x in head]
+        m = difflib.SequenceMatcher(None, a, b, autojunk=False).find_longest_match(0, len(a), 0, len(b))
+        if m.size >= min_block:
+            out = out[: len(out) - len(tail) + m.a + m.size] + words[m.b + m.size:]
+        else:
+            out += words
     return " ".join(out)
 
 

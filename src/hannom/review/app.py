@@ -36,6 +36,7 @@ from hannom.review.edit import (  # noqa: E402
     atomic_save_csv,
     atomic_save_labels,
     label_paths_save,
+    is_reviewed,
     progress,
     recompute_row_diff,
     red_density,
@@ -43,6 +44,7 @@ from hannom.review.edit import (  # noqa: E402
     awaiting_decision,
     find_rows,
     mark_as_warn,
+    normalize_cell,
     review_history,
     review_queue,
     reviewed_order,
@@ -50,6 +52,10 @@ from hannom.review.edit import (  # noqa: E402
     select_row,
     next_position,
     suggest_edit_text,
+    suggest_edit_text_all,
+    nom_char_location,
+    nom_stream_index,
+    pending_suggests,
 )
 from hannom.review.patches import (  # noqa: E402
     append_patch,
@@ -115,6 +121,153 @@ def _overlay(image_path: Path, labels: dict, folder: str, image_name: str,
     return image
 
 
+NOM_FONTS = ("'Nom Na Tong','HAN NOM A','HAN NOM B','Han-Nom Gothic','Han-Nom Ming','HanaMinA','HanaMinB',"
+             "'SimSun-ExtB','SimSun-ExtG','MingLiU-ExtB',serif")
+
+
+def _glyph_crop(image_path: Path, labels: dict, image_name: str, box: int, idx: int, count: int) -> Image.Image | None:
+    """The glyph cell ``idx`` of Nôm box ``box`` (cells estimated by dividing the
+    box evenly), with one cell of context on each side, outlined in red."""
+    boxes = labels.get(f"ch/{image_name}") or []
+    if box >= len(boxes) or not image_path.exists():
+        return None
+    pts = [tuple(float(v) for v in p) for p in (boxes[box].get("points") or [])]
+    if len(pts) != 4 or count <= 0:
+        return None
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    if (y1 - y0) >= (x1 - x0):  # vertical column
+        step = (y1 - y0) / count
+        cell = (x0, y0 + step * idx, x1, y0 + step * (idx + 1))
+        region = (x0 - step * 0.4, cell[1] - step * 1.1, x1 + step * 0.4, cell[3] + step * 1.1)
+    else:
+        step = (x1 - x0) / count
+        cell = (x0 + step * idx, y0, x0 + step * (idx + 1), y1)
+        region = (cell[0] - step * 1.1, y0 - step * 0.4, cell[2] + step * 1.1, y1 + step * 0.4)
+    image = Image.open(image_path).convert("RGB")
+    ImageDraw.Draw(image).rectangle(cell, outline=(230, 0, 0), width=3)
+    crop = image.crop(tuple(int(v) for v in region))
+    scale = 260 / max(1, crop.height)
+    return crop.resize((max(1, int(crop.width * scale)), 260))
+
+
+def _apply_suggestions(project, book, csv_path: Path, label_dir: Path, patch_path: Path, pairs, ch_labels, vi_labels,
+                       ops, reviewer: str, reason: str) -> tuple[int, list[str]]:
+    """Resolve suggestions on several rows at once (Quy định v2.4 states b/c).
+
+    ``ops``: [(sentence_id, content hash, accept positions, reject positions)].
+    Per row: accepted chars replace the OCR chars in Label.txt and ch_txt
+    together (SYNC kept, ch_txt patch logged, colouring recomputed); then the
+    rejected ones become plain red errors (text_diff patch logged). Rows whose
+    content changed on disk since the page was drawn are skipped."""
+    import copy as _copy
+
+    raw = read_alignment_csv(csv_path)
+    meta_rows, _ = load_rows_with_metadata(csv_path)
+    for r, m in zip(raw, meta_rows):
+        r.flags, r.confidence = list(m.flags), m.confidence
+    ctx = _recompute_context(project, book)
+    ch_now, vi_now, labels_changed = ch_labels, vi_labels, False
+    patches, done, skipped = [], 0, []
+    for sid, content_hash, accept, reject in ops:
+        idx = next((i for i, r in enumerate(raw)
+                    if r.sentence_id == sid and row_content_hash(r.img_id, r.ch_txt, r.vi_txt) == content_hash), None)
+        if idx is None:
+            skipped.append(sid)
+            continue
+        if accept:
+            chars = list(raw[idx].ch_txt)
+            for el in raw[idx].text_diff or []:
+                if el.type == "warn" and el.suggest and el.nom_pos and el.nom_pos[0][0] in accept:
+                    chars[el.nom_pos[0][0]] = el.suggest
+            new_text = "".join(chars)
+            if new_text != raw[idx].ch_txt:
+                try:
+                    ch_now, vi_now, new_rows = apply_row_edit(pairs, ch_now, vi_now, raw, idx, new_text, None)
+                except EditError:
+                    skipped.append(sid)
+                    continue
+                patches.append(make_patch(raw[idx], book_id=book.book_id, field="ch_txt", after=new_text,
+                                          reviewer=reviewer, reason=reason or "nhận gợi ý thay chữ (đã đối chiếu ảnh)"))
+                recompute_row_diff(new_rows[idx], **ctx)
+                raw, labels_changed = new_rows, True
+        if reject:
+            snapshot = _copy.deepcopy(raw[idx])
+            for k, el in enumerate(raw[idx].text_diff or []):
+                if el.type == "warn" and el.suggest and el.nom_pos and el.nom_pos[0][0] in reject:
+                    reject_suggest(raw[idx], k)
+            if raw[idx].text_diff_json() != snapshot.text_diff_json():
+                patches.append(make_patch(snapshot, book_id=book.book_id, field="text_diff",
+                                          after=raw[idx].text_diff_json(), reviewer=reviewer,
+                                          reason=reason or "bỏ gợi ý thay chữ (đã đối chiếu ảnh)"))
+        done += 1
+    if labels_changed:
+        atomic_save_labels(ch_now, label_dir / "ch" / "Label.txt", "ch")
+    atomic_save_csv(csv_path, raw)
+    for p in patches:
+        append_patch(patch_path, p)
+    return done, skipped
+
+
+def _suggest_grid(project, book, rows, pairs, ch_labels, vi_labels, csv_path, label_dir, patch_path) -> None:
+    """All pending suggestions of one kind as a grid of print crops: the
+    reviewer looks at every glyph, unticks the wrong ones, applies the page."""
+    import collections
+    import math
+
+    st.subheader("Duyệt gợi ý thay chữ Nôm theo lưới")
+    st.caption("Mỗi ô: ảnh in (khung đỏ = chữ được gợi ý thay). Giữ dấu ✓ nếu chữ in ĐÚNG là chữ gợi ý; "
+               "bỏ dấu nếu khác. Áp dụng: ô có dấu → nhận (thay vào Label.txt và CSV, thành đen); "
+               "ô không dấu → bỏ (giữ chữ OCR, tô đỏ). Quy định v2.4: mọi gợi ý phải được nhận hoặc bỏ trước khi nộp.")
+    reviewer = st.text_input("Người review", value=os.environ.get("USERNAME", ""), key="grid_reviewer")
+    items = [(i, el) for i, r in enumerate(rows) for el in (r.text_diff or []) if el.type == "warn" and el.suggest]
+    if not items:
+        st.success("Không còn gợi ý nào chưa xử lý.")
+        return
+    kinds = collections.Counter((el.nom_sub_text, el.suggest) for _i, el in items)
+    kind = st.selectbox("Loại gợi ý", sorted(kinds, key=lambda k: -kinds[k]),
+                        format_func=lambda k: f"{k[0]} → {k[1]}  ({kinds[k]} ô)")
+    sel = [(i, el) for i, el in items if (el.nom_sub_text, el.suggest) == kind]
+    per_page = 30
+    pages = max(1, math.ceil(len(sel) / per_page))
+    page = int(st.number_input(f"Trang lưới (1–{pages})", min_value=1, max_value=pages, value=1, step=1))
+    chunk = sel[(page - 1) * per_page: page * per_page]
+    st.markdown(
+        f"<div style=\"font-family:{NOM_FONTS};font-size:40px\">{html.escape(kind[0])} → "
+        f"<span style='color:#0a7d2c'>{html.escape(kind[1])}</span></div>", unsafe_allow_html=True)
+    native = project.data_dir / "pages" / book.book_id / "native"
+    stream = nom_stream_index(pairs, ch_labels, rows)
+    cols = st.columns(6)
+    choice = {}
+    for j, (i, el) in enumerate(chunk):
+        pos = el.nom_pos[0][0]
+        with cols[j % 6]:
+            loc = nom_char_location(pairs, ch_labels, rows, i, pos, stream=stream)
+            crop = _glyph_crop(native / loc[0], ch_labels, loc[0], loc[1], loc[2], loc[3]) if loc else None
+            if crop is not None:
+                st.image(crop.resize((max(1, crop.width * 180 // crop.height), 180)))
+            else:
+                st.caption("(không định vị được)")
+            st.caption(f"{rows[i].sentence_id.rsplit('.', 2)[-2]}.{rows[i].sentence_id.rsplit('.', 1)[-1]} · "
+                       f"{el.vi_sub_text}")
+            choice[(i, pos)] = st.checkbox("đúng chữ gợi ý", value=True, key=f"g|{rows[i].sentence_id}|{pos}")
+    n_yes = sum(choice.values())
+    if st.button(f"Áp dụng trang này: nhận {n_yes}, bỏ {len(choice) - n_yes}", type="primary"):
+        if not reviewer.strip():
+            st.error("Cần nhập người review.")
+            return
+        by_row: dict[int, tuple[set, set]] = {}
+        for (i, pos), yes in choice.items():
+            by_row.setdefault(i, (set(), set()))[0 if yes else 1].add(pos)
+        ops = [(rows[i].sentence_id, row_content_hash(rows[i].img_id, rows[i].ch_txt, rows[i].vi_txt), acc, rej)
+               for i, (acc, rej) in by_row.items()]
+        done, skipped = _apply_suggestions(project, book, csv_path, label_dir, patch_path, pairs, ch_labels,
+                                           vi_labels, ops, reviewer.strip(), "")
+        st.session_state.flash = (f"Đã xử lý {len(choice)} gợi ý trên {done} câu (nhận {n_yes}, bỏ {len(choice) - n_yes})."
+                                  + (f" Bỏ qua {len(skipped)} câu đã đổi trên đĩa." if skipped else ""))
+        st.rerun()
+
+
 def _read_labels(path: Path) -> dict:
     try:
         return read_label_txt(path) if path.exists() else {}
@@ -131,7 +284,11 @@ def _recompute_context(project, book) -> dict:
 
         lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json")
         dictionary = build_dictionary_index(project.root, project.dictionary_config or {}, book_id=book.book_id)
-        return {"lexicon": lexicon, "dictionary": dictionary, "readings_cache": load_readings_cache(project)}
+        from hannom.textdiff import suggest_rules_from_config, warn_rules_from_config
+
+        return {"lexicon": lexicon, "dictionary": dictionary, "readings_cache": load_readings_cache(project),
+                "warn_rules": warn_rules_from_config(project.alignment_config),
+                "suggest_rules": suggest_rules_from_config(project.alignment_config, book.book_id)}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -139,6 +296,10 @@ def _recompute_context(project, book) -> dict:
 def main() -> None:
     st.set_page_config(page_title="Hán Nôm review", layout="wide")
     st.title("Hán Nôm–Quốc ngữ review")
+    # Confirmation of the last action survives the rerun that follows it.
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.success(flash)
 
     project_root = Path(os.environ.get("HANNOM_PROJECT", ".")).resolve()
     try:
@@ -192,14 +353,26 @@ def main() -> None:
 
     done, total = progress(rows)
     st.sidebar.progress(done / total if total else 0.0, text=f"Đã chấp nhận/quyết định {done}/{total}")
+    undecided_black = sum(1 for r in rows if not getattr(r, "review_status", None) and red_density(r) == 0
+                          and not any(e.type == "warn" for e in (r.text_diff or [])))
+    if undecided_black:
+        st.sidebar.info(f"{undecided_black} câu không đỏ chưa có quyết định — chúng không nằm trong hàng đợi đỏ; "
+                        "xem hàng đợi \"Chưa quyết định\" (vẫn cần đối chiếu dấu thanh Quốc ngữ với ảnh).")
+    n_suggest = sum(pending_suggests(r) for r in rows)
+    if n_suggest:
+        st.sidebar.warning(f"{n_suggest} gợi ý thay chữ Nôm chưa xử lý ({sum(1 for r in rows if pending_suggests(r))} câu) "
+                           "— mỗi gợi ý phải Nhận hoặc Bỏ trước khi nộp (v2.4); xem hàng đợi \"Gợi ý thay chữ Nôm\".")
     pending = sum(1 for r in rows if awaiting_decision(r))
     if pending:
         st.sidebar.warning(f"{pending} câu đã lưu sửa nhưng CHƯA chấp nhận — xem hàng đợi \"Đã sửa, chưa chấp nhận\".")
     mode = st.sidebar.selectbox(
         "Hàng đợi",
-        ["red", "pending", "manual", "warn", "reviewed", "all"],
+        ["red", "suggest", "suggest_grid", "undecided", "pending", "manual", "warn", "reviewed", "all"],
         format_func={
             "red": "Mật độ đỏ giảm dần",
+            "suggest": "Gợi ý thay chữ Nôm — từng câu",
+            "suggest_grid": "Gợi ý thay chữ Nôm — lưới duyệt nhanh",
+            "undecided": "Chưa quyết định (mọi câu, kể cả không đỏ)",
             "pending": "Đã sửa, chưa chấp nhận",
             "manual": "Null / <5 ký tự (thủ công)",
             "warn": "Còn vàng chưa duyệt",
@@ -208,6 +381,9 @@ def main() -> None:
         }.get,
     )
     hide_done = st.sidebar.checkbox("Ẩn dòng đã chấp nhận/quyết định", value=False)
+    if mode == "suggest_grid":
+        _suggest_grid(project, book, rows, pairs, ch_labels, vi_labels, csv_path, label_dir, patch_path)
+        return
     if mode == "reviewed":
         queue = reviewed_order(rows, history)
     else:
@@ -234,17 +410,21 @@ def main() -> None:
                 if st.button(label, key=f"hist{k}"):
                     st.session_state.pinned_sid = h["sentence_id"]
                     st.rerun()
-    if not queue and not st.session_state.get("pinned_sid"):
-        st.success("Hàng đợi trống.")
-        return
+    if st.session_state.get("queue_key") != (book_id, mode, hide_done):
+        # A different book/queue: forget the pinned row (before the empty-queue check).
+        st.session_state.queue_key = (book_id, mode, hide_done)
+        st.session_state.pinned_sid = None
     if not queue:
+        if done == total:
+            st.success(f"Hàng đợi trống — đã quyết định đủ {done}/{total} câu của sách này.")
+        else:
+            st.success(f"Hàng đợi này trống. Còn {total - done} câu chưa quyết định: "
+                       "chọn hàng đợi \"Chưa quyết định\".")
+        if not st.session_state.get("pinned_sid"):
+            return
         queue = list(range(len(rows)))  # a pinned row outside an empty queue
     if "row_index" not in st.session_state:
         st.session_state.row_index = 0
-    if st.session_state.get("queue_key") != (book_id, mode, hide_done):
-        # A different book/queue: forget the pinned row.
-        st.session_state.queue_key = (book_id, mode, hide_done)
-        st.session_state.pinned_sid = None
     st.session_state.row_index = max(0, min(st.session_state.row_index, len(queue) - 1))
     position = st.sidebar.number_input(
         "Vị trí", min_value=1, max_value=len(queue), value=st.session_state.row_index + 1, step=1
@@ -385,8 +565,50 @@ def main() -> None:
                 st.rerun()
 
     st.markdown("**Cảnh báo vàng**")
+    suggestions = [(k, el) for k, el in enumerate(row.text_diff or []) if el.type == "warn" and el.suggest]
+    if suggestions:
+        st.markdown("**Gợi ý thay chữ Nôm** — so ô đỏ trên ảnh với chữ gợi ý; *Nhận* thay chữ vào Label.txt và CSV "
+                    "(thành đen), *Bỏ* giữ chữ OCR và tô đỏ (v2.4).")
+        cols = st.columns(min(4, len(suggestions)))
+        for j, (k, el) in enumerate(suggestions):
+            with cols[j % len(cols)]:
+                loc = None
+                try:
+                    loc = nom_char_location(pairs, ch_labels, rows, row_i, el.nom_pos[0][0])
+                except Exception:  # noqa: BLE001 - the crop is a convenience
+                    loc = None
+                crop = _glyph_crop(native / loc[0], ch_labels, loc[0], loc[1], loc[2], loc[3]) if loc else None
+                if crop is not None:
+                    st.image(crop, caption=f"ảnh in · {loc[0].rsplit('.', 2)[-2]} cột {loc[1] + 1}")
+                else:
+                    st.caption("(không định vị được chữ trên ảnh)")
+                st.markdown(
+                    f"<div style=\"font-family:{NOM_FONTS};font-size:34px\">"
+                    f"<span title='chữ OCR'>{html.escape(el.nom_sub_text)}</span> → "
+                    f"<span title='chữ gợi ý' style='color:#0a7d2c'>{html.escape(el.suggest)}</span></div>"
+                    f"<div>{html.escape(el.vi_sub_text)}</div>",
+                    unsafe_allow_html=True,
+                )
+                keep = st.checkbox("đúng chữ gợi ý", value=True, key=f"rowsug|{row.sentence_id}|{el.nom_pos[0][0]}")
+                st.session_state.setdefault("_rowsug", {})[(row.sentence_id, el.nom_pos[0][0])] = keep
+        picks = {pos: st.session_state["_rowsug"].get((row.sentence_id, pos), True)
+                 for pos in (el.nom_pos[0][0] for _k, el in suggestions)}
+        n_yes = sum(picks.values())
+        if st.button(f"Áp dụng gợi ý của câu này: nhận {n_yes}, bỏ {len(picks) - n_yes}"):
+            if not reviewer.strip():
+                st.error("Cần nhập người review.")
+            else:
+                op = (row.sentence_id, row_content_hash(row.img_id, row.ch_txt, row.vi_txt),
+                      {p for p, y in picks.items() if y}, {p for p, y in picks.items() if not y})
+                done, skipped = _apply_suggestions(project, book, csv_path, label_dir, patch_path, pairs, ch_labels,
+                                                   vi_labels, [op], reviewer.strip(), reason.strip())
+                if skipped:
+                    st.error("Dòng này đã thay đổi trên đĩa; tải lại trang.")
+                else:
+                    st.session_state.flash = f"Đã xử lý {len(picks)} gợi ý (nhận {n_yes}, bỏ {len(picks) - n_yes})."
+                    st.rerun()
     for k, el in enumerate(row.text_diff or []):
-        if el.type != "warn":
+        if el.type != "warn" or el.suggest:  # suggestions are resolved above (accept/reject), never "Duyệt"
             continue
         c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
         c1.write(
@@ -470,11 +692,14 @@ def main() -> None:
                 character_token_mappings=mappings,
             )
             append_decision(decision_path(project.data_dir, book.book_id), decision)
-            st.success(f"Đã ghi quyết định '{status}' cho {row.sentence_id}.")
+            label = {"accepted_match": "Chấp nhận match", "accepted_difference": "Chấp nhận khác biệt",
+                     "unresolved": "Chưa rõ", "unmatched": "Unmatched"}.get(status, status)
+            st.session_state.flash = f"Đã ghi “{label}” cho {row.sentence_id.rsplit(')', 1)[-1]}."
         except Exception as exc:  # noqa: BLE001
             st.error(f"Không ghi được quyết định: {exc}")
 
     if save:
+        ch_txt, vi_txt = normalize_cell(ch_txt, "ch_txt"), normalize_cell(vi_txt, "vi_txt")
         edit_ch = ch_txt if ch_txt != row.ch_txt else None
         edit_vi = vi_txt if vi_txt != row.vi_txt else None
         if edit_ch is None and edit_vi is None:
@@ -494,8 +719,27 @@ def main() -> None:
                 else "unresolved" if unresolved
                 else "unmatched"
             )
-            # The decision hash binds the approval to the persisted content.
-            _record_decision(status, row.ch_txt, row.vi_txt, row.text_diff_json())
+            if status == "accepted_match" and has_red:
+                st.error("Câu còn chữ đỏ nên không thể 'match': sửa chữ, chuyển vàng (tên riêng/năm) "
+                         "hoặc dùng 'Chấp nhận khác biệt'.")
+                st.stop()
+            already = (getattr(row, "review_status", None) == status
+                       and getattr(row, "decision_integrity", None) == "valid")
+            was_done = is_reviewed(row)
+            if not already:  # the same verdict on the same content is not logged twice
+                # The decision hash binds the approval to the persisted content.
+                _record_decision(status, row.ch_txt, row.vi_txt, row.text_diff_json())
+            else:
+                st.session_state.flash = (f"{row.sentence_id} đã có quyết định này trên đúng nội dung hiện tại "
+                                          "— không cần ghi lại.")
+            if st.session_state.get("flash"):
+                n_done = done + (0 if was_done or already else 1)
+                st.session_state.flash += f" Đã quyết định {n_done}/{total} câu."
+                if n_done == total:
+                    st.session_state.flash += " Sách này đã quyết định đủ."
+            if accept_next and queue_pos is not None and queue_pos >= len(queue) - 1 and not hide_done:
+                st.session_state.flash = (st.session_state.get("flash") or "") + \
+                    " Đây là câu cuối của hàng đợi nên app không chuyển tiếp."
             if accept_next:
                 nxt = next_position(queue, row_i, queue_pos, st.session_state.row_index)
                 if hide_done and queue_pos is not None:

@@ -173,7 +173,11 @@ def main() -> int:
         csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
         if csv_path.exists():
             rows = read_alignment_csv(csv_path)
-            recs, _problems = assign_origins(rows, stream_origins(pairs, cleaned))
+            from hannom.labels import read_label_txt
+
+            ch_label = project.data_dir / "labels" / book.book_id / "ch" / "Label.txt"
+            recs, _problems = assign_origins(rows, stream_origins(
+                pairs, cleaned, read_label_txt(ch_label) if ch_label.exists() else None))
             by_sid = {r.sentence_id: r for r in rows}
             for rec in recs:
                 row = by_sid.get(rec["sentence_id"])

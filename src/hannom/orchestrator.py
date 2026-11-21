@@ -22,7 +22,7 @@ from .dictionary.book_lexicon import BookLexicon
 from .dictionary.index import build_dictionary_index
 from .evaluate import evaluate_rows, overall_status
 from .intake import lock_scope, write_json
-from .labels import line_to_box, write_file_state, write_label_txt
+from .labels import line_to_box, read_label_txt, write_file_state, write_label_txt
 from .layout import classify_book
 from .models import AlignmentRow, BookMetrics, OCRLine, PageRecord
 from .ocr.base import OCRUnavailable
@@ -266,13 +266,51 @@ def _reviewed_text_edits(project: ProjectConfig, book: BookConfig) -> int:
     return sum(1 for p in read_patches(path) if p.field in ("ch_txt", "vi_txt")) if path.exists() else 0
 
 
+def _edited_pages(project: ProjectConfig, book: BookConfig) -> set[int]:
+    """PDF pages whose Label.txt text a reviewer edited: the Nôm page of each
+    ch_txt patch, the QN page(s) paired with the row's Nôm page for vi_txt."""
+    path = project.data_dir / "review" / f"{book.book_id}.patches.jsonl"
+    if not path.exists():
+        return set()
+    map_path = project.data_dir / "layout" / book.book_id / "image_map.json"
+    vi_of: dict[str, list[str]] = {}
+    if map_path.exists():
+        for pair in load_image_map(map_path):
+            for ch in pair.ch:
+                vi_of.setdefault(ch, []).extend(pair.vi)
+    out: set[int] = set()
+    for p in read_patches(path):
+        if p.field not in ("ch_txt", "vi_txt") or not p.img_id:
+            continue
+        names = [p.img_id] if p.field == "ch_txt" else vi_of.get(p.img_id, [])
+        for name in names:
+            try:
+                out.add(int(str(name).rsplit(".", 2)[-2]))
+            except ValueError:
+                pass
+    return out
+
+
 def stage_labels(
-    project: ProjectConfig, book: BookConfig, state: State, *, overwrite_reviewed: bool = False
+    project: ProjectConfig, book: BookConfig, state: State, *, overwrite_reviewed: bool = False,
+    only_pages: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     # Reviewer edits live in Label.txt + CSV (review app). Regenerating
     # Label.txt from OCR would silently discard them while the CSV keeps them
     # (patches are re-applied by align) -> SYNC failure and lost work.
-    edits = _reviewed_text_edits(project, book)
+    # ``only_pages``: regenerate just these PDF pages (e.g. QN pages re-read by
+    # tools/qn_rescue.py) and keep every other page's boxes as they are in the
+    # current Label.txt, reviewer edits included. Refused when one of the
+    # selected pages carries a reviewer edit (unless overwrite_reviewed).
+    selected = set(int(x) for x in only_pages) if only_pages else None
+    if selected is not None:
+        touched = sorted(selected & _edited_pages(project, book))
+        if touched and not overwrite_reviewed:
+            raise PipelineError(
+                f"{book.book_id}: page(s) {touched} carry reviewer text edits; regenerating them would discard "
+                "the edits. Leave them out of --pages, or pass --overwrite-reviewed if that is intended."
+            )
+    edits = _reviewed_text_edits(project, book) if selected is None else 0
     if edits and not overwrite_reviewed:
         raise PipelineError(
             f"{book.book_id}: {edits} reviewer text edit(s) exist (data/review/{book.book_id}.patches.jsonl); "
@@ -294,6 +332,8 @@ def stage_labels(
     # design, so pruning stale bins must happen here, explicitly.
     label_root = project.data_dir / "labels" / book.book_id
     for folder in ("ch", "vi", "intro", "ref", "toc", "misc"):
+        if selected is not None:
+            break  # partial regeneration never prunes folders
         if folder not in by_folder:
             stale = label_root / folder
             if stale.exists():
@@ -307,7 +347,17 @@ def stage_labels(
         image_names = [p.image_name for p in folder_pages]
         boxes_by_image: dict[str, list[dict[str, Any]]] = {}
         empty: list[str] = []
+        kept: dict[str, list[dict[str, Any]]] = {}
+        if selected is not None:
+            if not any(p.page_no in selected for p in folder_pages):
+                continue
+            current_path = label_root / folder / "Label.txt"
+            current = read_label_txt(current_path) if current_path.exists() else {}
+            kept = {k.split("/", 1)[-1]: v for k, v in current.items()}
         for page in folder_pages:
+            if selected is not None and page.page_no not in selected:
+                boxes_by_image[page.image_name] = kept.get(page.image_name, [])
+                continue
             result = router.load_result(page)
             if result is None:
                 empty.append(page.image_name)
@@ -339,6 +389,8 @@ def stage_labels(
         # = OCR ran but every line was cleaned away). An in-scope page must
         # never leave a regeneration unflagged.
         for page in folder_pages:
+            if selected is not None and page.page_no not in selected:
+                continue
             image = page.image_name
             before = set(page.review_flags)
             if image in no_result:
@@ -508,12 +560,18 @@ def recompute_text_diff(
     readings_cache: Any | None = None,
     force_recompute: bool = False,
     alignment_config: dict | None = None,
+    book_id: str | None = None,
 ) -> list[AlignmentRow]:
-    from .textdiff import auto_text_diff, spec_text_diff, validate_text_diff, variant_fold_from_config
+    from .textdiff import (
+        auto_text_diff, spec_text_diff, suggest_rules_from_config, validate_text_diff, variant_fold_from_config,
+        warn_rules_from_config,
+    )
 
     single_fold = variant_fold_from_config(alignment_config)
     _cfg = (alignment_config or {}).get("alignment", alignment_config or {}) or {}
     policy = str(_cfg.get("text_diff_policy", "spec"))
+    warn_rules = warn_rules_from_config(alignment_config)
+    suggest_rules = suggest_rules_from_config(alignment_config, book_id)
     out: list[AlignmentRow] = []
     for row in rows:
         if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
@@ -524,7 +582,8 @@ def recompute_text_diff(
             if "TEXT_DIFF_STALE" in row.flags:
                 from .review.edit import recompute_row_diff
 
-                recompute_row_diff(row, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache)
+                recompute_row_diff(row, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+                                   warn_rules=warn_rules, suggest_rules=suggest_rules)
                 row.flags = [f for f in row.flags if f != "TEXT_DIFF_STALE"]
             out.append(row)
             continue
@@ -563,6 +622,8 @@ def recompute_text_diff(
             # v2.4 / official checker semantics (FIX_PLAN T3.2, RC5/RC7).
             diff = spec_text_diff(
                 row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+                warn_rules=warn_rules,
+                suggest_rules=suggest_rules,
             )
         row.text_diff = diff.elements
         row.flags = sorted(
@@ -667,6 +728,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         dictionary=dictionary,
         readings_cache=readings_cache,
         alignment_config=project.alignment_config,
+        book_id=book.book_id,
     )
     # Apply patches and decisions again so human content and review
     # decisions always win over the automatic recomputation. Report what is

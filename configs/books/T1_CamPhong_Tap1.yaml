@@ -22,6 +22,12 @@ back_matter_is_toc: true
 # Printed cross-reference in every substantive QN page (header):
 # Nôm printed = Nôm PDF − 2; this book's offset: Nôm PDF = 289 − vi PDF.
 vi_to_nom_offset: 289
+# Two Nôm leaves sit out of printed order in the PDF (checked on the images,
+# 2026-11-20): Nôm PDF 263 prints page 272 (目籙, the Nôm TOC) and Nôm PDF 274
+# prints page 261. The QN headers give the same pairing: PDF 15 "- 13 - (272)"
+# (MỤC LỤC) and PDF 26 "- 24 - (261)". The formula above would pair them the
+# other way round. Pairs follow the printed numbers: {vi PDF: Nôm PDF}.
+marker_overrides: {15: 263, 26: 274}
 # Declarative bin overrides (PDF pages).
 # The translation front matter pages carry parens cross-references to the
 # Nôm book (PDF 13=parens 274 → Nôm PDF 276, ..., PDF 20=parens 267 → PDF 269):

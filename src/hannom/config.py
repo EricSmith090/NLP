@@ -50,6 +50,11 @@ class BookConfig:
     # built as a deterministic bijection Nôm PDF = vi_to_nom_offset − vi PDF
     # instead of the heuristic DP. Empirical per-book constant.
     vi_to_nom_offset: int | None = None
+    # Exceptions to the marker formula, {vi PDF: Nôm PDF}, for Nôm leaves
+    # bound/scanned out of printed order (the QN header's parenthesised Nôm
+    # page and the Nôm page's own printed number prove the pair). Each entry
+    # must cite that evidence in the book config.
+    marker_overrides: dict[int, int] = field(default_factory=dict)
     # Nôm PDF pages scanned upside-down (RC10, Doc/FIX_PLAN_v24.md T2.4): the
     # API reads the characters but returns the columns in reverse reading
     # order, so the label/clean stages reverse the box order of these pages.
@@ -189,6 +194,9 @@ def load_config(config_path: str | Path = "configs/project.yaml") -> ProjectConf
                     and int(b["vi_to_nom_offset"]) > 0
                     else None
                 ),
+                marker_overrides={
+                    int(k): int(v) for k, v in (b.get("marker_overrides", {}) or {}).items()
+                },
                 nom_reversed_pages=tuple(int(x) for x in (b.get("nom_reversed_pages", []) or [])),
                 rotation_overrides={
                     int(k): int(v) % 360 for k, v in (b.get("rotation_overrides", {}) or {}).items()

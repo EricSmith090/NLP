@@ -274,3 +274,37 @@ def test_superseded_and_in_place_patches_are_not_reported_stale():
     p2 = ReviewPatch(book_id="B", sentence_id="B.067.1", field="vi_txt", before="Lưỡi.", after="Men.", reviewer="r", timestamp="2026-11-20T01:42:58")
     _rows, rejected = apply_patches_checked([row], [p1, p2])
     assert rejected == []
+
+
+def test_patch_chain_replays_on_a_regenerated_row():
+    """Two successive edits of one field (A -> B -> C) must both apply, in order,
+    when re-alignment regenerated the row from OCR (value A again)."""
+    from hannom.models import AlignmentRow
+    from hannom.review.patches import ReviewPatch, apply_patches_checked
+
+    fresh = AlignmentRow("B.067.jpg", "B.067.1", "綿", "Amen.", [])
+    p1 = ReviewPatch(book_id="B", sentence_id="B.067.1", field="vi_txt", before="Amen.", after="Lưỡi.", reviewer="r", timestamp="2026-11-20T01:38:27")
+    p2 = ReviewPatch(book_id="B", sentence_id="B.067.1", field="vi_txt", before="Lưỡi.", after="Men.", reviewer="r", timestamp="2026-11-20T01:42:58")
+    out, rejected = apply_patches_checked([fresh], [p1, p2])
+    assert rejected == [] and out[0].vi_txt == "Men."
+
+
+def test_cells_never_keep_line_breaks():
+    from hannom.review.edit import normalize_cell
+
+    assert normalize_cell("Cho nên,\nkẻ có đạo\r\n đã biết", "vi_txt") == "Cho nên, kẻ có đạo đã biết"
+    assert normalize_cell("天主\n聖 神", "ch_txt") == "天主聖神"
+
+
+def test_warn_rules_turn_single_name_syllables_yellow():
+    from hannom.textdiff import spec_text_diff
+
+    class Lex:
+        def readings(self, ch):
+            return {"支": ["giê"], "秋": ["thu"], "髀": ["vế"]}.get(ch, [])
+
+    rules = (("秋", "su"),)
+    els = spec_text_diff("支秋", "Giê-su", lexicon=Lex(), warn_rules=rules).elements
+    assert [(e.type, e.reviewed) for e in els] == [("warn", 1)]
+    mixed = spec_text_diff("支秋髀", "Giê-su ra", lexicon=Lex(), warn_rules=rules).elements
+    assert [e.type for e in mixed] == ["error"]

@@ -27,7 +27,10 @@ from .dictionary.book_lexicon import qn_syllables
 from .models import AlignmentRow, DiffElement
 from .review_metadata import write_review_metadata
 from .t1_map import Pair
-from .textdiff import auto_text_diff, spec_text_diff, validate_text_diff, variant_fold_from_config
+from .textdiff import (
+    auto_text_diff, spec_text_diff, suggest_rules_from_config, validate_text_diff, variant_fold_from_config,
+    warn_rules_from_config,
+)
 
 QN_SENTENCE_SPLIT_RE = re.compile(
     r"(?<=[.!?;:\u2026])\s+(?=[" + VIETNAMESE_UPPER_CLASS + r"\"“(\[\d])"
@@ -66,6 +69,9 @@ class AlignConfig:
     # readings, unknown and 〓 red, extra syllables red, numbers yellow).
     # "legacy": the pre-2026-11-19 conservative diff (kept for comparison).
     text_diff_policy: str = "spec"
+    text_diff_warn_rules: tuple[tuple[str, str], ...] = ()
+    # Book-scoped OCR suggestion table (set by align_book from per_book).
+    text_diff_suggest_rules: tuple[tuple[str, str, str], ...] = ()
     expected_syllables_per_nom_char: float = 1.0
     max_group: int = 4
     max_nm_group: int = 2
@@ -127,6 +133,7 @@ def _as_config(raw: dict[str, Any] | None) -> AlignConfig:
     defaults = AlignConfig()
     return AlignConfig(
         text_diff_policy=str(raw.get("text_diff_policy", defaults.text_diff_policy)),
+        text_diff_warn_rules=warn_rules_from_config(raw_config),
         expected_syllables_per_nom_char=float(
             raw.get("expected_syllables_per_nom_char", defaults.expected_syllables_per_nom_char)
         ),
@@ -857,6 +864,8 @@ def _emit_rows(
             else:
                 diff = spec_text_diff(
                     ch_txt, vi_txt, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+                    warn_rules=config.text_diff_warn_rules,
+                    suggest_rules=config.text_diff_suggest_rules,
                 )
             text_diff = diff.elements
             flags.extend(diff.flags)
@@ -898,6 +907,7 @@ def align_book(
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
     per_book = cfg.per_book.get(book_id, {}) if isinstance(cfg.per_book, dict) else {}
+    cfg = replace(cfg, text_diff_suggest_rules=suggest_rules_from_config(config, book_id))
     segmentation = str(per_book.get("segmentation") or cfg.segmentation or "cosegment")
     strip_texts = tuple(per_book.get("strip_texts") or cfg.strip_texts or ())
     if segmentation == "charalign":

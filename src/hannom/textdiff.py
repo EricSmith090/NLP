@@ -639,6 +639,86 @@ def mask_spans_official(text: str) -> list[tuple[int, int]]:
         pos = k + len(MASK)
 
 
+def warn_rules_from_config(raw_config: Any | None) -> tuple[tuple[str, str], ...]:
+    """alignment.text_diff_warn_rules: [{nom: "秋", qn: "su", note: ...}, ...]
+    -> ((nom char, tone_key(qn syllable)), ...)."""
+    raw = raw_config or {}
+    cfg = raw.get("alignment", raw) if isinstance(raw, dict) else {}
+    rules = []
+    for item in (cfg or {}).get("text_diff_warn_rules", []) or []:
+        nom, qn = str(item.get("nom", "")).strip(), str(item.get("qn", "")).strip()
+        if nom and qn:
+            rules.append((nfc(nom), tone_key(qn)))
+    return tuple(rules)
+
+
+def suggest_rules_from_config(raw_config: Any | None, book_id: str | None) -> tuple[tuple[str, str, str], ...]:
+    """alignment.per_book.<book>.text_diff_suggest_rules:
+    [{ocr: "𠯇", suggest: "吧", qn: "và", note: ...}, ...] -> ((ocr char, tone_key(qn), suggest char), ...).
+
+    Book-scoped on purpose: each entry is a confusion of the Nôm OCR on one
+    typeface, verified on that book's scans."""
+    if not book_id:
+        return ()
+    raw = raw_config or {}
+    cfg = raw.get("alignment", raw) if isinstance(raw, dict) else {}
+    per_book = ((cfg or {}).get("per_book") or {}).get(book_id) or {}
+    rules = []
+    for item in per_book.get("text_diff_suggest_rules", []) or []:
+        ocr, sug, qn = (str(item.get(k, "")).strip() for k in ("ocr", "suggest", "qn"))
+        if len(ocr) == 1 and len(sug) == 1 and qn and ocr != sug:
+            rules.append((nfc(ocr), tone_key(qn), nfc(sug)))
+    return tuple(rules)
+
+
+def apply_suggest_rules(
+    elements: Sequence[DiffElement], suggest_rules: Sequence[tuple[str, str, str]]
+) -> tuple[list[DiffElement], int]:
+    """Quy định v2.4, "chữ Nôm nghi ngờ bị nhận dạng sai nhưng có gợi ý thay
+    thế (bảng chữ giống hình)": a red Nôm char listed in the book's
+    suggestion table, facing the syllable that table expects, becomes a
+    yellow working-state element {type warn, suggest, suggest_by "similar",
+    reviewed 0} on exactly one Nôm char. ch_txt/Label.txt keep the OCR char
+    until a reviewer accepts (replace everywhere -> black) or rejects (-> red).
+
+    An equal-length error run (n chars <-> n syllables) is split 1:1 so the
+    suggestion sits on its own char; the other chars stay red, one element
+    each. Runs of unequal length are left as they are."""
+    table = {(o, q): s for o, q, s in suggest_rules}
+    out: list[DiffElement] = []
+    count = 0
+    for el in elements:
+        if el.type != "error" or not el.nom_sub_text:
+            out.append(el)
+            continue
+        toks = list(_SPEC_VI_TOKEN_RE.finditer(el.vi_sub_text))
+        nom_idx = [k for s, e in el.nom_pos for k in range(s, e)]
+        vi_idx = [k for s, e in el.vi_pos for k in range(s, e)]
+        if (len(toks) != len(el.nom_sub_text) or len(nom_idx) != len(el.nom_sub_text)
+                or len(vi_idx) != len(el.vi_sub_text)
+                or not any((c, tone_key(t.group())) in table for c, t in zip(el.nom_sub_text, toks))):
+            out.append(el)
+            continue
+        parts: list[DiffElement] = []
+        for c, t, n in zip(el.nom_sub_text, toks, nom_idx):
+            a, b = vi_idx[t.start()], vi_idx[t.end() - 1] + 1
+            if b - a != t.end() - t.start():  # token not contiguous in vi_txt: leave the run whole
+                parts = []
+                break
+            sug = table.get((c, tone_key(t.group())))
+            if sug:
+                parts.append(DiffElement(((n, n + 1),), c, ((a, b),), t.group(), "warn",
+                                         reviewed=0, suggest=sug, suggest_by="similar"))
+            else:
+                parts.append(DiffElement(((n, n + 1),), c, ((a, b),), t.group(), "error"))
+        if not parts:
+            out.append(el)
+            continue
+        out.extend(parts)
+        count += sum(1 for p in parts if p.suggest)
+    return out, count
+
+
 def spec_text_diff(
     nom: str,
     vi: str,
@@ -647,6 +727,8 @@ def spec_text_diff(
     dictionary: Any | None = None,
     readings_cache: Any | None = None,
     warn_numbers: bool = True,
+    warn_rules: Sequence[tuple[str, str]] = (),
+    suggest_rules: Sequence[tuple[str, str, str]] = (),
 ) -> DiffResult:
     nom = nfc(nom)
     vi = nfc(vi)
@@ -741,6 +823,26 @@ def spec_text_diff(
             else:
                 run_v.append(vt[b])
         flush()
+    if warn_rules:
+        # Project reading conventions agreed with the teaching assistant
+        # (configs/alignment.yaml text_diff_warn_rules): a one-char / one-
+        # syllable error such as 秋 <-> "su" (支秋 = Giê-su) is yellow, already
+        # reviewed by that rule. Multi-token runs stay red.
+        rule_set = set(warn_rules)
+        converted = []
+        for el in elements:
+            vi_tokens = _SPEC_VI_TOKEN_RE.findall(el.vi_sub_text)
+            if (el.type == "error" and len(el.nom_sub_text) == 1 and len(vi_tokens) == 1
+                    and (el.nom_sub_text, tone_key(vi_tokens[0])) in rule_set):
+                el = DiffElement(el.nom_pos, el.nom_sub_text, el.vi_pos, el.vi_sub_text, "warn", reviewed=1)
+                flags.append("DIFF_WARN_RULE")
+            converted.append(el)
+        elements = converted
+    if suggest_rules:
+        elements, n_suggest = apply_suggest_rules(elements, suggest_rules)
+        if n_suggest:
+            flags.append("DIFF_SUGGEST_RULE")
+            review.append("SUGGEST_PENDING")
     if unknown_chars:
         flags.append("DIFF_UNKNOWN_NOM_CHARS")
         review.append("DICT_MISS")

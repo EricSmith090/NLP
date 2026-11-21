@@ -46,3 +46,14 @@ def test_report_requires_a_description_per_code():
     assert any(i.startswith("REPORT_PLACEHOLDER_DESCRIPTION_MISSING:B:U+F047C") for i in validate_report_data(data))
     data.placeholder_descriptions = {"U+F047C": "mô tả mẫu (test)"}
     assert not any("PLACEHOLDER_DESCRIPTION" in i for i in validate_report_data(data))
+
+
+def test_origins_survive_a_reviewer_replacing_one_placeholder():
+    p276 = clean_page_lines("B", 276, "B.276.jpg", "nom", ["天\U000F047C主\U000F07EF聖"])
+    pairs = [Pair(ch=("B.276.jpg",), vi=("B.013.jpg",))]
+    # the reviewer found the first glyph in Unicode and typed it in place of 〓
+    labels = {"ch/B.276.jpg": [{"transcription": "天羅主"}, {"transcription": "〓聖"}]}
+    origins = stream_origins(pairs, {"B.276.jpg": p276}, labels)
+    assert origins == [("B.276.jpg", "U+F07EF")]
+    recs, problems = assign_origins([_row("B.276.1", "B.276.jpg", "天羅主〓聖")], origins)
+    assert problems == [] and recs[0]["code"] == "U+F07EF"

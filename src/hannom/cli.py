@@ -214,12 +214,21 @@ def labels(
     overwrite_reviewed: bool = typer.Option(
         False, "--overwrite-reviewed", help="Regenerate Label.txt even if reviewer text edits exist (discards them)"
     ),
+    pages: Optional[str] = typer.Option(
+        None, "--pages",
+        help='Only regenerate these PDF pages, e.g. "19 22 49" or 19,22,49; every other page keeps its Label.txt boxes',
+    ),
 ):
     """Generate PPOCRLabel Label.txt and fileState.txt."""
+    import re as _re
+
     project = _project(config)
+    only = [int(x) for x in _re.findall(r"\d+", pages)] if pages else None
+    if pages is not None and not only:
+        raise typer.BadParameter("--pages: no page number given")
     with open_state(project) as state:
         for item in _books(project, book):
-            counts = stage_labels(project, item, state, overwrite_reviewed=overwrite_reviewed)
+            counts = stage_labels(project, item, state, overwrite_reviewed=overwrite_reviewed, only_pages=only)
             console.print(f"[green]{item.book_id}[/]: {counts}")
 
 
@@ -267,6 +276,7 @@ def textdiff(
                 readings_cache=readings_cache,
                 force_recompute=force_recompute,
                 alignment_config=project.alignment_config,
+                book_id=item.book_id,
             )
             write_alignment_csv(csv_path, rows)
             console.print(f"[green]{item.book_id}[/]: {len(rows)} rows")
