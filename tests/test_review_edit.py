@@ -62,6 +62,96 @@ def test_qn_edit_with_hyphen():
     assert sync(c3, v3, r3) == []
 
 
+# --- QN spacing: Label.txt must hold exactly what the reviewer typed ----------
+# SYNC ignores whitespace, so these tests compare Label.txt text directly.
+# Regression for the 2026-11-21 finding: "vào ngục." -> "vào hơn." was stored
+# in Label.txt as "vàohơ n." while the CSV and SYNC looked fine.
+
+QN_PAIRS = [{"ch": ["c1.jpg"], "vi": ["v1.jpg"]}]
+
+
+def build_qn(*row_texts):
+    nom = {"ch/c1.jpg": [box("天" * sum(len(t.split()) for t in row_texts))]}
+    vi = {"vi/v1.jpg": [box(" ".join(row_texts))]}
+    rows = [AlignmentRow("c1.jpg", f"s{i}", "天" * len(t.split()), t) for i, t in enumerate(row_texts)]
+    return nom, vi, rows
+
+
+def vi_text(vi, key="vi/v1.jpg"):
+    return " | ".join(b["transcription"] for b in vi[key])
+
+
+def test_qn_insert_keeps_typed_spacing():
+    ch, vi, rows = build_qn("Song có ba cửa rộng lớn, nhiều người vào ngục.", "Song có ba cửa")
+    typed = "Song có ba cửa rộng lớn, nhiều người vào hơn. Rầy con hãy"
+    _, v2, r2 = apply_row_edit(QN_PAIRS, ch, vi, rows, 0, new_vi=typed)
+    assert vi_text(v2) == typed + " Song có ba cửa"
+    assert r2[0].vi_txt == typed
+
+
+def test_qn_delete_words_leaves_single_spaces():
+    ch, vi, rows = build_qn("Một hai ba bốn.", "Năm sáu.")
+    _, v2, _ = apply_row_edit(QN_PAIRS, ch, vi, rows, 0, new_vi="Một bốn.")
+    assert vi_text(v2) == "Một bốn. Năm sáu."
+    _, v3, _ = apply_row_edit(QN_PAIRS, ch, vi, rows, 1, new_vi="Năm.")
+    assert vi_text(v3) == "Một hai ba bốn. Năm."
+
+
+def test_qn_edit_middle_row_keeps_neighbours():
+    ch, vi, rows = build_qn("Một hai.", "ba bốn năm.", "sáu bảy.")
+    _, v2, _ = apply_row_edit(QN_PAIRS, ch, vi, rows, 1, new_vi="ba, bốn và năm.")
+    assert vi_text(v2) == "Một hai. ba, bốn và năm. sáu bảy."
+    _, v3, _ = apply_row_edit(QN_PAIRS, ch, vi, rows, 1, new_vi="lẽ ấy, nếu con lấy tội mọn")
+    assert vi_text(v3) == "Một hai. lẽ ấy, nếu con lấy tội mọn sáu bảy."
+
+
+def test_qn_edit_row_spanning_two_pages():
+    pairs = [{"ch": ["c1.jpg"], "vi": ["v1.jpg"]}, {"ch": ["c2.jpg"], "vi": ["v2.jpg"]}]
+    vi = {"vi/v1.jpg": [box("Câu một. Câu hai bắt")], "vi/v2.jpg": [box("đầu ở trang trước. Câu ba.")]}
+    ch = {"ch/c1.jpg": [box("天天天天天")], "ch/c2.jpg": [box("天天天天天天天")]}
+    rows = [
+        AlignmentRow("c1.jpg", "s1", "天天", "Câu một."),
+        AlignmentRow("c1.jpg", "s2", "天天天天天天天天", "Câu hai bắt đầu ở trang trước."),
+        AlignmentRow("c2.jpg", "s3", "天天", "Câu ba."),
+    ]
+    _, v2, _ = apply_row_edit(pairs, ch, vi, rows, 1, new_vi="Câu hai thật sự bắt đầu ở trang trước.")
+    assert vi_text(v2, "vi/v1.jpg") == "Câu một. Câu hai thật sự bắt"
+    assert vi_text(v2, "vi/v2.jpg") == "đầu ở trang trước. Câu ba."
+    _, v3, _ = apply_row_edit(pairs, ch, vi, rows, 1, new_vi="Câu hai bắt đầu ở trang sau này.")
+    assert vi_text(v3, "vi/v1.jpg") == "Câu một. Câu hai bắt"
+    assert vi_text(v3, "vi/v2.jpg") == "đầu ở trang sau này. Câu ba."
+
+
+def test_respace_repairs_label_damaged_by_old_edits():
+    from hannom.review.edit import respace_vi_rows
+
+    ch, vi, rows = build_qn("Song có ba cửa rộng lớn, nhiều người vào hơn. Rầy con hãy", "Song có ba cửa")
+    vi["vi/v1.jpg"][0]["transcription"] = "Song có ba cửa rộng lớn, nhiều người vàohơ n. Rầyc onhãy   Song có ba cửa"
+    assert sync(ch, vi, rows) == []  # SYNC cannot see the damage
+    v2, changed = respace_vi_rows(QN_PAIRS, vi, rows, [0, 1])
+    assert vi_text(v2) == "Song có ba cửa rộng lớn, nhiều người vào hơn. Rầy con hãy Song có ba cửa"
+    assert changed == [0]
+    assert vi["vi/v1.jpg"][0]["transcription"].startswith("Song có ba cửa rộng lớn, nhiều người vàohơ n.")  # input untouched
+
+
+def test_same_length_substitution_stays_in_its_column():
+    # Suggestion grid: 〓 -> 没 when 没 already follows. A diff can match the
+    # existing 没 against the first new one and move characters across boxes.
+    ch = {"ch/c1.jpg": [box("天〓〓"), box("没地")]}
+    vi = {"vi/v1.jpg": [box("thiên một một một địa")]}
+    rows = [AlignmentRow("c1.jpg", "s1", "天〓〓没地", "thiên một một một địa")]
+    c2, v2, r2 = apply_row_edit(PAIRS, ch, vi, rows, 0, new_ch="天没没没地")
+    assert [b["transcription"] for b in c2["ch/c1.jpg"]] == ["天没没", "没地"]
+    assert sync(c2, v2, r2) == []
+    # Found by a randomised check (243/5000 cases moved a char, old and new
+    # diff-based code alike): the diff matched the existing 没 too early.
+    ch = {"ch/c1.jpg": [box("地天〓"), box("没〓地")]}
+    rows = [AlignmentRow("c1.jpg", "s1", "地天〓没〓地", "thiên một một một địa")]
+    c3, v3, r3 = apply_row_edit(PAIRS, ch, vi, rows, 0, new_ch="地天没没没地")
+    assert [b["transcription"] for b in c3["ch/c1.jpg"]] == ["地天没", "没没地"]
+    assert sync(c3, v3, r3) == []
+
+
 def test_insertion_at_row_boundary():
     ch, vi, rows = build()
     c2, v2, r2 = apply_row_edit(PAIRS, ch, vi, rows, 1, new_ch="大人日")  # row start

@@ -41,50 +41,121 @@ def _stream(labels: Mapping[str, Sequence[Mapping[str, Any]]], order: Sequence[s
     return "".join(text), origin
 
 
+def _join_gap(left: str, right: str) -> str:
+    """Join two pieces of a box around removed/rewritten text.
+
+    Whitespace that touched the gap collapses to one space (none at the box
+    edges); where neither side had whitespace (Nôm columns, hyphen joins)
+    nothing is added.
+    """
+    had_space = left[-1:].isspace() or right[:1].isspace()
+    left, right = left.rstrip(), right.lstrip()
+    if left and right and had_space:
+        return left + " " + right
+    return left + right
+
+
+def _row_segments(origin, start: int, length: int) -> tuple[list[list], list[int]]:
+    """The row's characters grouped per Label box.
+
+    Returns ([key, box, raw_first, raw_last] per box in stream order, and the
+    segment index of every normalised character of the row).
+    """
+    segs: list[list] = []
+    seg_of: list[int] = []
+    for g in range(start, start + length):
+        key, b, raw = origin[g]
+        if segs and segs[-1][0] == key and segs[-1][1] == b:
+            segs[-1][3] = raw
+        else:
+            segs.append([key, b, raw, raw])
+        seg_of.append(len(segs) - 1)
+    return segs, seg_of
+
+
 def _edit_side(labels: Labels, order, norm, row_norms: list[str], index: int, new_raw: str) -> None:
+    """Rewrite the row's text inside each Label box it occupies.
+
+    The row occupies one contiguous raw span per box (first to last counted
+    character). Each span is replaced by the slice of ``new_raw`` that the
+    character diff assigns to that box, so the reviewer's own spacing is kept
+    verbatim; text outside the row (neighbouring rows, the gaps between them)
+    is untouched apart from collapsing whitespace at the edges. Earlier
+    versions inserted and deleted single counted characters, which SYNC
+    cannot see but which glued and split words in Label.txt (e.g. "vào ngục."
+    -> "vàohơ n.").
+    """
     stream, origin = _stream(labels, order, norm)
     if stream != "".join(row_norms):
         raise EditError("Label.txt and CSV are not in SYNC before the edit; refusing to edit")
     start = sum(len(t) for t in row_norms[:index])
     old = row_norms[index]
+    if not old:
+        raise EditError("the row has no text in Label.txt to rewrite")
     new_map = [r for r, c in enumerate(new_raw) if norm(c)]
     new = "".join(new_raw[r] for r in new_map)
+    segs, seg_of_old = _row_segments(origin, start, len(old))
 
-    def raw_slice(j1: int, j2: int) -> str:
-        if j2 <= j1:
-            return ""
-        return new_raw[new_map[j1] : new_map[j2 - 1] + 1]
+    # Box of every new character. Same length (character substitutions, e.g.
+    # accepting suggestions): position i stays in the box of old position i;
+    # a diff could match a repeated character early and move characters into
+    # the neighbouring Nôm column. Otherwise: equal/replaced characters follow
+    # the old character they stand for (overflow stays in the last one),
+    # insertions join the box of the preceding character (the following one
+    # at row start).
+    seg_of_new: list[int] = []
+    if len(new) == len(old):
+        seg_of_new = list(seg_of_old)
+    else:
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag in ("equal", "replace"):
+                seg_of_new.extend(seg_of_old[min(i1 + k, i2 - 1)] for k in range(j2 - j1))
+            elif tag == "insert":
+                seg_of_new.extend([seg_of_old[i1 - 1] if i1 > 0 else seg_of_old[0]] * (j2 - j1))
 
-    ops = [o for o in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes() if o[0] != "equal"]
-    for tag, i1, i2, j1, j2 in reversed(ops):
-        g1, g2 = start + i1, start + i2
-        text = raw_slice(j1, j2)
-        if tag == "insert":
-            if g1 == start and g1 < len(origin):
-                key, b, pos = origin[g1]  # row start: before the following char
-            elif g1 > 0:
-                key, b, r = origin[g1 - 1]  # after the preceding char
-                pos = r + 1
-            else:
-                raise EditError("no Label.txt box to receive the inserted text")
-            t = str(labels[key][b]["transcription"])
-            labels[key][b]["transcription"] = t[:pos] + text + t[pos:]
+    for s in range(len(segs) - 1, -1, -1):  # last box first: earlier raw indices stay valid
+        key, b, first, last = segs[s]
+        js = [j for j, sj in enumerate(seg_of_new) if sj == s]
+        text = new_raw[new_map[js[0]] : new_map[js[-1]] + 1] if js else ""
+        t = str(labels[key][b]["transcription"])
+        left, right = t[:first], t[last + 1 :]
+        if not text:
+            labels[key][b]["transcription"] = _join_gap(left, right)
             continue
-        if tag == "replace" and i2 - i1 == j2 - j1:  # same length: swap char by char, keep box layout
-            for k in range(i2 - i1):
-                key, b, r = origin[g1 + k]
-                t = str(labels[key][b]["transcription"])
-                labels[key][b]["transcription"] = t[:r] + new[j1 + k] + t[r + 1 :]
+        if left[-1:].isspace():
+            left = left.rstrip() + " " if left.strip() else ""
+        if right[:1].isspace():
+            right = " " + right.lstrip() if right.strip() else ""
+        labels[key][b]["transcription"] = left + text + right
+
+
+def respace_vi_rows(
+    pairs: Sequence[Any], vi_labels: Labels, rows: Sequence[AlignmentRow], indices: Sequence[int]
+) -> tuple[Labels, list[int]]:
+    """Repair Quốc ngữ spacing in Label.txt from the CSV (inputs untouched).
+
+    For each row in ``indices`` the row's spans in vi/Label.txt are rewritten
+    with the row's own ``vi_txt`` (same characters, the CSV's spacing). Used
+    to undo the spacing damage of the pre-2026-11-21 editor. Returns the new
+    labels and the indices whose Label text actually changed. Raises
+    ``EditError`` if Label.txt and the CSV are not in SYNC before or after.
+    """
+    labels = copy.deepcopy(vi_labels)
+    _ch_order, vi_order = page_orders(list(pairs))
+    norms = [norm_vi(r.vi_txt) for r in rows]
+    changed: list[int] = []
+    for index in indices:
+        if not norms[index]:
             continue
-        first = origin[g1]
-        for g in range(g2 - 1, g1 - 1, -1):  # descending: raw indices stay valid
-            key, b, r = origin[g]
-            t = str(labels[key][b]["transcription"])
-            labels[key][b]["transcription"] = t[:r] + t[r + 1 :]
-        if tag == "replace" and text:
-            key, b, r = first
-            t = str(labels[key][b]["transcription"])
-            labels[key][b]["transcription"] = t[:r] + text + t[r:]
+        before = copy.deepcopy(labels)
+        _edit_side(labels, vi_order, norm_vi, norms, index, rows[index].vi_txt)
+        if labels != before:
+            changed.append(index)
+    dicts = [{"img_id": r.img_id, "ch_txt": r.ch_txt, "vi_txt": r.vi_txt} for r in rows]
+    errors = check_sync(dicts, None, labels, pairs)
+    if errors:
+        raise EditError("respacing left Label.txt out of SYNC: " + errors[0])
+    return labels, changed
 
 
 def apply_row_edit(

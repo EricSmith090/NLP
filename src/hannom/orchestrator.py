@@ -648,6 +648,7 @@ def reconcile_for_book(
     *,
     governance_rows: list[AlignmentRow] | None = None,
     governance_failures: Iterable[Any] | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Fail-closed lexicon reconciliation shared by ``stage_align`` and tests.
 
@@ -662,18 +663,54 @@ def reconcile_for_book(
         governance_failures = gov_failures
     if any(getattr(f, "sentence_id", "x") is None for f in governance_failures):
         return {"skipped_log_wide_failure": True, "changed": False}
-    summary = lexicon.reconcile(governance_rows, dry_run=False)
-    if summary.get("changed"):
+    summary = lexicon.reconcile(governance_rows, dry_run=not persist)
+    if summary.get("changed") and persist:
         lexicon.backup()
         lexicon.save()
     return summary
 
 
-def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple[list[AlignmentRow], dict[str, Any]]:
+def resegment_enabled(project: ProjectConfig, book: BookConfig) -> bool:
+    """``alignment.resegment_from_labels`` (per_book overrides the global value; default off)."""
+    raw = project.alignment_config or {}
+    cfg = raw.get("alignment", raw) or {}
+    per_book = (cfg.get("per_book") or {}).get(book.book_id) or {}
+    return bool(per_book.get("resegment_from_labels", cfg.get("resegment_from_labels", False)))
+
+
+def compute_alignment(
+    project: ProjectConfig,
+    book: BookConfig,
+    state: State,
+    *,
+    persist: bool = True,
+    resegment: bool | None = None,
+) -> tuple[list[AlignmentRow], dict[str, Any], list[Any]]:
+    """Everything ``stage_align`` computes, without writing the CSV or summary.
+
+    ``persist=False`` also leaves the book lexicon on disk untouched, so the
+    whole computation can be dry-run on real data. ``resegment`` overrides
+    ``alignment.resegment_from_labels`` (``resegment.py``): segment on the
+    reviewed Label.txt text and keep the previous rows wherever a reviewer
+    accepted one. Returns (rows, summary without sync_errors, pairs).
+    """
+    from .resegment import overlay_label_text, pin_reviewed_rows, pinned_indices, previous_rows_for_pinning
+
     pairs = _load_pairs(project, book, state)
     cleaned = load_cleaned_pages(project, book)
     if not cleaned:
         raise PipelineError(f"{book.book_id}: no cleaned pages; run clean first")
+    reseg = resegment_enabled(project, book) if resegment is None else bool(resegment)
+    reseg_summary: dict[str, Any] | None = None
+    previous_rows: list[AlignmentRow] | None = None
+    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
+    decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
+    if reseg:
+        csv_prev = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+        previous_rows = previous_rows_for_pinning(csv_prev, decisions, decision_issues, failures)
+        cleaned, changed_pages = overlay_label_text(cleaned, project.data_dir / "labels" / book.book_id)
+        reseg_summary = {"pages_from_label": sorted(changed_pages),
+                         "pinning": "on" if previous_rows is not None else "skipped: no previous CSV"}
     dictionary_cfg = project.dictionary_config or {}
     dictionary = build_dictionary_index(project.root, dictionary_cfg, book_id=book.book_id)
     readings_cache = load_readings_cache(project)
@@ -685,7 +722,7 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
         # invalidated, conflicted, log-wide failure) must not influence
         # this alignment. Reconcile against the *previous* CSV + current
         # decisions before alignment consumes the lexicon.
-        revocation = reconcile_for_book(project, book, lexicon)
+        revocation = reconcile_for_book(project, book, lexicon, persist=persist)
     else:
         revocation = {"skipped_no_previous_csv": True, "changed": False}
     align_stats: dict[str, Any] = {}
@@ -711,17 +748,23 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
                 f"stream_tokens={stream_tokens} emitted_tokens={emitted_tokens} "
                 f"sentences_skipped={align_stats.get('sentences_skipped') or []}"
             )
+    if reseg and previous_rows is not None:
+        pinned = pinned_indices(previous_rows)
+        rows, pin_report = pin_reviewed_rows(previous_rows, rows, pinned)
+        reseg_summary.update(pin_report)
+        # Every text edit already sits in the Label.txt text the rows were cut
+        # from; replaying text patches on re-cut rows could paste text twice.
+        patches = [p for p in patches if p.field not in ("ch_txt", "vi_txt")]
     # Human patches are applied BEFORE learning and BEFORE recomputation so
     # that active learning never consumes unreviewed machine output. Lexicon
     # learning itself is restricted to rows whose decision history is sound
     # (see review_decisions.apply_decisions); a log-wide integrity failure
     # fails the learning step closed for the whole book.
-    patches = read_patches(project.data_dir / "review" / f"{book.book_id}.patches.jsonl")
     rows, _first_pass_rejected = apply_patches_checked(rows, patches)
-    decisions, failures, decision_issues = parse_decisions(decision_path(project.data_dir, book.book_id))
     rows, review_issues, review_audit = apply_decisions(rows, decisions, decision_issues, failures=failures)
     learned = learn_for_book(lexicon, rows, dictionary, failures)
-    lexicon.save()
+    if persist:
+        lexicon.save()
     rows = recompute_text_diff(
         rows,
         lexicon=lexicon,
@@ -743,8 +786,6 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
             flush=True,
         )
     rows, _, _ = apply_decisions(rows, decisions, decision_issues, failures=failures)
-    csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
-    write_alignment_csv(csv_path, rows)
     summary = {
         "book_id": book.book_id,
         "rows": len(rows),
@@ -763,6 +804,15 @@ def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple
             for flag in sorted({flag for row in rows for flag in row.flags})
         },
     }
+    if reseg_summary is not None:
+        summary["resegment"] = reseg_summary
+    return rows, summary, pairs
+
+
+def stage_align(project: ProjectConfig, book: BookConfig, state: State) -> tuple[list[AlignmentRow], dict[str, Any]]:
+    rows, summary, pairs = compute_alignment(project, book, state)
+    csv_path = _book_stage(project, book, state, "align") / f"{book.book_name}.csv"
+    write_alignment_csv(csv_path, rows)
     # Label.txt <-> CSV SYNC with the official normalisation (FIX_PLAN T1.4).
     # Reported here for diagnosis; packaging refuses a book that is out of sync.
     from .sync_check import check_book_dir

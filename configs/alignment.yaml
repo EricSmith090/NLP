@@ -4,6 +4,15 @@ alignment:
   # streams globally and projects QN punctuation cuts onto the Nôm stream
   # (see hannom.charstream). Per-book overrides live under per_book.
   segmentation: cosegment
+  # Cut sentences on the reviewed Label.txt text (it holds every reviewer
+  # edit) and keep the previous rows wherever a reviewer accepted one
+  # (hannom.resegment; decisions follow their content if a sentence_id
+  # changes). Dry run 2026-11-21 on the live data, compared with a plain
+  # re-run: SLQ 395/395 rows and decisions kept, official check-diff ok (the
+  # plain re-run broke SYNC on one row); Tap1 32/32 accepted decisions kept,
+  # 3 unresolved rows re-cut (191.6/191.7, 190.x, 269.11), no new check-diff
+  # error; Tap2 one window re-cut. Needs the previous CSV.
+  resegment_from_labels: true
   per_book:
     T1_SuaLoiQuyen:
       segmentation: charalign

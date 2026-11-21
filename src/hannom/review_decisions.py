@@ -570,6 +570,68 @@ def _incompatible_transition(
     return None
 
 
+def _relocate_groups(
+    rows: list[AlignmentRow],
+    groups: dict[str, list[ReviewDecision]],
+    failure_by_sid: dict[str, list[DecisionFailure]],
+) -> list[tuple[str, str]]:
+    """Move decision groups whose sentence_id no longer names their content.
+
+    ``sentence_id`` is positional (``<image>.<n>``): re-segmenting one row
+    renumbers every later row of the page. A group is moved (``groups`` and
+    ``failure_by_sid`` are re-keyed in place) only when all of this holds:
+
+    - its latest event is a valid record (a later failure never moves);
+    - that record does not match the row that carries the group's own id
+      (or that id no longer exists);
+    - exactly one row of the book has the record's content hash;
+    - that row has no failures and its own latest record does not already
+      verify it;
+    - no other group would move to the same row.
+
+    The move does not bypass anything: the main replay still checks every
+    event against the target row's hash. Returns ``(old_sid, new_sid)``.
+    """
+    hashes = {row.sentence_id: _row_hash(row) for row in rows}
+    count: dict[str, int] = {}
+    for h in hashes.values():
+        count[h] = count.get(h, 0) + 1
+    unique = {h: sid for sid, h in hashes.items() if count[h] == 1}
+
+    def latest(sid: str) -> ReviewDecision | None:
+        group = groups.get(sid) or []
+        if not group:
+            return None
+        last = max(group, key=lambda d: int(getattr(d, "log_line", 0)))
+        last_failure = max((f.line for f in failure_by_sid.get(sid, [])), default=-1)
+        return None if last_failure > int(getattr(last, "log_line", 0)) else last
+
+    moves: dict[str, str] = {}
+    for sid in list(groups):
+        event = latest(sid)
+        if event is None or hashes.get(sid) == event.content_sha256:
+            continue
+        target = unique.get(event.content_sha256)
+        if target is None or target == sid or failure_by_sid.get(target):
+            continue
+        own = latest(target)
+        if own is not None and own.content_sha256 == hashes[target]:
+            continue
+        moves[sid] = target
+    targets: dict[str, int] = {}
+    for target in moves.values():
+        targets[target] = targets.get(target, 0) + 1
+    moves = {s: t for s, t in moves.items() if targets[t] == 1}
+    if not moves:
+        return []
+    moved_groups = {s: groups.pop(s) for s in moves}
+    moved_failures = {s: failure_by_sid.pop(s, []) for s in moves}
+    for s, t in moves.items():
+        groups[t] = moved_groups[s]  # the target's own (non-verifying) history is about older content
+        failure_by_sid[t] = moved_failures[s]
+    return sorted(moves.items())
+
+
 def apply_decisions(
     rows: list[AlignmentRow],
     decisions: Iterable[ReviewDecision],
@@ -620,6 +682,10 @@ def apply_decisions(
     groups: dict[str, list[ReviewDecision]] = {}
     for decision in decisions:
         groups.setdefault(decision.sentence_id, []).append(decision)
+    # Re-segmentation renumbers rows; let a decision follow its exact
+    # content to the row's new sentence_id (diagnostic only, never blocking).
+    for old_sid, new_sid in _relocate_groups(rows, groups, failure_by_sid):
+        audit.append(f"DECISION_RELOCATED:{old_sid}->{new_sid}")
     for row in rows:
         sid = row.sentence_id
         group = groups.get(sid, [])
