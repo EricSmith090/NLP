@@ -1,0 +1,43 @@
+book_id: T1_DanDangNhanDuc_Phan1
+pdf: "CV20-24127189/T1_Sách Dẫn Đàng Nhân Đức (Phần 1).pdf"
+layout: T1
+scope: all
+expected_pages: 462
+# Checked on the page images 2026-11-22 (every QN header 11-230 and every Nôm
+# header 231-446 read). 462 pages, one 800x1135 JPEG each, none rotated or
+# upside down. Same printer, typeface, frames and 。 marks as Cấm Phòng.
+# QN 1-10: covers, title, "Lời giới thiệu" (5-6 printed: Phần I = Quyển 1-2,
+# Nôm leaves 1-198), "BẢN QUỐC NGỮ" divider. QN 11-12: title pages (442),
+# (441) = Nôm 446 (cover 冊引塘仁德, 印在寧富堂) and 445 (天主降生一千九百七年).
+# QN 13-26: TOC (440)-(427) = Nôm 目錄 444-431. QN 27-224: text (426)-(229) =
+# Nôm 430-231. QN 225-227 "CHÚ THÍCH" endnotes, 229 "BẢN CHỮ NÔM" divider.
+# PDF 447-461: "MỤC LỤC CHUNG" of the reprint (QN, no Nôm counterpart).
+front_matter_end: 10
+# PDF 231 (printed 229, leaf 一百九十八) holds a few columns only and misses the
+# nom_likely heuristic; hannom.layout.extend_run_to_hints adds it from the hint.
+nom_start_hint: 231
+nom_end_hint: 446
+translation_start: 11
+translation_end: 224
+back_matter_is_toc: true
+# Printed cross-reference in every substantive QN page header: ( ) = 453 − vi PDF.
+# Nôm printed = Nôm PDF − 2 up to PDF 426 (printed 424), then Nôm PDF − 4: two
+# blank leaves (PDF 427, 428, no ink at all, no printed number) sit between
+# printed 424 and 425. The margin leaf numbers run on across them (序一 430,
+# 序二 429, 序三 426, 四 425), so no leaf is missing. Hence Nôm PDF = 455 − vi
+# PDF for vi 29-224, and 457 − vi PDF for vi 11-28 (overrides below).
+vi_to_nom_offset: 455
+marker_overrides: {11: 446, 12: 445, 13: 444, 14: 443, 15: 442, 16: 441, 17: 440, 18: 439, 19: 438,
+                   20: 437, 21: 436, 22: 435, 23: 434, 24: 433, 25: 432, 26: 431, 27: 430, 28: 429}
+# Non-translation pages: 2 (spine / back cover), 3 (half title, nearly blank),
+# 5 (title), 7-8 (Lời giới thiệu), 9 ("BẢN QUỐC NGỮ"), 225-227 ("CHÚ THÍCH"),
+# 229 ("BẢN CHỮ NÔM"). 4, 6, 10, 228, 230, 427, 428, 462 are blank.
+inventory_misc: [2, 3, 5, 7, 8, 9, 225, 226, 227, 229]
+
+ocr:
+  # API first for Nôm; local engines take over when the quota is reached.
+  nom: [kimhannom, paddleocr_vl]
+  quoc_ngu: [vintern_1b_v3_5]
+  api_mode: api_first
+  sample_pages: 12
+review_profile: strict

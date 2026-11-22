@@ -47,20 +47,27 @@ from hannom.sync_check import check_sync  # noqa: E402
 from hannom.t1_map import load_image_map  # noqa: E402
 
 
-def diff_context(project, book) -> dict:
-    """Lexicon / dictionary / readings / rules exactly as the review app recomputes a row."""
+def diff_context(project, book, rows) -> dict:
+    """Lexicon / dictionary / readings / rules / name blocks exactly as the review app recomputes a row."""
     from hannom.dictionary.book_lexicon import BookLexicon
     from hannom.dictionary.index import build_dictionary_index
     from hannom.orchestrator import load_readings_cache
-    from hannom.textdiff import suggest_rules_from_config, warn_rules_from_config
+    from hannom.textdiff import (
+        name_blocks_from_config, name_spellings_from_config, suggest_rules_from_config, warn_rules_from_config,
+    )
 
-    return {
+    ctx = {
         "lexicon": BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json"),
         "dictionary": build_dictionary_index(project.root, project.dictionary_config or {}, book_id=book.book_id),
         "readings_cache": load_readings_cache(project),
         "warn_rules": warn_rules_from_config(project.alignment_config),
         "suggest_rules": suggest_rules_from_config(project.alignment_config, book.book_id),
+        "name_blocks": name_blocks_from_config(project.alignment_config, book.book_id),
     }
+    ctx["name_spellings"] = name_spellings_from_config(
+        project.alignment_config, book.book_id, ((r.ch_txt, r.vi_txt) for r in rows),
+        lexicon=ctx["lexicon"], dictionary=ctx["dictionary"], readings_cache=ctx["readings_cache"])
+    return ctx
 
 
 def colours(row) -> Counter:
@@ -110,7 +117,7 @@ def main() -> int:
 
     found, missing = match_listed(ch_labels, entries)
     new_labels, new_rows, removed = drop_listed_boxes(pairs, ch_labels, rows, set(found))
-    ctx = diff_context(project, book)
+    ctx = diff_context(project, book, new_rows)
     before = {i: colours(rows[i]) for i in removed}
     for i in removed:
         recompute_row_diff(new_rows[i], **ctx, mark_edited=False)

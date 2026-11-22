@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .clean import MASK, count_nom_chars, is_nom_char, nfc
 from .anchors import gather_readings
@@ -671,6 +672,86 @@ def suggest_rules_from_config(raw_config: Any | None, book_id: str | None) -> tu
     return tuple(rules)
 
 
+# A transliterated proper name in the QN text: syllables joined by hyphens
+# (Giê-su, Lu-si-phe, I-ghê-rê-gia). In the assigned books hyphens occur only
+# in such names.
+_NAME_RE = re.compile(r"[^\W\d_]+(?:[-\u2010\u2011][^\W\d_]+)+")
+
+
+def name_blocks_from_config(raw_config: Any | None, book_id: str | None) -> bool:
+    """alignment.per_book.<book>.text_diff_name_blocks (default off)."""
+    if not book_id:
+        return False
+    raw = raw_config or {}
+    cfg = raw.get("alignment", raw) if isinstance(raw, dict) else {}
+    per_book = ((cfg or {}).get("per_book") or {}).get(book_id) or {}
+    return bool(per_book.get("text_diff_name_blocks", False))
+
+
+def name_key(name: str) -> str:
+    """One key for the QN spellings of a name: Lu-si-phe = Lu-xi-phe, Giu-đa = Giu-da."""
+    key = unicodedata.normalize("NFD", nfc(name).lower().replace("đ", "d"))
+    key = "".join(c for c in key if unicodedata.category(c) != "Mn")
+    return re.sub(r"[-‐‑]", "-", key).replace("x", "s")
+
+
+def name_spelling_table(
+    texts: Iterable[tuple[str, str]],
+    *,
+    lexicon: Any | None = None,
+    dictionary: Any | None = None,
+    readings_cache: Any | None = None,
+    warn_rules: Sequence[tuple[str, str]] = (),
+    suggest_rules: Sequence[tuple[str, str, str]] = (),
+    memo: dict[tuple[str, str], list[tuple[str, str]]] | None = None,
+) -> dict[str, Counter]:
+    """{name key: Counter of Nôm spellings} over a whole book's rows.
+
+    A spelling is the Nôm chars ``spec_text_diff`` pairs 1-1 with the name's
+    syllables (same alignment as the colouring); occurrences with a gap or a
+    〓 are not counted. Used to keep a minority spelling of a name (an OCR
+    misreading such as 卢樣批 beside 卢搓批 ×3) out of a yellow name block.
+
+    ``memo``: {(nom, vi): spellings of that row}, kept by the caller across
+    calls made with the same readings and rules (the review app rebuilds
+    the table after every edit; only the edited row is aligned again).
+    """
+    seen: list[tuple[str, str]] = []
+    for nom, vi in texts:
+        if nom and vi and _NAME_RE.search(nfc(vi)):
+            if memo is not None and (nom, vi) in memo:
+                seen.extend(memo[(nom, vi)])
+                continue
+            got: list[tuple[str, str]] = []
+            spec_text_diff(nom, vi, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+                           warn_rules=warn_rules, suggest_rules=suggest_rules, name_blocks=True, name_collect=got)
+            if memo is not None:
+                memo[(nom, vi)] = got
+            seen.extend(got)
+    table: dict[str, Counter] = {}
+    for key, spelling in seen:
+        table.setdefault(key, Counter())[spelling] += 1
+    return table
+
+
+def name_spellings_from_config(
+    raw_config: Any | None, book_id: str | None, texts: Iterable[tuple[str, str]], **readings: Any
+) -> dict[str, Counter] | None:
+    """The book's name spelling table when name blocks are on for it, else None."""
+    if not name_blocks_from_config(raw_config, book_id):
+        return None
+    return name_spelling_table(texts, warn_rules=warn_rules_from_config(raw_config),
+                               suggest_rules=suggest_rules_from_config(raw_config, book_id), **readings)
+
+
+def _is_majority_spelling(counts: Counter | None, spelling: str) -> bool:
+    """The unique most frequent spelling of the name (or its only one)."""
+    if not counts or len(counts) == 1:
+        return True
+    top = max(counts.values())
+    return counts.get(spelling, 0) == top and sum(1 for v in counts.values() if v == top) == 1
+
+
 def apply_suggest_rules(
     elements: Sequence[DiffElement], suggest_rules: Sequence[tuple[str, str, str]]
 ) -> tuple[list[DiffElement], int]:
@@ -729,9 +810,41 @@ def spec_text_diff(
     warn_numbers: bool = True,
     warn_rules: Sequence[tuple[str, str]] = (),
     suggest_rules: Sequence[tuple[str, str, str]] = (),
+    name_blocks: bool = False,
+    stats: dict | None = None,
+    name_spellings: Mapping[str, Counter] | None = None,
+    name_collect: list | None = None,
 ) -> DiffResult:
     nom = nfc(nom)
     vi = nfc(vi)
+    # Names (``name_blocks``, config key text_diff_name_blocks): in a
+    # hyphenated QN name (a transliteration), a syllable whose Nôm char the
+    # dictionaries do not read that way is yellow, not red. The TA's answer
+    # (asked for 秋 <-> "su" in Giê-su, "tên riêng phiên âm có cùng số chữ
+    # nhưng từ điển không ghi âm"): "Bạn đánh vàng nhé". Only the differing
+    # chars turn yellow (consecutive ones form one element); chars whose
+    # reading matches stay black (支 <-> Giê), as in the spec's example
+    # 027.3. Until 2026-11-22 the whole name was one yellow element, which
+    # painted 70 (Tap1) / 453 (Tap2) matching chars yellow. reviewed 1 only
+    # when every pair of the element is a TA reading rule (warn_rules).
+    # Never for a name holding 〓 or a char without any known reading (both
+    # must stay red) or a pending OCR suggestion (a suggestion sits on
+    # exactly one char).
+    # Nor when the yellow would hide an OCR error the spec colours red
+    # (2026-11-22, measured on Tap1/Tap2): the Nôm chars must pair 1-1 with
+    # the name's syllables (no duplicated 吹吹, no missing 蟡 in 亞 ↔ A-ve,
+    # no 翁 swallowed), and, given the book's ``name_spellings`` table
+    # (``name_spelling_table``), the spelling must be the unique most
+    # frequent one of that name (卢樣批 / 卢極批 beside 卢搓批 ×3, 德妑 ↔
+    # Giê-su beside 支秋 ×267 stay per char). ``name_collect`` receives
+    # (name key, spelling) of every 1-1 occurrence, for building that table.
+    name_spans = [(m.start(), m.end()) for m in _NAME_RE.finditer(vi)] if name_blocks else []
+    sug_keys = {(o, q) for o, q, _s in suggest_rules}
+    rule_keys = set(warn_rules)
+
+    def _count(key: str) -> None:
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + 1
     keys_cache: dict[str, frozenset[str]] = {}
     sources: dict[str, str] = {}
 
@@ -784,8 +897,75 @@ def spec_text_diff(
                 ops.append(("s", i - 1, j - 1))
                 i, j = i - 1, j - 1
         ops.reverse()
+        name_warn: dict[int, int] = {}  # op index -> name: a differing syllable of a qualifying name
+        if name_spans:
+            name_of: dict[int, int] = {}
+            for bi, t in enumerate(vt):
+                for k, (ws, we) in enumerate(name_spans):
+                    if ws <= t[0] and t[1] <= we:
+                        name_of[bi] = k
+                        break
+            first: dict[int, int] = {}
+            last: dict[int, int] = {}
+            for oi, (_op, _a, b) in enumerate(ops):
+                if b is not None and b in name_of:
+                    first.setdefault(name_of[b], oi)
+                    last[name_of[b]] = oi
+            for k, lo in first.items():
+                seg_ops = ops[lo:last[k] + 1]
+                chars = [nt[a] for _op, a, _b in seg_ops if a is not None]
+                labels = [kinds[(a, b)] if op == "s" else "gap" for op, a, b in seg_ops]
+                spelling = "".join(c[2] for c in chars)
+                key = name_key(vi[name_spans[k][0]:name_spans[k][1]])
+                hi = last[k]
+                # 1-1 also at the edges: an unpaired Nôm char right before or
+                # after the name means its extent is uncertain (卢搓搓批 ↔
+                # Lu-si-phe pairs 搓 with "phe" and leaves 批 outside).
+                edge_gap = (lo > 0 and ops[lo - 1][0] == "d") or (hi + 1 < len(ops) and ops[hi + 1][0] == "d")
+                one_to_one = bool(chars) and "gap" not in labels and not edge_gap
+                if name_collect is not None and one_to_one and "placeholder" not in labels:
+                    name_collect.append((key, spelling))
+                if all(x == "match" for x in labels):
+                    _count("name_black")
+                    continue
+                if not chars:
+                    _count("name_skip_no_nom")
+                    continue
+                if not one_to_one:
+                    _count("name_skip_not_one_to_one")
+                    continue
+                if any(x == "placeholder" for x in labels):
+                    _count("name_skip_placeholder")
+                    continue
+                if any(x == "unknown" for x in labels):
+                    _count("name_skip_unknown_char")
+                    continue
+                if any(op == "s" and kinds[(a, b)] != "match" and (nt[a][2], tone_key(vt[b][2])) in sug_keys
+                       for op, a, b in seg_ops):
+                    _count("name_skip_suggestion")
+                    continue
+                if name_spellings is not None and not _is_majority_spelling(name_spellings.get(key), spelling):
+                    _count("name_skip_minority_spelling")
+                    continue
+                for oi in range(lo, hi + 1):
+                    op, a, b = ops[oi]
+                    if kinds[(a, b)] != "match":
+                        name_warn[oi] = k
         run_n: list[tuple] = []
         run_v: list[tuple] = []
+        name_run: list[tuple[int, int, int]] = []  # (nom index, vi index, name) of consecutive name syllables
+
+        def flush_name() -> None:
+            if not name_run:
+                return
+            (a0, b0, _k), (a1, b1, _k1) = name_run[0], name_run[-1]
+            el = make_element(nom, vi, [[nt[a0][0], nt[a1][1]]], [[vt[b0][0], vt[b1][1]]], "warn")
+            reviewed = 1 if all((nt[a][2], tone_key(vt[b][2])) in rule_keys for a, b, _ in name_run) else 0
+            elements.append(DiffElement(el.nom_pos, el.nom_sub_text, el.vi_pos, el.vi_sub_text, "warn",
+                                        reviewed=reviewed))
+            flags.append("DIFF_NAME_WARN")
+            _count("name_warn_reviewed" if reviewed else "name_warn")
+            name_run.clear()
 
         def flush() -> None:
             if not run_n and not run_v:
@@ -805,7 +985,14 @@ def spec_text_diff(
             run_n.clear()
             run_v.clear()
 
-        for op, a, b in ops:
+        for oi, (op, a, b) in enumerate(ops):
+            if oi in name_warn:
+                flush()
+                if name_run and name_run[-1][2] != name_warn[oi]:
+                    flush_name()  # two adjacent names: one element each
+                name_run.append((a, b, name_warn[oi]))
+                continue
+            flush_name()
             if op == "s":
                 kind = kinds[(a, b)]
                 if kind == "unknown":
@@ -822,12 +1009,22 @@ def spec_text_diff(
                 run_n.append(nt[a])
             else:
                 run_v.append(vt[b])
+        flush_name()
         flush()
+    if suggest_rules:
+        elements, n_suggest = apply_suggest_rules(elements, suggest_rules)
+        if n_suggest:
+            flags.append("DIFF_SUGGEST_RULE")
+            review.append("SUGGEST_PENDING")
     if warn_rules:
         # Project reading conventions agreed with the teaching assistant
         # (configs/alignment.yaml text_diff_warn_rules): a one-char / one-
         # syllable error such as 秋 <-> "su" (支秋 = Giê-su) is yellow, already
         # reviewed by that rule. Multi-token runs stay red.
+        # Applied AFTER the suggestion split (2026-11-22): "秋髀 <-> su ra" is
+        # one 2:2 red run until apply_suggest_rules puts 髀 (OCR for 𪡔 "ra")
+        # on its own element; before, 秋 <-> "su" was then left red (21 times
+        # in Tap2) although the rule covers it.
         rule_set = set(warn_rules)
         converted = []
         for el in elements:
@@ -838,11 +1035,6 @@ def spec_text_diff(
                 flags.append("DIFF_WARN_RULE")
             converted.append(el)
         elements = converted
-    if suggest_rules:
-        elements, n_suggest = apply_suggest_rules(elements, suggest_rules)
-        if n_suggest:
-            flags.append("DIFF_SUGGEST_RULE")
-            review.append("SUGGEST_PENDING")
     if unknown_chars:
         flags.append("DIFF_UNKNOWN_NOM_CHARS")
         review.append("DICT_MISS")

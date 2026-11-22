@@ -275,6 +275,29 @@ def _strip_inline_refs(text: str) -> tuple[str, bool]:
     return new, new != text
 
 
+# Sentences the QN model writes about the image instead of reading it: the
+# prompt echoed ("Trích xuất toàn bộ văn bản tiếng Việt có trong ảnh."), or a
+# refusal glued to the page text by the halves stitch, so the whole-line
+# filter in hannom.ocr.local_vintern misses it (Dẫn Đàng Phần 1 PDF 224 "… thì
+# làm sao? Tôi không thể trích xuất toàn bộ văn bản tiếng Việt từ ảnh. Ảnh chỉ
+# hiển thị một phần văn bản mờ nhạt, …", PDF 461 "…443 Không có bất kỳ văn
+# bản tiếng Việt nào trong ảnh."). "văn bản" occurs in none of the four books'
+# printed QN text ("ảnh" does: "ảnh tượng", "ảnh chuộc tội"), so a sentence
+# must contain it; the match starts at the model's first word, never eating
+# the page text before it.
+QN_MODEL_TALK_RE = re.compile(
+    r"\((?:không có nội dung)\)"
+    r"|\b(?:Tôi|Ảnh|Hình ảnh|Không|Trích xuất|Chỉ trả về|Đây là|Văn bản)\b[^.?!\n]*\bvăn bản\b[^.?!\n]*[.?!]?"
+)
+
+
+def _strip_model_talk(text: str) -> tuple[str, list[str]]:
+    found = [m.group(0) for m in QN_MODEL_TALK_RE.finditer(text)]
+    if not found:
+        return text, []
+    return SPACE_RE.sub(" ", QN_MODEL_TALK_RE.sub(" ", text)).strip(), found
+
+
 # Full-page OCR transcription produces a single giant "line" per page, so
 # the margin machinery (which inspects each page's marginal lines) never
 # sees the running page marker and lets it pass through. The two concrete
@@ -685,6 +708,10 @@ def clean_quoc_ngu_lines(
         if mark_removed:
             flags.append("PAGE_MARK_REMOVED")
             dropped.append(mark_text)
+        line, talk = _strip_model_talk(line)
+        if talk:
+            flags.append("QN_MODEL_TALK_REMOVED")
+            dropped.extend(talk)
         physical.extend(line.split("\n"))
     pieces = [p.strip() for p in physical if p.strip()]
     total = len(pieces)

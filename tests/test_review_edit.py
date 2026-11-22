@@ -379,6 +379,29 @@ def test_patch_chain_replays_on_a_regenerated_row():
     assert rejected == [] and out[0].vi_txt == "Men."
 
 
+def test_colour_patch_already_in_csv_survives_recompute():
+    """A reviewer's text_diff change saved to the CSV (patch already in place)
+    marks the row as human-edited, so the automatic recompute keeps it."""
+    import copy
+
+    from hannom.models import AlignmentRow, DiffElement
+    from hannom.orchestrator import recompute_text_diff
+    from hannom.review.edit import accept_warn
+    from hannom.review.patches import apply_patches_checked, make_patch
+
+    w = DiffElement(((0, 2),), "卢搓", ((0, 5),), "Lu-si", "warn", reviewed=0)
+    row = AlignmentRow("B.200.jpg", "B.200.1", "卢搓", "Lu-si", [w])
+    snap = copy.deepcopy(row)
+    accept_warn(row, 0)
+    patch = make_patch(snap, book_id="B", field="text_diff", after=row.text_diff_json(), reviewer="r")
+    saved = copy.deepcopy(row)  # what the app wrote to the CSV
+    saved.flags = []
+    out, rejected = apply_patches_checked([saved], [patch])
+    assert not rejected and "CONTENT_EDITED" in out[0].flags
+    out = recompute_text_diff(out)
+    assert out[0].text_diff[0].reviewed == 1
+
+
 def test_cells_never_keep_line_breaks():
     from hannom.review.edit import normalize_cell
 

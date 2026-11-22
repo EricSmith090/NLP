@@ -131,6 +131,22 @@ def test_toc_pages_are_not_pinned():
     assert toc_nom_images(None, "B", pairs) == set()
 
 
+def test_reviewed_toc_rows_are_released_only_where_the_cut_changes():
+    from hannom.resegment import release_toc_pins, same_cut_rows
+
+    prev = [R("天地", "a.", "263"), R("人日月", "b c d.", "263"), R("星", "e.", "263"), R("山", "f.", "100")]
+    renumber(prev)
+    new = [R("天地", "a.", "263"), R("人", "b", "263"), R("日月", "c d.", "263"), R("星", "e.", "263"), R("山", "f.", "100")]
+    assert same_cut_rows(prev, new) == {0, 2, 3}
+    kept, released = release_toc_pins(prev, new, [0, 1, 2, 3], {"B.263.jpg"})
+    assert kept == [0, 2, 3] and released == ["B.263.2"]  # only the row the rule now splits
+    out, _ = pin_reviewed_rows(prev, new, kept)
+    assert texts(out) == [("天地", "a."), ("人", "b"), ("日月", "c d."), ("星", "e."), ("山", "f.")]
+    assert release_toc_pins(prev, new, [1, 3], set()) == ([1, 3], [])  # no TOC pages: nothing released
+    # a repeated text elsewhere is not "the same cut"
+    assert same_cut_rows([R("天", "a."), R("天", "a.")], [R("天天", "a. a.")]) == set()
+
+
 def test_overlay_joins_boxes_like_clean(tmp_path):
     # clean.py: Nôm page text = "".join(lines), QN page text = " ".join(lines).
     # A "\n" between Nôm column boxes reached the CSV cells (official FORM

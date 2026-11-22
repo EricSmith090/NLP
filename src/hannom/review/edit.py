@@ -198,8 +198,13 @@ def recompute_row_diff(
     row: AlignmentRow, *, lexicon=None, dictionary=None, readings_cache=None, mark_edited: bool = True,
     warn_rules=(),
     suggest_rules=(),
+    name_blocks: bool = False,
+    name_spellings=None,
 ) -> AlignmentRow:
-    """Spec-policy text_diff for one row; keeps accepted (reviewed=1) warns; flags CONTENT_EDITED."""
+    """Spec-policy text_diff for one row; keeps accepted (reviewed=1) warns; flags CONTENT_EDITED.
+
+    ``name_spellings``: the book's name spelling table (``textdiff.name_spelling_table``);
+    pass it whenever ``name_blocks`` is on so a single row is coloured as the whole-book recompute colours it."""
     from ..orchestrator import _rederivable_text_diff_flag
     from ..textdiff import spec_text_diff
 
@@ -210,8 +215,8 @@ def recompute_row_diff(
     if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
         row.text_diff = None
     else:
-        diff = spec_text_diff(row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary, warn_rules=warn_rules, suggest_rules=suggest_rules,
-                              readings_cache=readings_cache)
+        diff = spec_text_diff(row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary, warn_rules=warn_rules, suggest_rules=suggest_rules, name_blocks=name_blocks,
+                              name_spellings=name_spellings, readings_cache=readings_cache)
         row.text_diff = diff.elements
         row.flags = sorted(
             {f for f in row.flags if not _rederivable_text_diff_flag(f)}

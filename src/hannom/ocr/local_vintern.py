@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from ..models import OCRLine, OCRResult, PageRecord
@@ -470,23 +471,44 @@ def dedupe_adjacent_repeats(text: str, min_len: int = 12, max_gap: int = 6) -> t
         removed += 1
 
 
+def find_loop(words: Sequence[str], repeats: int = 3, max_period: int = 120) -> tuple[int, int] | None:
+    """Earliest generation loop in a syllable list: ``(start, period)``.
+
+    A loop is a block of ``period`` syllables written ``repeats``+ times back
+    to back, long enough that an 8-gram occurs ``repeats`` times. A phrase the
+    book itself repeats with other text in between is not a loop: Dẫn Đàng
+    Nhân Đức prints "nhân đức ở siêng năng nắn thờ phượng Đức Chúa Trời" five
+    times on PDF 65, and its TOC pages repeat it entry after entry; counting
+    8-grams anywhere on the page cut those pages at the second occurrence.
+    """
+    n = len(words)
+    for i in range(n):
+        for p in range(1, min(max_period, n - i) + 1):
+            need = (repeats - 1) * p + max(0, 8 - p)
+            if i + p + need > n:
+                break
+            k = 0
+            while k < need and words[i + k] == words[i + k + p]:
+                k += 1
+            if k == need:
+                return i, p
+    return None
+
+
 def trim_loop(text: str, repeats: int = 3) -> tuple[str, bool]:
-    """Cut a repetition loop: keep the text up to the second occurrence of
-    the first 8-gram that occurs ``repeats``+ times. The original characters
-    (line breaks, hyphens) before the cut are kept as they were."""
+    """Cut a repetition loop (``find_loop``): keep the text up to the start
+    of the loop's second copy. The original characters (line breaks,
+    hyphens) before the cut are kept as they were."""
     matches = list(_SYLLABLE_RE.finditer(text or ""))
-    words = [m.group(0).lower() for m in matches]
-    grams: dict[tuple[str, ...], int] = {}
-    for i in range(len(words) - 7):
-        g = tuple(words[i : i + 8])
-        grams[g] = grams.get(g, 0) + 1
-    seen: set[tuple[str, ...]] = set()
-    for i in range(len(words) - 7):
-        g = tuple(words[i : i + 8])
-        if g in seen and grams[g] >= repeats:
-            return text[: matches[i].start()].rstrip(), True
-        seen.add(g)
-    return text, False
+    loop = find_loop([m.group(0).lower() for m in matches], repeats)
+    if loop is None:
+        return text, False
+    start, period = loop
+    return text[: matches[start + period].start()].rstrip(), True
+
+
+def has_loop(text: str, repeats: int = _REPEAT_8GRAM) -> bool:
+    return find_loop([w.lower() for w in _SYLLABLE_RE.findall(text or "")], repeats) is not None
 
 
 def _loop_criteria(tokenizer, every: int = 24):
@@ -510,7 +532,9 @@ def _loop_criteria(tokenizer, every: int = 24):
                 return done
             for i, row in enumerate(input_ids):
                 text = tokenizer.decode(row, skip_special_tokens=True)
-                if qn_text_quality(text)["rep8"] >= _REPEAT_8GRAM:
+                # back-to-back copies only: a phrase the page itself repeats
+                # must not end the generation (see find_loop)
+                if has_loop(text):
                     done[i] = True
             return done
 

@@ -155,3 +155,42 @@ def test_dedupe_adjacent_repeats_removes_loop_copies_only():
     assert n == 1 and text == "Đầu trang. " + s + " Câu cuối."
     far = s + " Một đoạn khác khá dài ở giữa trang có hơn mười hai chữ để tách hai lần lặp này ra xa nhau. " + s
     assert dedupe_adjacent_repeats(far) == (far, 0)
+
+
+# Dẫn Đàng Nhân Đức Phần 1, PDF 65 as printed: the book's own phrase "nhân
+# đức ở siêng năng nắn thờ phượng Đức Chúa Trời" five times, other text in
+# between. The old 8-gram count cut this page after ~100 of ~235 syllables.
+_PDF65 = (
+    "Chúa Trời thì cũng bay đến cùng Đức Chúa Trời, vì có làm một hai việc lành, song le bay một hai "
+    "khi và hèn bay, vì yếu sức cùng làm biếng việc lành, còn kẻ đã được nhân đức ở siêng năng nắn "
+    "thờ phượng Đức Chúa Trời thì năng bay đến cùng Đức Chúa Trời và bay mạnh, vì năng nắn làm "
+    "việc lành, và lại bay cao, vì khi làm việc lành thì đã có ý kính mến và đẹp lòng Cha Cả hết "
+    "lòng hết sức. Ấy vậy, nhân đức ở siêng năng nắn thờ phượng Đức Chúa Trời là nhân đức làm "
+    "cho ta ở siêng năng nắn làm những việc lành và có ý làm vì mến Đức Chúa Trời, cho nên nhân "
+    "đức kính mến Đức Chúa Trời làm cho ta giữ mười sự răn cách thường thường vậy. Song le, "
+    "nhân đức ở siêng năng nắn thờ phượng Đức Chúa Trời thì làm cho ta ở siêng năng nắn giữ mười "
+    "sự răn cho lọn. Bởi đấy cho nên, kẻ chẳng có giữ mười sự răn thì chẳng được kể là kẻ lành, "
+    "cùng kẻ ở siêng năng nắn thờ phượng Đức Chúa Trời đâu. Vì chưng, ai muốn cho được nên kẻ "
+    "lành thì phải có nhân đức kính mến Đức Chúa Trời, cùng muốn cho được nên kẻ ở siêng năng "
+    "nắn thờ phượng Đức Chúa Trời, thì phải ở"
+)
+
+
+def test_trim_loop_keeps_a_phrase_the_page_repeats():
+    from hannom.ocr.local_vintern import _REPEAT_8GRAM, has_loop, trim_loop
+
+    assert qn_text_quality(_PDF65)["rep8"] >= _REPEAT_8GRAM  # what used to trigger the cut
+    assert trim_loop(_PDF65) == (_PDF65, False)
+    assert not has_loop(_PDF65)  # the generation stopper lets it finish
+
+
+def test_trim_loop_still_cuts_a_loop_after_repeated_phrases():
+    from hannom.ocr.local_vintern import has_loop, trim_loop
+
+    cycle = " nhân đức ở siêng năng nắn thờ phượng Đức Chúa Trời,"
+    text, cut = trim_loop(_PDF65 + cycle * 4)
+    assert cut and text == (_PDF65 + cycle).rstrip()
+    assert has_loop(_PDF65 + cycle * 4) and not has_loop(_PDF65 + cycle * 3)
+    # a short period needs an 8-gram written 3 times too
+    assert trim_loop("Lạy Chúa" + " lắm" * 10) == ("Lạy Chúa lắm", True)
+    assert trim_loop("Thánh, Thánh, Thánh, Chúa là Đức Chúa Trời các cơ binh.")[1] is False

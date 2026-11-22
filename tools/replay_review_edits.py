@@ -61,7 +61,12 @@ def main() -> int:
             "warn_rules": __import__("hannom.textdiff", fromlist=["x"]).warn_rules_from_config(project.alignment_config),
             "suggest_rules": __import__("hannom.textdiff", fromlist=["x"]).suggest_rules_from_config(
                 project.alignment_config, book.book_id),
+            "name_blocks": __import__("hannom.textdiff", fromlist=["x"]).name_blocks_from_config(
+                project.alignment_config, book.book_id),
         }
+        context["name_spellings"] = __import__("hannom.textdiff", fromlist=["x"]).name_spellings_from_config(
+            project.alignment_config, book.book_id, ((r.ch_txt, r.vi_txt) for r in rows),
+            lexicon=context["lexicon"], dictionary=context["dictionary"], readings_cache=context["readings_cache"])
     except Exception:  # noqa: BLE001
         context = {}
 
