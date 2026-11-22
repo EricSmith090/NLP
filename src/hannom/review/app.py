@@ -314,33 +314,99 @@ def _read_labels(path: Path) -> dict:
         return {}
 
 
+def _dictionary_cfg(project) -> dict:
+    return (project.dictionary_config or {}).get("dictionary", project.dictionary_config or {}) or {}
+
+
+def _stamp(paths) -> tuple:
+    return tuple((str(p), p.stat().st_mtime_ns if p.exists() else 0) for p in paths)
+
+
+def _dictionary_stamp(project) -> tuple:
+    """The dictionary files the shared adapters are read from (a new or
+    changed file, or a dictionary.yaml edit, reloads them)."""
+    root, cfg = project.root, _dictionary_cfg(project)
+    return _stamp([root / "configs" / "dictionary.yaml", root / str(cfg.get("entries_dir", "dictionaries/entries"))]
+                  + [root / str(cfg[k]) for k in ("unihan_dir", "cedict_path", "makemeahanzi_path",
+                                                   "cjkvi_ids_path", "cjkvi_variants_path") if cfg.get(k)])
+
+
+def _resource_stamp(project, book) -> tuple:
+    """What one book's diff resources were built from: its lexicon (a
+    re-align rewrites it), the readings cache, the configs, the dictionaries."""
+    return _dictionary_stamp(project) + _stamp((
+        project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json",
+        project.data_dir / "dictionary" / "char_readings.json",
+        project.root / "configs" / "alignment.yaml",
+    ))
+
+
+@st.cache_resource(max_entries=1, show_spinner="Đang nạp từ điển (một lần cho cả phiên, khoảng 30–40 giây)…")
+def _shared_dictionary(_project, stamp: tuple) -> tuple[list, list]:
+    """The dictionary adapters (official JSONL drop, Unihan, CC-CEDICT, …),
+    loaded once for every book: about 2.6 GB once read. Built on every save,
+    a fresh index re-read the files and the save took 33-37 s (Tap1,
+    2026-11-22); on loaded adapters it takes 1.5-1.7 s. Only the book lexicon
+    differs between books (``_diff_resources``)."""
+    from hannom.dictionary.index import build_dictionary_index
+
+    index = build_dictionary_index(_project.root, _project.dictionary_config or {}, book_id=None)
+    index.lookup("天", use_cache=False)  # adapters read their files on the first lookup: do it under the spinner
+    return index.adapters, index.configured_sources
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def _diff_resources(_project, book_id: str, stamp: tuple) -> dict:
+    """One book's lexicon, dictionary index (shared adapters + this book's
+    lexicon, as ``build_dictionary_index`` assembles it) and readings cache,
+    kept across reruns. ``name_memo`` holds the per-row name spellings
+    (textdiff.name_spelling_table)."""
+    from hannom.dictionary.book_lexicon import BookLexicon
+    from hannom.dictionary.index import DictionaryIndex
+    from hannom.orchestrator import load_readings_cache
+
+    adapters, configured = _shared_dictionary(_project, _dictionary_stamp(_project))
+    lexicons_dir = _project.root / str(_dictionary_cfg(_project).get("book_lexicons_dir", "data/dictionary/book_lexicons"))
+    return {
+        "lexicon": BookLexicon(_project.data_dir / "dictionary" / "book_lexicons" / f"{book_id}.json"),
+        "dictionary": DictionaryIndex(adapters, BookLexicon(lexicons_dir / f"{book_id}.json"),
+                                      configured_sources=configured),
+        "readings_cache": load_readings_cache(_project),
+        "name_memo": {},
+    }
+
+
 def _recompute_context(project, book) -> dict:
-    """Lexicon / dictionary / readings cache as ``stage_align`` builds them (empty on failure)."""
-    try:
-        from hannom.dictionary.book_lexicon import BookLexicon
-        from hannom.dictionary.index import build_dictionary_index
-        from hannom.orchestrator import load_readings_cache
+    """Lexicon / dictionary / readings cache as ``stage_align`` builds them.
 
-        lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json")
-        dictionary = build_dictionary_index(project.root, project.dictionary_config or {}, book_id=book.book_id)
-        from hannom.textdiff import (
-            name_blocks_from_config, name_spellings_from_config, suggest_rules_from_config, warn_rules_from_config,
-        )
+    Raises on failure (shown by Streamlit; the callers have not written
+    anything yet): an empty context would recolour the edited row without
+    any dictionary and save that."""
+    import inspect
 
-        ctx = {"lexicon": lexicon, "dictionary": dictionary, "readings_cache": load_readings_cache(project),
-               "warn_rules": warn_rules_from_config(project.alignment_config),
-               "suggest_rules": suggest_rules_from_config(project.alignment_config, book.book_id),
-               "name_blocks": name_blocks_from_config(project.alignment_config, book.book_id)}
-        csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
-        if ctx["name_blocks"] and csv_path.exists():
-            # Same whole-book spelling table as `align` / `textdiff`, so an
-            # edited row gets the colouring a full recompute would give it.
-            ctx["name_spellings"] = name_spellings_from_config(
-                project.alignment_config, book.book_id, ((r.ch_txt, r.vi_txt) for r in read_alignment_csv(csv_path)),
-                lexicon=lexicon, dictionary=dictionary, readings_cache=ctx["readings_cache"])
-        return ctx
-    except Exception:  # noqa: BLE001
-        return {}
+    from hannom import textdiff
+    from hannom.textdiff import (
+        name_blocks_from_config, name_spellings_from_config, suggest_rules_from_config, warn_rules_from_config,
+    )
+
+    res = _diff_resources(project, book.book_id, _resource_stamp(project, book))
+    ctx = {"lexicon": res["lexicon"], "dictionary": res["dictionary"], "readings_cache": res["readings_cache"],
+           "warn_rules": warn_rules_from_config(project.alignment_config),
+           "suggest_rules": suggest_rules_from_config(project.alignment_config, book.book_id),
+           "name_blocks": name_blocks_from_config(project.alignment_config, book.book_id)}
+    csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+    if ctx["name_blocks"] and csv_path.exists():
+        # Same whole-book spelling table as `align` / `textdiff`, so an
+        # edited row gets the colouring a full recompute would give it.
+        extra = {}
+        # Streamlit reloads this script on change, not hannom.textdiff: an app
+        # started before the memo existed keeps the old signature.
+        if "memo" in inspect.signature(textdiff.name_spelling_table).parameters:
+            extra["memo"] = res["name_memo"]
+        ctx["name_spellings"] = name_spellings_from_config(
+            project.alignment_config, book.book_id, ((r.ch_txt, r.vi_txt) for r in read_alignment_csv(csv_path)),
+            lexicon=ctx["lexicon"], dictionary=ctx["dictionary"], readings_cache=ctx["readings_cache"], **extra)
+    return ctx
 
 
 def main() -> None:

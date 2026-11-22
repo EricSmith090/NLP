@@ -703,6 +703,7 @@ def name_spelling_table(
     readings_cache: Any | None = None,
     warn_rules: Sequence[tuple[str, str]] = (),
     suggest_rules: Sequence[tuple[str, str, str]] = (),
+    memo: dict[tuple[str, str], list[tuple[str, str]]] | None = None,
 ) -> dict[str, Counter]:
     """{name key: Counter of Nôm spellings} over a whole book's rows.
 
@@ -710,12 +711,23 @@ def name_spelling_table(
     syllables (same alignment as the colouring); occurrences with a gap or a
     〓 are not counted. Used to keep a minority spelling of a name (an OCR
     misreading such as 卢樣批 beside 卢搓批 ×3) out of a yellow name block.
+
+    ``memo``: {(nom, vi): spellings of that row}, kept by the caller across
+    calls made with the same readings and rules (the review app rebuilds
+    the table after every edit; only the edited row is aligned again).
     """
     seen: list[tuple[str, str]] = []
     for nom, vi in texts:
         if nom and vi and _NAME_RE.search(nfc(vi)):
+            if memo is not None and (nom, vi) in memo:
+                seen.extend(memo[(nom, vi)])
+                continue
+            got: list[tuple[str, str]] = []
             spec_text_diff(nom, vi, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
-                           warn_rules=warn_rules, suggest_rules=suggest_rules, name_blocks=True, name_collect=seen)
+                           warn_rules=warn_rules, suggest_rules=suggest_rules, name_blocks=True, name_collect=got)
+            if memo is not None:
+                memo[(nom, vi)] = got
+            seen.extend(got)
     table: dict[str, Counter] = {}
     for key, spelling in seen:
         table.setdefault(key, Counter())[spelling] += 1

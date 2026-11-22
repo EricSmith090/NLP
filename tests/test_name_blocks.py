@@ -91,6 +91,23 @@ def test_spelling_table_counts_one_to_one_occurrences_only():
     assert table == {"lu-si-phe": Counter({"卢搓批": 3, "卢樣批": 1}), "li-a": Counter({"離亞": 1})}
 
 
+def test_spelling_table_memo_gives_the_same_table_and_skips_known_rows(monkeypatch):
+    import hannom.textdiff as td
+
+    texts = [("卢搓批", "Lu-si-phe")] * 3 + [("卢樣批", "Lu-xi-phe"), ("離亞", "Li-a")]
+    memo: dict = {}
+    first = name_spelling_table(texts, lexicon=_Lex(), memo=memo)
+    assert first == name_spelling_table(texts, lexicon=_Lex())
+    calls = []
+    real = td.spec_text_diff
+    monkeypatch.setattr(td, "spec_text_diff", lambda *a, **k: calls.append(a) or real(*a, **k))
+    # the review app after an edit: one row changed, the others come from the memo
+    edited = texts[:3] + [("卢搓批", "Lu-xi-phe"), ("離亞", "Li-a")]
+    again = name_spelling_table(edited, lexicon=_Lex(), memo=memo)
+    assert calls == [("卢搓批", "Lu-xi-phe")]
+    assert again == name_spelling_table(edited, lexicon=_Lex())
+
+
 def test_name_key_merges_qn_spelling_variants():
     assert name_key("Lu-xi-phe") == name_key("Lu-si-phe") and name_key("Giu-đa") == name_key("Giu-da")
     assert name_key("Giê-su") != name_key("Giu-se")
