@@ -18,6 +18,8 @@ alignment:
       segmentation: charalign
       # Margin running-head boxes printed on Nôm pages (title of the book).
       strip_texts: ["所𥚇卷"]
+      # Yellow for the differing chars of transliterated names; see Tap1.
+      text_diff_name_blocks: true
     T1_CamPhong_Tap1:
       segmentation: charalign
       # Table of contents: QN PDF 15–20 (↔ Nôm PDF 263, 273–269). Instructor
@@ -26,6 +28,17 @@ alignment:
       # means nothing). Rows end after each page number, never at ":"
       # (hannom.charstream.toc_sentence_spans).
       toc_qn_pages: [15, 16, 17, 18, 19, 20]
+      # Transliterated names (hannom.textdiff.spec_text_diff, name_blocks):
+      # inside a hyphenated QN name a char the dictionaries do not read as its
+      # syllable is yellow, not red; matching chars stay black. TA, asked about
+      # 秋 <-> "su" in Giê-su ("tên riêng phiên âm có cùng số chữ nhưng từ điển
+      # không ghi âm"): "Bạn đánh vàng nhé". Never over 〓, a char without any
+      # reading, a pending suggestion, a duplicated / missing char, or a
+      # minority spelling of the name in the book (OCR misreading). reviewed 1
+      # only for TA rule pairs. Turned on 2026-11-22 for SLQ and Tap1 (the books
+      # in review); copies of the live data: 0 decisions lost (textdiff, align),
+      # Tap1 96.324 -> 96.406 %, SLQ unchanged (every row decided).
+      text_diff_name_blocks: true
       # Quy định v2.4 "chữ Nôm nghi ngờ bị nhận dạng sai nhưng có gợi ý thay thế
       # (bảng chữ giống hình)": the Kim Hán Nôm API reads these glyphs of this
       # book's typeface as a similar-looking wrong char (raw API output, not the

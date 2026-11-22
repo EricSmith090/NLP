@@ -184,18 +184,28 @@ def apply_patches_checked(
         if q is not p and q.sentence_id == p.sentence_id and q.field == p.field
         and p.field in ("ch_txt", "vi_txt") and q.before == p.after and str(q.timestamp) > str(p.timestamp)
     }
+    def mark_edited(row: AlignmentRow) -> None:
+        # Human content already in the CSV is still human content: the
+        # automatic text_diff recomputation must not overwrite it.
+        if "CONTENT_EDITED" not in row.flags:
+            row.flags.append("CONTENT_EDITED")
+
     for patch in patches:
-        if patch.field in ("ch_txt", "vi_txt") and patch.after and any(
-            patch.after in _current(r, patch.field) and patch.before not in _current(r, patch.field)
-            for r in rows if not patch.img_id or r.img_id == patch.img_id
-        ):
-            continue  # the edited text is already in place (re-segmented row / replayed edit)
+        if patch.field in ("ch_txt", "vi_txt") and patch.after:
+            in_place = [r for r in rows if (not patch.img_id or r.img_id == patch.img_id)
+                        and patch.after in _current(r, patch.field) and patch.before not in _current(r, patch.field)]
+            if in_place:
+                for r in in_place:
+                    mark_edited(r)
+                continue  # the edited text is already in place (re-segmented row / replayed edit)
         if patch.row_hash:
             cands = [r for r in index.get(patch.row_hash, []) if not patch.img_id or r.img_id == patch.img_id]
             if not cands and patch.after_hash:
                 done = [r for r in index.get(patch.after_hash, [])
                         if (not patch.img_id or r.img_id == patch.img_id) and _current(r, patch.field) == patch.after]
                 if done:
+                    for r in done:
+                        mark_edited(r)
                     continue  # already applied (persisted to the CSV)
             if not cands:
                 rejected.append(RejectedPatch(patch, "stale: no row has the content this patch was made against"))
@@ -214,6 +224,7 @@ def apply_patches_checked(
                 continue
         current = _current(row, patch.field)
         if current == patch.after:
+            mark_edited(row)
             continue
         if current != patch.before:
             rejected.append(RejectedPatch(patch, f"stale: {patch.field} changed since the patch was made"))

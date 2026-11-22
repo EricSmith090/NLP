@@ -209,6 +209,45 @@ def _apply_suggestions(project, book, csv_path: Path, label_dir: Path, patch_pat
     return done, skipped
 
 
+def _review_everywhere(project, book, csv_path: Path, patch_path: Path, nom_text: str, vi_text: str,
+                       reviewer: str) -> tuple[int, int]:
+    """Set reviewed 1 on every yellow element of the book with exactly this
+    Nôm and QN text (e.g. one transliterated name block). Rows carrying a
+    review decision are left alone (changing their text_diff would void the
+    decision); returns (elements reviewed, decided rows skipped)."""
+    import copy as _copy
+
+    raw = read_alignment_csv(csv_path)
+    meta_rows, _ = load_rows_with_metadata(csv_path)
+    from hannom.review_decisions import parse_decisions as _parse_decisions
+
+    decided = {d.sentence_id for d in _parse_decisions(decision_path(project.data_dir, book.book_id))[0]}
+    for r, m in zip(raw, meta_rows):
+        r.flags, r.confidence = list(m.flags), m.confidence
+    n_done = n_skipped = 0
+    patches = []
+    for row in raw:
+        hits = [k for k, el in enumerate(row.text_diff or [])
+                if el.type == "warn" and not el.suggest and el.reviewed != 1
+                and el.nom_sub_text == nom_text and el.vi_sub_text == vi_text]
+        if not hits:
+            continue
+        if row.sentence_id in decided:
+            n_skipped += 1
+            continue
+        snapshot = _copy.deepcopy(row)
+        for k in hits:
+            accept_warn(row, k)
+        patches.append(make_patch(snapshot, book_id=book.book_id, field="text_diff", after=row.text_diff_json(),
+                                  reviewer=reviewer, reason=f"duyệt vàng hàng loạt: {nom_text} ↔ {vi_text}"))
+        n_done += len(hits)
+    if patches:
+        atomic_save_csv(csv_path, raw)
+        for p in patches:
+            append_patch(patch_path, p)
+    return n_done, n_skipped
+
+
 def _suggest_grid(project, book, rows, pairs, ch_labels, vi_labels, csv_path, label_dir, patch_path) -> None:
     """All pending suggestions of one kind as a grid of print crops: the
     reviewer looks at every glyph, unticks the wrong ones, applies the page."""
@@ -284,11 +323,22 @@ def _recompute_context(project, book) -> dict:
 
         lexicon = BookLexicon(project.data_dir / "dictionary" / "book_lexicons" / f"{book.book_id}.json")
         dictionary = build_dictionary_index(project.root, project.dictionary_config or {}, book_id=book.book_id)
-        from hannom.textdiff import suggest_rules_from_config, warn_rules_from_config
+        from hannom.textdiff import (
+            name_blocks_from_config, name_spellings_from_config, suggest_rules_from_config, warn_rules_from_config,
+        )
 
-        return {"lexicon": lexicon, "dictionary": dictionary, "readings_cache": load_readings_cache(project),
-                "warn_rules": warn_rules_from_config(project.alignment_config),
-                "suggest_rules": suggest_rules_from_config(project.alignment_config, book.book_id)}
+        ctx = {"lexicon": lexicon, "dictionary": dictionary, "readings_cache": load_readings_cache(project),
+               "warn_rules": warn_rules_from_config(project.alignment_config),
+               "suggest_rules": suggest_rules_from_config(project.alignment_config, book.book_id),
+               "name_blocks": name_blocks_from_config(project.alignment_config, book.book_id)}
+        csv_path = project.data_dir / "align" / book.book_id / f"{book.book_name}.csv"
+        if ctx["name_blocks"] and csv_path.exists():
+            # Same whole-book spelling table as `align` / `textdiff`, so an
+            # edited row gets the colouring a full recompute would give it.
+            ctx["name_spellings"] = name_spellings_from_config(
+                project.alignment_config, book.book_id, ((r.ch_txt, r.vi_txt) for r in read_alignment_csv(csv_path)),
+                lexicon=lexicon, dictionary=dictionary, readings_cache=ctx["readings_cache"])
+        return ctx
     except Exception:  # noqa: BLE001
         return {}
 
@@ -617,6 +667,19 @@ def main() -> None:
         )
         if c2.button("Duyệt", key=f"w{k}") and _persist(mutate=lambda r, k=k: accept_warn(r, k)):
             st.rerun()
+        same = sum(1 for r in rows for e in (r.text_diff or [])
+                   if e.type == "warn" and not e.suggest and e.reviewed != 1
+                   and e.nom_sub_text == el.nom_sub_text and e.vi_sub_text == el.vi_sub_text)
+        if same > 1 and c3.button(f"Duyệt cả {same} lần", key=f"wa{k}",
+                                  help="Mọi phần tử vàng chưa duyệt có CÙNG chữ Nôm và CÙNG chữ Quốc ngữ trong sách"):
+            if not reviewer.strip():
+                st.error("Cần nhập người review.")
+            else:
+                n_done, n_skip = _review_everywhere(project, book, csv_path, patch_path, el.nom_sub_text,
+                                                    el.vi_sub_text, reviewer.strip())
+                st.session_state.flash = (f"Đã duyệt {n_done} phần tử “{el.nom_sub_text} ↔ {el.vi_sub_text}”."
+                                          + (f" Bỏ qua {n_skip} câu đã có quyết định." if n_skip else ""))
+                st.rerun()
         if el.suggest:
             if c3.button("Nhận gợi ý", key=f"s{k}") and _persist(edit_ch=suggest_edit_text(row, k)):
                 st.rerun()

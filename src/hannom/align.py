@@ -28,8 +28,8 @@ from .models import AlignmentRow, DiffElement
 from .review_metadata import write_review_metadata
 from .t1_map import Pair
 from .textdiff import (
-    auto_text_diff, spec_text_diff, suggest_rules_from_config, validate_text_diff, variant_fold_from_config,
-    warn_rules_from_config,
+    auto_text_diff, name_blocks_from_config, spec_text_diff, suggest_rules_from_config, validate_text_diff,
+    variant_fold_from_config, warn_rules_from_config,
 )
 
 QN_SENTENCE_SPLIT_RE = re.compile(
@@ -72,6 +72,7 @@ class AlignConfig:
     text_diff_warn_rules: tuple[tuple[str, str], ...] = ()
     # Book-scoped OCR suggestion table (set by align_book from per_book).
     text_diff_suggest_rules: tuple[tuple[str, str, str], ...] = ()
+    text_diff_name_blocks: bool = False
     expected_syllables_per_nom_char: float = 1.0
     max_group: int = 4
     max_nm_group: int = 2
@@ -761,6 +762,17 @@ def _emit_rows(
     rows: list[AlignmentRow] = []
     counters: dict[str, int] = {}
     threshold = minimum_confidence if minimum_confidence is not None else config.low_confidence_threshold
+    name_spellings = None
+    if config.text_diff_name_blocks and config.text_diff_policy != "legacy":
+        # Whole-book name spelling table, from the very rows about to be emitted.
+        from .textdiff import name_spelling_table
+
+        name_spellings = name_spelling_table(
+            ((nfc("".join(s.text for s in nom_segments[g[0]:g[1]])),
+              nfc(" ".join(s.text for s in qn_segments[g[2]:g[3]]).strip())) for g in groups),
+            lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+            warn_rules=config.text_diff_warn_rules, suggest_rules=config.text_diff_suggest_rules,
+        )
     for (i0, i1, j0, j1, cost, kind, a, b) in groups:
         nom_group = list(nom_segments[i0:i1])
         qn_group = list(qn_segments[j0:j1])
@@ -866,6 +878,8 @@ def _emit_rows(
                     ch_txt, vi_txt, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
                     warn_rules=config.text_diff_warn_rules,
                     suggest_rules=config.text_diff_suggest_rules,
+                    name_blocks=config.text_diff_name_blocks,
+                    name_spellings=name_spellings,
                 )
             text_diff = diff.elements
             flags.extend(diff.flags)
@@ -907,7 +921,8 @@ def align_book(
 ) -> tuple[list[AlignmentRow], list[str]]:
     cfg = _as_config(config)
     per_book = cfg.per_book.get(book_id, {}) if isinstance(cfg.per_book, dict) else {}
-    cfg = replace(cfg, text_diff_suggest_rules=suggest_rules_from_config(config, book_id))
+    cfg = replace(cfg, text_diff_suggest_rules=suggest_rules_from_config(config, book_id),
+                  text_diff_name_blocks=name_blocks_from_config(config, book_id))
     segmentation = str(per_book.get("segmentation") or cfg.segmentation or "cosegment")
     strip_texts = tuple(per_book.get("strip_texts") or cfg.strip_texts or ())
     toc_qn_pages = tuple(int(p) for p in (per_book.get("toc_qn_pages") or ()))

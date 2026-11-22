@@ -563,8 +563,8 @@ def recompute_text_diff(
     book_id: str | None = None,
 ) -> list[AlignmentRow]:
     from .textdiff import (
-        auto_text_diff, spec_text_diff, suggest_rules_from_config, validate_text_diff, variant_fold_from_config,
-        warn_rules_from_config,
+        auto_text_diff, name_blocks_from_config, name_spellings_from_config, spec_text_diff,
+        suggest_rules_from_config, validate_text_diff, variant_fold_from_config, warn_rules_from_config,
     )
 
     single_fold = variant_fold_from_config(alignment_config)
@@ -572,6 +572,14 @@ def recompute_text_diff(
     policy = str(_cfg.get("text_diff_policy", "spec"))
     warn_rules = warn_rules_from_config(alignment_config)
     suggest_rules = suggest_rules_from_config(alignment_config, book_id)
+    name_blocks = name_blocks_from_config(alignment_config, book_id)
+    rows = list(rows)
+    # Spelling table over every row of the book (decided ones included:
+    # they are evidence of how a name is written).
+    name_spellings = name_spellings_from_config(
+        alignment_config, book_id, ((r.ch_txt, r.vi_txt) for r in rows),
+        lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
+    ) if policy != "legacy" else None
     out: list[AlignmentRow] = []
     for row in rows:
         if getattr(row, "review_status", None) is not None or "CONTENT_EDITED" in row.flags:
@@ -583,7 +591,8 @@ def recompute_text_diff(
                 from .review.edit import recompute_row_diff
 
                 recompute_row_diff(row, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
-                                   warn_rules=warn_rules, suggest_rules=suggest_rules)
+                                   warn_rules=warn_rules, suggest_rules=suggest_rules, name_blocks=name_blocks,
+                                   name_spellings=name_spellings)
                 row.flags = [f for f in row.flags if f != "TEXT_DIFF_STALE"]
             out.append(row)
             continue
@@ -624,6 +633,8 @@ def recompute_text_diff(
                 row.ch_txt, row.vi_txt, lexicon=lexicon, dictionary=dictionary, readings_cache=readings_cache,
                 warn_rules=warn_rules,
                 suggest_rules=suggest_rules,
+                name_blocks=name_blocks,
+                name_spellings=name_spellings,
             )
         row.text_diff = diff.elements
         row.flags = sorted(
@@ -695,7 +706,8 @@ def compute_alignment(
     accepted one. Returns (rows, summary without sync_errors, pairs).
     """
     from .resegment import (
-        overlay_label_text, pin_reviewed_rows, pinned_indices, previous_rows_for_pinning, toc_nom_images,
+        overlay_label_text, pin_reviewed_rows, pinned_indices, previous_rows_for_pinning, release_toc_pins,
+        toc_nom_images,
     )
 
     pairs = _load_pairs(project, book, state)
@@ -753,8 +765,7 @@ def compute_alignment(
     if reseg and previous_rows is not None:
         pinned = pinned_indices(previous_rows)
         toc_images = toc_nom_images(project.alignment_config, book.book_id, pairs)
-        released = [previous_rows[k].sentence_id for k in pinned if previous_rows[k].img_id in toc_images]
-        pinned = [k for k in pinned if previous_rows[k].img_id not in toc_images]
+        pinned, released = release_toc_pins(previous_rows, rows, pinned, toc_images)
         rows, pin_report = pin_reviewed_rows(previous_rows, rows, pinned)
         reseg_summary.update(pin_report)
         reseg_summary["pins_released_on_toc_pages"] = released

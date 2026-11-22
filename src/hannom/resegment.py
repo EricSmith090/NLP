@@ -158,14 +158,48 @@ def previous_rows_for_pinning(csv_path: Path, decisions, decision_issues, failur
     return rows
 
 
+def same_cut_rows(previous: Sequence[AlignmentRow], new: Sequence[AlignmentRow]) -> set[int]:
+    """Indices of ``previous`` rows whose exact span (start and end in both
+    streams, whitespace-insensitive) is also one row of ``new``. Spans, not
+    texts: a repeated sentence elsewhere never counts as the same cut."""
+    def spans(rows: Sequence[AlignmentRow]) -> list[tuple[int, int, int, int]]:
+        out, n, q = [], 0, 0
+        for r in rows:
+            n2, q2 = n + len(norm_nom(r.ch_txt)), q + len(norm_vi(r.vi_txt))
+            out.append((n, q, n2, q2))
+            n, q = n2, q2
+        return out
+
+    new_spans = set(spans(new))
+    return {k for k, s in enumerate(spans(previous)) if s in new_spans}
+
+
+def release_toc_pins(
+    previous: Sequence[AlignmentRow], new: Sequence[AlignmentRow], pinned: Iterable[int], toc_images: set[str]
+) -> tuple[list[int], list[str]]:
+    """(pins kept, sentence_ids released) for rows on TOC pages.
+
+    A reviewed TOC row is released only where the TOC rule now cuts its text
+    differently (e.g. 263.5 once the missing page numbers 33/48 were typed:
+    one merged row becomes three entries). Where the new cut yields the very
+    same row it stays pinned with its colouring, so a later colouring change
+    (name blocks, new rules) cannot void its decision (269.2, 2026-11-22).
+    """
+    pinned = list(pinned)
+    same = same_cut_rows(previous, new) if toc_images else set()
+    kept = [k for k in pinned if previous[k].img_id not in toc_images or k in same]
+    kept_set = set(kept)
+    released = [previous[k].sentence_id for k in pinned if k not in kept_set]
+    return kept, released
+
+
 def toc_nom_images(alignment_config: dict[str, Any] | None, book_id: str, pairs: Sequence[Any]) -> set[str]:
     """Nôm images paired with the book's QN table-of-contents pages
     (``alignment.per_book.<book>.toc_qn_pages``).
 
-    Rows there are cut by the TOC rule (instructor, 2026-11-21) and are not
-    pinned: reviews made before the rule existed judged rows the rule
-    replaces. A decision whose row comes out of the new cut unchanged still
-    verifies (by sentence_id, or relocated by content).
+    Rows there are cut by the TOC rule (instructor, 2026-11-21); a reviewed
+    row is unpinned where the rule cuts differently (``release_toc_pins``):
+    reviews made before the rule existed judged rows the rule replaces.
     """
     raw = alignment_config or {}
     cfg = raw.get("alignment", raw) or {}
