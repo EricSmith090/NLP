@@ -208,10 +208,21 @@ def recompute_row_diff(
     from ..orchestrator import _rederivable_text_diff_flag
     from ..textdiff import spec_text_diff
 
+    from collections import Counter
+
     kept = {
         (e.nom_pos, e.vi_pos, e.nom_sub_text, e.vi_sub_text)
         for e in (row.text_diff or []) if e.type == "warn" and e.reviewed == 1
     }
+    # Reviewer yellows ("→ Vàng", no suggestion) follow their content, not their
+    # position: an edit elsewhere in the row (an accepted suggestion, a QN fix)
+    # can shift positions or recolour the pair red, and the click was lost
+    # (Tap2 539.8, 2026-11-21). The same Nôm text <-> the same QN text is kept
+    # yellow and reviewed; once the char or syllable itself changes it is not.
+    manual = Counter(
+        (e.nom_sub_text, e.vi_sub_text)
+        for e in (row.text_diff or []) if e.type == "warn" and e.reviewed == 1 and not e.suggest
+    )
     if "NON_ONE_TO_ONE" in row.flags or not row.ch_txt or not row.vi_txt:
         row.text_diff = None
     else:
@@ -223,11 +234,16 @@ def recompute_row_diff(
             | set(diff.flags) | {f"REVIEW:{r}" for r in diff.review_reasons}
         )
         if row.text_diff:
-            row.text_diff = [
-                dataclasses.replace(e, reviewed=1)
-                if e.type == "warn" and (e.nom_pos, e.vi_pos, e.nom_sub_text, e.vi_sub_text) in kept else e
-                for e in row.text_diff
-            ]
+            out = []
+            for e in row.text_diff:
+                key = (e.nom_sub_text, e.vi_sub_text)
+                if e.type in ("warn", "error") and not e.suggest and manual[key] > 0:
+                    manual[key] -= 1
+                    e = dataclasses.replace(e, type="warn", reviewed=1)
+                elif e.type == "warn" and (e.nom_pos, e.vi_pos, e.nom_sub_text, e.vi_sub_text) in kept:
+                    e = dataclasses.replace(e, reviewed=1)
+                out.append(e)
+            row.text_diff = out
     if mark_edited and "CONTENT_EDITED" not in row.flags:
         row.flags = sorted(set(row.flags) | {"CONTENT_EDITED"})
     return row

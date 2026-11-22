@@ -355,6 +355,44 @@ def test_mark_as_warn_and_text_diff_patch_survives_realignment():
     assert not rejected and out[0].text_diff[0].type == "warn" and out[0].text_diff[0].reviewed == 1
 
 
+class _NameLex:
+    """Readings for the manual-yellow tests (Tap2 539.8: 臯 has no reading "ti")."""
+    READ = {"安": ["an"], "臯": ["cao"], "烏": ["ô"], "姑": ["cô"], "死": ["tử"], "𣩂": ["chết"], "皐": ["cao"]}
+
+    def readings(self, ch):
+        return self.READ.get(ch, [])
+
+
+def _yellow_ti(row):
+    from hannom.review.edit import mark_as_warn
+
+    k = next(i for i, e in enumerate(row.text_diff) if e.nom_sub_text == "臯")
+    mark_as_warn(row, k)
+    assert row.text_diff[k].type == "warn" and row.text_diff[k].reviewed == 1
+
+
+def test_manual_yellow_survives_an_edit_elsewhere_in_the_row():
+    # Tap2 539.8 (2026-11-21): the reviewer turned 臯 <-> ti yellow, then accepted
+    # a suggestion on another char; the recompute dropped the yellow and 臯 <-> ti
+    # had to be clicked again.
+    row = AlignmentRow("c.jpg", "c.1", "安臯烏姑死", "An-ti-ô-cô chết.")
+    recompute_row_diff(row, lexicon=_NameLex())
+    _yellow_ti(row)
+    row.ch_txt = "安臯烏姑𣩂"  # another char changes (an accepted suggestion)
+    recompute_row_diff(row, lexicon=_NameLex())
+    ti = [e for e in row.text_diff if e.nom_sub_text == "臯"]
+    assert [(e.type, e.vi_sub_text, e.reviewed) for e in ti] == [("warn", "ti", 1)]
+
+
+def test_manual_yellow_is_dropped_when_its_own_char_changes():
+    row = AlignmentRow("c.jpg", "c.1", "安臯烏姑死", "An-ti-ô-cô chết.")
+    recompute_row_diff(row, lexicon=_NameLex())
+    _yellow_ti(row)
+    row.ch_txt = "安皐烏姑死"  # the yellow char itself was edited: review it again
+    recompute_row_diff(row, lexicon=_NameLex())
+    assert [(e.type, e.nom_sub_text) for e in row.text_diff if e.vi_sub_text == "ti"] == [("error", "皐")]
+
+
 def test_superseded_and_in_place_patches_are_not_reported_stale():
     from hannom.models import AlignmentRow
     from hannom.review.patches import ReviewPatch, apply_patches_checked

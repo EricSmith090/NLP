@@ -80,6 +80,17 @@ alignment:
       # PDF 351, 392) that face other syllables. Origin codes facing là/một were
       # 1:1 (U+F047C 718, U+F070B 87).
       text_diff_suggest_rules: *camphong_suggest_rules
+      # Yellow for the differing chars of transliterated names; see Tap1.
+      # Turned on 2026-11-22 (khoa/name-warn-rules) in place of the 6 name pairs
+      # this branch had added to text_diff_warn_rules: those were chosen from the
+      # Hán-Việt reading, not checked on the images, and as reviewed-1 rules
+      # they bypassed the spelling-table guard (基 <-> ki is yellow in the
+      # Êu-ta-ki-ô spellings where Êu itself has 3 different OCR chars).
+      # Simulated on the live Tap2 CSV (read-only): red Nôm chars 4589 -> 4513,
+      # unreviewed yellow 4 -> 116 (to confirm with "Duyệt cả N lần"), 94 rows
+      # recoloured, 5 of them decided (539.3/539.8/538.6 臯 ti, 539.4 林 lem,
+      # 537.3 樞 Giu: yellow, now unreviewed), none turned red.
+      text_diff_name_blocks: true
     T1_DanDangNhanDuc_Phan1:
       segmentation: charalign
       # QN TOC PDF 13-26 (↔ Nôm 目錄 PDF 444-431): title + page number per row,
@@ -103,18 +114,9 @@ alignment:
   text_diff_warn_rules:
     - {nom: "秋", qn: "su", note: "支秋 = Giê-su (trợ giảng, 2026-11-20)"}
     - {nom: "衣", qn: "ê", note: "衣 = Ê trong tên riêng, vd. Ê-li-siêu (trợ giảng, 2026-11-20)"}
-    # Name pairs found by the option-A scan (2026-11-21): QN token capitalised
-    # with >= 2 hyphen-joined syllables = transliterated name; red 1 Nôm char
-    # <-> 1 syllable inside it, same pair in every occurrence, and the Hán-Việt
-    # reading close to the syllable (dictionary gap, not an OCR misread).
-    # Report: data/diagnostics/name_pairs/T1_CamPhong_Tap2.md. Pairs whose
-    # reading does not fit (e.g. 枚 "mai" <-> câu) wait for an image check.
-    - {nom: "移", qn: "rê", note: "I-ghê-rê-gia (移 di), Tập 2 ×21"}
-    - {nom: "樞", qn: "giu", note: "Giu-se, Giu-da, Giu-bi-lêu… (樞 xu), Tập 2 ×7"}
-    - {nom: "基", qn: "ki", note: "Êu-ta-ki-ô (基 cơ), Tập 2 ×5"}
-    - {nom: "姑", qn: "gô", note: "Li-gô-ri-ô (姑 cô), Tập 2 ×3"}
-    - {nom: "林", qn: "lem", note: "Giê-ru-gia-lem (林 lâm), Tập 2 ×2"}
-    - {nom: "林", qn: "len", note: "Giê-ru-gia-len (林 lâm; sách in cả -lem và -len), Tập 2 ×2"}
+    # Pairs a reviewer turned yellow on the image ("→ Vàng") where the name
+    # blocks keep a char red can be added here with tools/harvest_name_rules.py
+    # (it lists them with the rows they would change); only image-checked pairs.
   # Length ratio is a weak but cheap prior for phonetic translation.
   expected_syllables_per_nom_char: 1.0
   max_group: 4
