@@ -96,6 +96,14 @@ def main() -> int:
     diag = project.data_dir / "diagnostics"
     tool_src = ensure_tool(diag / "ocr-nom-align")
     books = [b for b in project.books if not args.book or b.book_id in args.book]
+    if not args.book:
+        # Default run: a configured book that has not been aligned yet is
+        # skipped, not fatal (a book named with --book still must exist).
+        aligned = [b for b in books if (project.data_dir / "align" / b.book_id / f"{b.book_name}.csv").exists()]
+        for b in books:
+            if b not in aligned:
+                print(f"{b.book_id}: not aligned yet, skipped")
+        books = aligned
     report = {}
     ok_all = True
     for book in books:

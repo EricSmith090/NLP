@@ -235,11 +235,12 @@ def build_marker_map(
             continue
         used_ch.add(ch_no)
         if page.page_no in overrides:
-            # The Nôm leaf sits out of printed order in the PDF: the pair
-            # follows the printed numbers (book config marker_overrides).
+            # The formula does not hold for this page (a Nôm leaf out of
+            # printed order, Tap1; blank leaves inserted in the scan, Dẫn Đàng
+            # Phần 1): the pair follows the printed numbers (marker_overrides).
             pairs.append(
                 Pair(ch=(nom_page.image_name,), vi=(page.image_name,),
-                     note=(f"Nôm PDF {ch_no} nằm sai thứ tự trong bản scan; ghép theo số trang in "
+                     note=(f"ghép theo số trang in: Nôm PDF {ch_no} "
                            f"(marker_overrides, thay cho {offset} − vi PDF = {offset - page.page_no})"),
                      confidence=1.0, source="printed_marker_override", status="verified")
             )

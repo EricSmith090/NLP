@@ -36,8 +36,8 @@ screenshots:
 
 method_notes:
   - "Pipeline cục bộ: trích ảnh gốc, phân loại trang, OCR, PPOCRLabel, làm sạch, căn hàng, text_diff, đánh giá và đóng gói."
-  - "923/950 ảnh được sao chép nguyên byte từ JPEG nhúng; 27 ảnh xoay được chuyển hướng lossless ở độ phân giải gốc (không upscale)."
-  - "Hai file <Book>_updated.pdf (Tập 1 và Tập 2; Sách 3 không cần) đã tạo bằng tools/build_updated_pdf.py từ ảnh trích xuất: ảnh nhúng nguyên byte, một ảnh/trang, số trang giữ nguyên (282/550, trang xoay: 263+274 / 287+295+296+305+310+335+339+345+349+364+386+388+392+398+405+406+414+416+419+426+438+444+447+452+459+461+479+499+505+515+525; trong đó 388, 398, 406, 438, 444, 479 là 6 trang Nôm bị scan ngược 180° mà PDF không đánh dấu, được xoay khi trích ảnh và OCR lại ở hướng đúng). HÀNH ĐỘNG CẦN LÀM TRƯỚC KHI NỘP: thông báo cho người giao sách về hai file _updated.pdf và danh sách trang xoay."
+  - "1385/1412 ảnh được sao chép nguyên byte từ JPEG nhúng; 27 ảnh xoay được chuyển hướng lossless ở độ phân giải gốc (không upscale)."
+  - "Hai file <Book>_updated.pdf (Tập 1 và Tập 2; Sửa Lưới Quyền và Dẫn Đàng Nhân Đức không cần) đã tạo bằng tools/build_updated_pdf.py từ ảnh trích xuất: ảnh nhúng nguyên byte, một ảnh/trang, số trang giữ nguyên (282/550, trang xoay: 263+274 / 287+295+296+305+310+335+339+345+349+364+386+388+392+398+405+406+414+416+419+426+438+444+447+452+459+461+479+499+505+515+525; trong đó 388, 398, 406, 438, 444, 479 là 6 trang Nôm bị scan ngược 180° mà PDF không đánh dấu, được xoay khi trích ảnh và OCR lại ở hướng đúng). HÀNH ĐỘNG CẦN LÀM TRƯỚC KHI NỘP: thông báo cho người giao sách về hai file _updated.pdf và danh sách trang xoay."
   - "OCR chữ Nôm: Kim Hán Nôm API (một tài khoản, có sổ theo dõi quota); OCR Quốc ngữ: Vintern-1B-v3.5 chạy cục bộ trên GPU (một box toàn trang), có đọc lại theo hai nửa trang chồng lấn khi kết quả ngắn hoặc lặp."
   - "text_diff theo Quy định v2.4, cùng ngữ nghĩa với công cụ chấm ocr-nom-align v0.2.0: so âm đọc sau khi bỏ 5 dấu thanh; chữ 〓 và chữ không có âm đọc trong mọi từ điển được bàn giao bị tô đỏ; âm tiết Quốc ngữ thừa bị tô đỏ; đoạn có chứa số được tô vàng (reviewed = 0 cho đến khi được duyệt)."
   - "Label.txt và CSV dùng chung một văn bản đã làm sạch (kiểm tra SYNC theo chuẩn của công cụ chấm trước khi đóng gói); không có hàng chỉ có một vế."
@@ -47,11 +47,13 @@ yellow_reasons:
   T1_CamPhong_Tap1: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
   T1_CamPhong_Tap2: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
   T1_SuaLoiQuyen: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
+  T1_DanDangNhanDuc_Phan1: "Chưa có yellow được xác nhận. Nếu có, ghi rõ trường hợp đặc biệt và lý do sau review."
 
 book_notes:
   T1_CamPhong_Tap1: "Biên Nôm đã kiểm tra trực quan: p147-276; p146 trống, p277 bắt đầu mục lục QN. 282 ảnh, tất cả 800x1135. _updated.pdf đã tạo (282 trang; xoay: p263, p274)."
   T1_CamPhong_Tap2: "Biên Nôm đã kiểm tra trực quan: p277-540; p541 bắt đầu mục lục QN. 550 ảnh: 525 ảnh 800x1135 và 25 bản scan xoay gốc 564x800 đã chuyển hướng lossless. _updated.pdf đã tạo (550 trang; 25 trang xoay)."
   T1_SuaLoiQuyen: "Biên Nôm đã kiểm tra trực quan: p67-116; p117-118 là mục lục QN. p61 trống và không vào vi/. 118 ảnh 800x1135."
+  T1_DanDangNhanDuc_Phan1: "Biên Nôm đã kiểm tra trực quan: p231-446; p427-428 là hai trang trắng chèn giữa khối Nôm (không vào ch/); Quốc ngữ p11-224; p447-461 là MỤC LỤC CHUNG chỉ có Quốc ngữ (thư mục toc/). Ghép trang theo số trang in: Nôm PDF = 455 − vi PDF (vi p29-224), 457 − vi PDF (vi p11-28), 214 cặp. 462 ảnh 800x1135, sao chép nguyên byte, không trang xoay."
 
 citations:
   - "Quy_định_đồ_án_v2.1.pdf — quy định đồ án (nguồn chuẩn)."

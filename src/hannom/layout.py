@@ -264,6 +264,33 @@ def _longest_nom_run(
     return best[1], best[2]
 
 
+def extend_run_to_hints(
+    run: tuple[int, int],
+    nom_start_hint: int,
+    nom_end_hint: int,
+    page_count: int,
+) -> tuple[tuple[int, int], list[int]]:
+    """Grow the image-evidence Nôm run (0-based, inclusive) to the configured hints.
+
+    The first PDF page of a T1 Nôm block is the last page of the text and can
+    hold only a few columns, too little ink for ``nom_likely`` (Dẫn Đàng Phần 1
+    PDF 231: 6 column peaks, column_std 0.059). The hints are read off the page
+    images when a book is configured. They only extend a run they overlap or
+    touch, never shrink it or bridge a gap. Returns the run and the added page
+    numbers (1-based).
+    """
+    start, end = run
+    if not (nom_start_hint and nom_end_hint):
+        return run, []
+    lo, hi = nom_start_hint - 1, nom_end_hint - 1
+    if lo > end + 1 or hi < start - 1:
+        return run, []
+    new_start = min(start, max(0, lo))
+    new_end = max(end, min(page_count - 1, hi))
+    added = [i + 1 for i in range(new_start, new_end + 1) if not start <= i <= end]
+    return (new_start, new_end), added
+
+
 def classify_book(
     project: ProjectConfig,
     book: BookConfig,
@@ -293,6 +320,11 @@ def classify_book(
             )
         run = (book.nom_start_hint - 1, book.nom_end_hint - 1)
         run_source = "config_hint_fallback"
+        hint_pages: list[int] = []
+    else:
+        run, hint_pages = extend_run_to_hints(run, book.nom_start_hint, book.nom_end_hint, len(pages))
+        if hint_pages:
+            run_source = "image_evidence+config_hint"
 
     start_idx, end_idx = run
     nom_pages = set(range(start_idx + 1, end_idx + 2))
@@ -310,6 +342,8 @@ def classify_book(
             section, folder, script = "blank", "blank", "blank"
         elif page.page_no in nom_pages:
             section, folder, script = "nom", "ch", "nom"
+            if page.page_no in hint_pages:
+                flags.append("NOM_BY_CONFIG_HINT")
             if page.page_no == book.nom_start_hint:
                 flags.append("NOM_BLOCK_START")
             if page.page_no == book.nom_end_hint:
@@ -378,6 +412,7 @@ def classify_book(
         "page_count": len(pages),
         "nom_run": [start_idx + 1, end_idx + 1],
         "nom_run_source": run_source,
+        "nom_pages_by_config_hint": hint_pages,
         "counts": _counts(pages),
         "features": {str(p.page_no): p.features for p in pages},
         "thresholds": {

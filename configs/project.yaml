@@ -18,6 +18,7 @@ books:
   - "configs/books/T1_CamPhong_Tap1.yaml"
   - "configs/books/T1_CamPhong_Tap2.yaml"
   - "configs/books/T1_SuaLoiQuyen.yaml"
+  - "configs/books/T1_DanDangNhanDuc_Phan1.yaml"
 
 api:
   base_url: "https://kimhannom.fit.hcmus.edu.vn"

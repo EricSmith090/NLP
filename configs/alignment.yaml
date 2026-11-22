@@ -80,6 +80,23 @@ alignment:
       # PDF 351, 392) that face other syllables. Origin codes facing là/một were
       # 1:1 (U+F047C 718, U+F070B 87).
       text_diff_suggest_rules: *camphong_suggest_rules
+    T1_DanDangNhanDuc_Phan1:
+      segmentation: charalign
+      # QN TOC PDF 13-26 (↔ Nôm 目錄 PDF 444-431): title + page number per row,
+      # as in Tap1 (instructor 2026-11-21).
+      toc_qn_pages: [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+      # Yellow for the differing chars of transliterated names; see Tap1.
+      text_diff_name_blocks: true
+      # Same typeface as Cấm Phòng, same Kim Hán Nôm confusions; checked
+      # 2026-11-22 on 10 random crops per glyph/code across PDF 238–432
+      # (2 chars of context, box from the API column split evenly): 吧 10/10,
+      # 𪡔 10/10, 𢖕 10/10 (one crop cut through 婪), 𦉼/没/羕 10/10 each; 嚉
+      # 3/10 = 𡂳, 7 real 嚉 (吶嚉 nói dối, 嚉詐 dối trá) that face "dối" and
+      # match. Facing syllables of the red OCR chars in a trial charalign run
+      # (1392 rows): 𠯇–và 364/364, 髀–ra 211/211, 楼–sau 113/113, 嚉–rồi 5/7;
+      # origin codes facing là/một were 1:1 (U+F047C 327 + 2 "la", U+F070B 74
+      # + 1 "mốt"). U+F07EF also faces "dưỡng" ×3, not in the rules (stays red).
+      text_diff_suggest_rules: *camphong_suggest_rules
   # Reading conventions for transliterated names agreed with the teaching
   # assistant (2026-11-20): a one-char/one-syllable red element matching a rule
   # becomes yellow (warn, reviewed: 1). Multi-token runs stay red.
