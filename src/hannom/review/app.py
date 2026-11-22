@@ -348,10 +348,19 @@ def _shared_dictionary(_project, stamp: tuple) -> tuple[list, list]:
     a fresh index re-read the files and the save took 33-37 s (Tap1,
     2026-11-22); on loaded adapters it takes 1.5-1.7 s. Only the book lexicon
     differs between books (``_diff_resources``)."""
+    import gc
+
     from hannom.dictionary.index import build_dictionary_index
 
     index = build_dictionary_index(_project.root, _project.dictionary_config or {}, book_id=None)
     index.lookup("天", use_cache=False)  # adapters read their files on the first lookup: do it under the spinner
+    # Streamlit runs gc.collect(2) after every script run (runner.postScriptGC):
+    # over the ~5.1 M objects of the loaded dictionaries that is ~0.9 s per
+    # click on an idle machine and far more when RAM is short (py-spy on the
+    # live app, 2026-11-22: 54 of 65 s CPU in _on_script_finished). Frozen
+    # objects are skipped by the collector; they live as long as this cache.
+    gc.collect()
+    gc.freeze()
     return index.adapters, index.configured_sources
 
 
