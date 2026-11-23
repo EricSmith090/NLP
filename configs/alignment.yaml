@@ -56,6 +56,7 @@ alignment:
         - {ocr: "嚉", suggest: "𡂳", qn: "rồi", note: "in ⿰口磊; API trả ⿰口對 (10/10 mẫu)"}
         - {ocr: "楼", suggest: "𢖕", qn: "sau", note: "in ⿰後娄 (không phải 𢖖 ⿰娄後 như SLQ)"}
         - {ocr: "楼", suggest: "婪", qn: "lam", note: "in ⿱林女"}
+        - {ocr: "梦", suggest: "婪", qn: "lam", note: "in ⿱林女; API cũng trả 梦 ⿱林夕 (Tap2 536.1: 貪梦 = tham lam, 3 câu). Chưa kiểm 10 mẫu như trên: mỗi ô duyệt bằng ảnh cắt trong lưới (2026-11-23)"}
         # 〓 written for a Kim Hán Nôm private-use code whose glyph IS encoded
         # (v2.4: 〓 only for chars not in Unicode / not in any font). Facing
         # syllable ↔ origin code was 1:1 in this book (là: U+F047C 371/371,

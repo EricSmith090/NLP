@@ -393,6 +393,48 @@ def test_manual_yellow_is_dropped_when_its_own_char_changes():
     assert [(e.type, e.nom_sub_text) for e in row.text_diff if e.vi_sub_text == "ti"] == [("error", "皐")]
 
 
+def _tap2_5398():
+    """Tap2 539.8 (2026-11-21): yellow click, suggestion accepted (〓 -> 𦉼), yellow click again."""
+    import copy
+
+    from hannom.review.edit import mark_as_warn
+    from hannom.review.patches import make_patch
+
+    err = DiffElement(((3, 4),), "臯", ((11, 13),), "ti", "error")
+    sug = DiffElement(((7, 8),), "〓", ((24, 26),), "là", "warn", reviewed=0, suggest="𦉼", suggest_by="similar")
+    row = AlignmentRow("B.539.jpg", "B.539.8", "丕𤤰安臯烏姑𣩂〓", "Vậy vua An-ti-ô-cô chết là", [err, sug])
+    snap = copy.deepcopy(row)
+    mark_as_warn(row, 0)
+    p1 = make_patch(snap, book_id="B", field="text_diff", after=row.text_diff_json(), reviewer="r")
+    p_ch = make_patch(row, book_id="B", field="ch_txt", after="丕𤤰安臯烏姑𣩂𦉼", reviewer="r")
+    row.ch_txt, row.text_diff = "丕𤤰安臯烏姑𣩂𦉼", [err]  # the recompute dropped the click
+    snap2 = copy.deepcopy(row)
+    mark_as_warn(row, 0)
+    p2 = make_patch(snap2, book_id="B", field="text_diff", after=row.text_diff_json(), reviewer="r")
+    return row, p1, p_ch, p2
+
+
+def test_text_diff_patch_superseded_by_a_later_one_is_not_reported_stale():
+    from hannom.review.patches import apply_patches_checked
+
+    row, p1, p_ch, p2 = _tap2_5398()
+    out, rejected = apply_patches_checked([row], [p1, p_ch, p2])
+    assert rejected == []
+    assert [(e.type, e.reviewed) for e in out[0].text_diff] == [("warn", 1)]
+
+
+def test_text_diff_patch_without_a_later_one_is_still_reported_stale():
+    import dataclasses
+
+    from hannom.review.patches import apply_patches_checked
+
+    row, p1, _p_ch, _p2 = _tap2_5398()
+    other = dataclasses.replace(row, sentence_id="B.539.9")  # p1 has no successor for this sentence
+    p1b = dataclasses.replace(p1, sentence_id="B.539.9")
+    _out, rejected = apply_patches_checked([other], [p1b])
+    assert [r.reason for r in rejected] == ["stale: no row has the content this patch was made against"]
+
+
 def test_superseded_and_in_place_patches_are_not_reported_stale():
     from hannom.models import AlignmentRow
     from hannom.review.patches import ReviewPatch, apply_patches_checked

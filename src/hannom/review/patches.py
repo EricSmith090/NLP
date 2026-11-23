@@ -184,6 +184,16 @@ def apply_patches_checked(
         if q is not p and q.sentence_id == p.sentence_id and q.field == p.field
         and p.field in ("ch_txt", "vi_txt") and q.before == p.after and str(q.timestamp) > str(p.timestamp)
     }
+    # A text_diff patch is the row's whole colouring; a later text_diff patch of
+    # the same sentence (later in the append-only log, which is the event
+    # order) replaces it. If a content edit came in between, the earlier one
+    # can no longer find its row: that is expected, not stale (Tap2 539.8,
+    # 2026-11-21: yellow click, suggestion accepted, yellow click again).
+    superseded |= {
+        id(p) for i, p in enumerate(patches)
+        if p.field == "text_diff"
+        and any(q.field == "text_diff" and q.sentence_id == p.sentence_id for q in patches[i + 1:])
+    }
     def mark_edited(row: AlignmentRow) -> None:
         # Human content already in the CSV is still human content: the
         # automatic text_diff recomputation must not overwrite it.
