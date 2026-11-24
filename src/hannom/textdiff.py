@@ -658,14 +658,20 @@ def suggest_rules_from_config(raw_config: Any | None, book_id: str | None) -> tu
     [{ocr: "𠯇", suggest: "吧", qn: "và", note: ...}, ...] -> ((ocr char, tone_key(qn), suggest char), ...).
 
     Book-scoped on purpose: each entry is a confusion of the Nôm OCR on one
-    typeface, verified on that book's scans."""
+    typeface, verified on that book's scans.
+
+    ``text_diff_suggest_rules_extra`` (same entry format) is appended: rules
+    checked on this book only, while ``text_diff_suggest_rules`` may be a
+    table shared by several books of one typeface (a YAML alias)."""
     if not book_id:
         return ()
     raw = raw_config or {}
     cfg = raw.get("alignment", raw) if isinstance(raw, dict) else {}
     per_book = ((cfg or {}).get("per_book") or {}).get(book_id) or {}
     rules = []
-    for item in per_book.get("text_diff_suggest_rules", []) or []:
+    items = [*(per_book.get("text_diff_suggest_rules", []) or []),
+             *(per_book.get("text_diff_suggest_rules_extra", []) or [])]
+    for item in items:
         ocr, sug, qn = (str(item.get(k, "")).strip() for k in ("ocr", "suggest", "qn"))
         if len(ocr) == 1 and len(sug) == 1 and qn and ocr != sug:
             rules.append((nfc(ocr), tone_key(qn), nfc(sug)))

@@ -81,6 +81,27 @@ alignment:
       # PDF 351, 392) that face other syllables. Origin codes facing là/một were
       # 1:1 (U+F047C 718, U+F070B 87).
       text_diff_suggest_rules: *camphong_suggest_rules
+      # Tap2 only: 〓 (Kim Hán Nôm private-use codes) resolved by the reviewer on
+      # print crops (tools/pua_resolve_sheet.py, 2026-11-24): the candidate whose
+      # shape is the printed glyph. Each occurrence is still accepted on its crop.
+      # Left out: U+F0742 đem / U+F0761 đơm, đơn (no candidate matched);
+      # U+F047C facing "ra" ×2 (that code is 𦉼 "là": alignment slip, not a rule);
+      # U+F0284 (picked 𩙋 for gió but 噙 for gầm: one code is one glyph, recheck).
+      text_diff_suggest_rules_extra:
+        - {ocr: "〓", suggest: "𫀅", qn: "xem", note: "U+F03D9 ×129"}
+        - {ocr: "〓", suggest: "𲈫", qn: "cửa", note: "U+F082E ×20, U+F0607 ×10 (same pick)"}
+        - {ocr: "〓", suggest: "涅", qn: "nết", note: "U+F07BA ×19"}
+        - {ocr: "〓", suggest: "涅", qn: "nát", note: "U+F07BA ×6"}
+        - {ocr: "〓", suggest: "𱒢", qn: "ví", note: "U+F0087 ×17 (vì/ví/vị: rules ignore tone marks)"}
+        - {ocr: "〓", suggest: "𱏺", qn: "sách", note: "U+F000B ×14"}
+        - {ocr: "〓", suggest: "𣌋", qn: "sớm", note: "U+F0272 ×13"}
+        - {ocr: "〓", suggest: "滈", qn: "khao", note: "U+F02EB ×9"}
+        - {ocr: "〓", suggest: "𫢩", qn: "nay", note: "U+F0152 ×9"}
+        - {ocr: "〓", suggest: "瘖", qn: "ốm", note: "U+F0887 ×9"}
+        - {ocr: "〓", suggest: "沈", qn: "đắm", note: "U+F01EE ×2"}
+        - {ocr: "〓", suggest: "𱷲", qn: "giê", note: "U+F0482 ×2"}
+        - {ocr: "〓", suggest: "𩈘", qn: "mặt", note: "U+F061A ×2"}
+        - {ocr: "〓", suggest: "𧘇", qn: "ấy", note: "U+F000E ×2"}
       # Yellow for the differing chars of transliterated names; see Tap1.
       # Turned on 2026-11-22 (khoa/name-warn-rules) in place of the 6 name pairs
       # this branch had added to text_diff_warn_rules: those were chosen from the
