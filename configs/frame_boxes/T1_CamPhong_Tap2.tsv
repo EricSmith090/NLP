@@ -219,3 +219,13 @@ T1_Cấm Phòng Cho Bổn Đạo (Tập 2).539.jpg	591	968	613	1006	熙
 T1_Cấm Phòng Cho Bổn Đạo (Tập 2).539.jpg	318	966	593	1002	嘉嘉
 T1_Cấm Phòng Cho Bổn Đạo (Tập 2).540.jpg	630	749	648	894	无
 T1_Cấm Phòng Cho Bổn Đạo (Tập 2).540.jpg	150	977	172	1016	说
+# Added 2026-11-24 (khoa/name-warn-rules): Hán-numeral folio numbers printed beside the frame that the
+# first pass missed (OCR misread them: 口六十九, 二百北八, 口七十一; 一百七十七 glued to a stray 但), found by
+# Hán-numeral boxes lying outside the page's main column block; 486 嘉 = frame ornament at the top margin.
+# 516 checked on the image by the reviewer; the others are 40+ px outside the text block.
+T1_Cấm Phòng Cho Bổn Đạo (Tập 2).394.jpg	116	826	152	945	口六十九
+T1_Cấm Phòng Cho Bổn Đạo (Tập 2).435.jpg	618	741	656	884	二百北八
+T1_Cấm Phòng Cho Bổn Đạo (Tập 2).486.jpg	153	149	168	215	嘉
+T1_Cấm Phòng Cho Bổn Đạo (Tập 2).486.jpg	99	755	142	982	一百七十七但
+T1_Cấm Phòng Cho Bổn Đạo (Tập 2).492.jpg	100	829	137	939	口七十一
+T1_Cấm Phòng Cho Bổn Đạo (Tập 2).516.jpg	165	752	200	919	一百四十七
