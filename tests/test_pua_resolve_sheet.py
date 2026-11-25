@@ -30,6 +30,20 @@ def test_candidates_exact_first_most_used_in_the_book_first():
     assert {c for c, k in out if k == "tone"} == {"兼", "眨"}
 
 
+def test_candidates_look_alikes_of_the_ocr_char_come_first():
+    exact, loose = prs.reverse_readings(_Readings())
+    freq = Counter({"占": 40, "䀡": 3})
+    out = prs.candidates_for("xem", exact, loose, freq, similar=["𥆾", "某"])
+    assert out[0] == ("𥆾", "exact")  # rank 0 look-alike, even though unused in the book
+    assert out[1:3] == [("占", "exact"), ("䀡", "exact")]
+
+
+def test_read_pairs_skips_headers_and_duplicates(tmp_path):
+    p = tmp_path / "note.txt"
+    p.write_text("Nôm; Việt\n\n諫; khiêm\n了;tréo\n了; tréo\n〓; Vì\n參; TÓM\nbad line\n二三; x\n", encoding="utf-8")
+    assert prs.read_pairs(p) == [("諫", "khiêm"), ("了", "tréo"), ("〓", "vì"), ("參", "tóm")]
+
+
 def test_candidates_unknown_syllable_is_empty():
     exact, loose = prs.reverse_readings(_Readings())
     assert prs.candidates_for("qwz", exact, loose, Counter()) == []

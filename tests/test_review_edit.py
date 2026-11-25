@@ -369,6 +369,10 @@ def test_any_red_queue_keeps_reading_order_and_qn_only_red():
     assert review_queue(rows, "any_red") == [0, 2, 4]
     nom_red.review_status = "accepted_difference"
     assert review_queue(rows, "any_red", include_reviewed=False) == [2, 4]
+    # no_red is the complement (minus null/short rows): black and yellow-only rows
+    assert review_queue(rows, "no_red") == [1, 3]
+    black.review_status = "accepted_match"
+    assert review_queue(rows, "no_red", include_reviewed=False) == [3]
 
 
 class _NameLex:

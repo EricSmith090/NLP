@@ -492,10 +492,12 @@ def main() -> None:
         st.sidebar.warning(f"{pending} câu đã lưu sửa nhưng CHƯA chấp nhận — xem hàng đợi \"Đã sửa, chưa chấp nhận\".")
     mode = st.sidebar.selectbox(
         "Hàng đợi",
-        ["red", "any_red", "suggest", "suggest_grid", "undecided", "pending", "manual", "warn", "reviewed", "all"],
+        ["red", "any_red", "no_red", "suggest", "suggest_grid", "undecided", "pending", "manual", "warn", "reviewed",
+         "all"],
         format_func={
             "red": "Mật độ đỏ giảm dần",
             "any_red": "Có đỏ (Nôm hoặc Quốc ngữ) — thứ tự đọc",
+            "no_red": "Không đỏ (0 %) — thứ tự đọc",
             "suggest": "Gợi ý thay chữ Nôm — từng câu",
             "suggest_grid": "Gợi ý thay chữ Nôm — lưới duyệt nhanh",
             "undecided": "Chưa quyết định (mọi câu, kể cả không đỏ)",

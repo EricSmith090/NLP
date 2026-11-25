@@ -365,7 +365,8 @@ def pending_suggests(row: AlignmentRow) -> int:
 
 def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_reviewed: bool = True) -> list[int]:
     """Row indices. mode: red (density desc, plus manual rows), any_red (reading order: any red element,
-    Nôm or QN side, plus manual rows), manual (null/short), warn (unreviewed warns), all."""
+    Nôm or QN side, plus manual rows), no_red (reading order: no red element, not null/short),
+    manual (null/short), warn (unreviewed warns), all."""
     idx = list(range(len(rows)))
     if not include_reviewed:
         idx = [i for i in idx if not is_reviewed(rows[i])]
@@ -379,6 +380,10 @@ def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_review
         return [i for i in idx if any(e.type == "warn" and e.reviewed != 1 for e in (rows[i].text_diff or []))]
     if mode == "suggest":
         return [i for i in range(len(rows)) if pending_suggests(rows[i])]
+    if mode == "no_red":
+        # The complement of any_red: no red element on either side, not a null/short row.
+        return [i for i in idx if not needs_manual(rows[i])
+                and not any(e.type == "error" for e in (rows[i].text_diff or []))]
     if mode == "any_red":
         # Reading order; any red element counts, also one with no Nôm char
         # (∅ <-> extra QN words), which red_density (Nôm chars only) shows as 0 %.
