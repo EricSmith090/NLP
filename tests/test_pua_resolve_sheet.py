@@ -44,6 +44,26 @@ def test_read_pairs_skips_headers_and_duplicates(tmp_path):
     assert prs.read_pairs(p) == [("諫", "khiêm"), ("了", "tréo"), ("〓", "vì"), ("參", "tóm")]
 
 
+def test_no_limit_by_default_and_limits_when_asked():
+    exact = {"xem": {chr(0x4E00 + k) for k in range(30)}}
+    loose = {"xem": set(exact["xem"]) | {chr(0x5000 + k) for k in range(20)}}
+    assert len(prs.candidates_for("xem", exact, loose, Counter())) == 50
+    out = prs.candidates_for("xem", exact, loose, Counter(), limit=24, loose_limit=12)
+    assert [k for _c, k in out].count("exact") == 24 and [k for _c, k in out].count("tone") == 12
+
+
+def test_tonghop3_rows_join_the_candidates(tmp_path):
+    d = tmp_path / "dictionaries-04-11-2026"
+    d.mkdir()
+    (d / "QuocNgu_SinoNom_TongHop3.csv").write_text(
+        '"QuocNgu","SinoNom"\n"xem","𫀅"\n"xém","䁤"\n"xem","𧡊𧡊"\n', encoding="utf-8")
+    th3 = prs.load_tonghop3(tmp_path)
+    assert th3[0]["xem"] == {"𫀅"} and th3[1]["xem"] == {"𫀅", "䁤"}  # multi-char SinoNom skipped
+    exact, loose = prs.merge_reverse(prs.reverse_readings(_Readings()), th3)
+    assert exact["xem"] == {"䀡", "占", "𥆾", "𫀅"}
+    assert "䁤" in loose["xem"] and "䁤" not in exact["xem"]
+
+
 def test_candidates_unknown_syllable_is_empty():
     exact, loose = prs.reverse_readings(_Readings())
     assert prs.candidates_for("qwz", exact, loose, Counter()) == []

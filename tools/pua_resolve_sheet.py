@@ -67,21 +67,51 @@ def reverse_readings(readings) -> tuple[dict[str, set[str]], dict[str, set[str]]
     return exact, loose
 
 
-def candidates_for(syllable: str, exact, loose, freq: Counter, limit: int = 24, loose_limit: int = 12,
-                   similar: list[str] | None = None):
-    """[(char, 'exact'|'tone')] reading as ``syllable``.
-
-    Look-alikes of the OCR char (``similar``, in their rank order) first, then
-    the chars used most in the book."""
+def candidates_for(syllable: str, exact, loose, freq: Counter, limit: int | None = None,
+                   loose_limit: int | None = None, similar: list[str] | None = None):
+    """[(char, 'exact'|'tone')]: every char read as ``syllable`` (tone marks
+    included), then every char read as it with other tone marks; ``limit`` /
+    ``loose_limit`` cut the lists (None: all). Look-alikes of the OCR char
+    (``similar``, in their rank order) first, then the chars used most in the book."""
     rank = {c: k for k, c in enumerate(similar or [])}
 
     def key(c):
         return (rank.get(c, len(rank)), -freq[c], c)
 
     s = norm_reading(syllable)
-    first = sorted(exact.get(s, set()), key=key)[:limit]
-    rest = sorted(loose.get(tone_key(s), set()) - set(first) - exact.get(s, set()), key=key)
-    return [(c, "exact") for c in first] + [(c, "tone") for c in rest[:loose_limit]]
+    first = sorted(exact.get(s, set()), key=key)
+    rest = sorted(loose.get(tone_key(s), set()) - exact.get(s, set()), key=key)
+    return [(c, "exact") for c in first[:limit]] + [(c, "tone") for c in rest[:loose_limit]]
+
+
+def merge_reverse(base: tuple[dict, dict], extra: tuple[dict, dict]) -> tuple[dict, dict]:
+    """Union of two (reading -> chars, tone key -> chars) maps."""
+    out = []
+    for a, b in zip(base, extra):
+        m: dict[str, set[str]] = defaultdict(set)
+        for table in (a, b):
+            for k, v in table.items():
+                m[k] |= set(v)
+        out.append(m)
+    return out[0], out[1]
+
+
+def load_tonghop3(root: Path) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """(reading -> chars, tone key -> chars) from the instructor's QuocNgu_SinoNom_TongHop3.csv
+    ("QuocNgu","SinoNom" rows; single-char SinoNom only)."""
+    exact: dict[str, set[str]] = defaultdict(set)
+    loose: dict[str, set[str]] = defaultdict(set)
+    path = root / "dictionaries-04-11-2026" / "QuocNgu_SinoNom_TongHop3.csv"
+    if not path.exists():
+        return exact, loose
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            qn = norm_reading(unicodedata.normalize("NFC", row.get("QuocNgu") or ""))
+            ch = unicodedata.normalize("NFC", (row.get("SinoNom") or "").strip())
+            if qn and len(ch) == 1:
+                exact[qn].add(ch)
+                loose[tone_key(qn)].add(ch)
+    return exact, loose
 
 
 def read_pairs(path: Path) -> list[tuple[str, str]]:
@@ -203,7 +233,9 @@ def main() -> int:
     readings = load_readings_cache(project)
     if readings is None:
         raise SystemExit("readings cache unavailable")
-    exact, loose = reverse_readings(readings)
+    base = reverse_readings(readings)
+    th3 = load_tonghop3(project.root)
+    exact, loose = merge_reverse(base, th3)
     similar = load_similar(project.root)
     freq = Counter(ch for r in rows for ch in (r.ch_txt or ""))
     out = data / "diagnostics" / "pua_resolve" / book.book_id
@@ -233,14 +265,26 @@ def main() -> int:
                               f"{short_id(rows[i].sentence_id)}<br><span class='ctx'>…{html.escape(ctx)}…</span>"
                               f"</figcaption></figure>")
         sims = similar.get(ocr, []) if ocr != PLACEHOLDER else []
-        cand_html = []
+        s_norm, s_key = norm_reading(syl), tone_key(norm_reading(syl))
+        shown, more = [], []
+        n_exact = n_tone = 0
         for c, cls in candidates_for(syl, exact, loose, freq, similar=sims):
-            reads = ", ".join(sorted(readings.of(c)))[:60]
-            badge = " · <b>giống hình</b>" if c in sims else ""
-            cand_html.append(
-                f"<label class='cand {cls}'><input type='radio' name='g{g}' value='{html.escape(c)}'>"
-                f"<span class='glyph'>{html.escape(c)}</span><span class='meta'>U+{ord(c):04X} · ×{freq[c]} trong sách"
-                f"{badge}<br>{html.escape(reads)}</span></label>")
+            in_base = c in base[0].get(s_norm, ()) or c in base[1].get(s_key, ())
+            reads = ", ".join(sorted(readings.of(c)))[:60] or f"TongHop3: {syl}"
+            badge = (" · <b>giống hình</b>" if c in sims else "") + ("" if in_base else " · <b>TongHop3</b>")
+            item = (f"<label class='cand {cls}'><input type='radio' name='g{g}' value='{html.escape(c)}'>"
+                    f"<span class='glyph'>{html.escape(c)}</span><span class='meta'>U+{ord(c):04X} · ×{freq[c]} "
+                    f"trong sách{badge}<br>{html.escape(reads)}</span></label>")
+            if cls == "exact":
+                n_exact += 1
+                (shown if n_exact <= 24 else more).append(item)
+            else:
+                n_tone += 1
+                (shown if n_tone <= 12 else more).append(item)
+        cand_html = shown
+        if more:
+            cand_html.append(f"<details class='more'><summary>Xem thêm {len(more)} chữ</summary>"
+                             f"<div class='cands'>{''.join(more)}</div></details>")
         if ocr != PLACEHOLDER:
             cand_html.append(f"<label class='cand opt'><input type='radio' name='g{g}' value='nochange'>"
                              f"<span class='glyph small'>{html.escape(ocr)}</span><span class='meta'><b>No-change</b>: "
@@ -295,6 +339,7 @@ figure img{height:200px;border:1px solid var(--line);border-radius:6px;backgroun
 .cand:has(input:checked){background:var(--sel);outline:3px solid var(--ok)}
 .glyph{font-family:{{FONTS}};font-size:46px;line-height:1}.glyph.small{font-size:30px}.glyph.inline{font-size:30px}
 .meta{font-size:12px;color:var(--muted)}
+details.more{flex-basis:100%}details.more summary{cursor:pointer;color:var(--ok);margin:4px 0}
 textarea{width:100%;height:90px;font:12px monospace}
 button{font:inherit;padding:6px 12px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
 </style></head><body>
