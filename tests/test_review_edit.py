@@ -355,6 +355,22 @@ def test_mark_as_warn_and_text_diff_patch_survives_realignment():
     assert not rejected and out[0].text_diff[0].type == "warn" and out[0].text_diff[0].reviewed == 1
 
 
+def test_any_red_queue_keeps_reading_order_and_qn_only_red():
+    black = AlignmentRow("i", "a", "天地人日月", "a b c d e", text_diff=[])
+    nom_red = AlignmentRow("i", "b", "天地人日月", "a b c d e", text_diff=[
+        DiffElement(((0, 1),), "天", ((0, 1),), "a", "error")])
+    qn_only = AlignmentRow("i", "c", "天地人日月", "a b c d e x y", text_diff=[
+        DiffElement((), "", ((10, 13),), "x y", "error")])  # extra QN words: 0 % Nôm red
+    yellow = AlignmentRow("i", "d", "天地人日月", "a b c d e", text_diff=[
+        DiffElement(((0, 1),), "天", ((0, 1),), "a", "warn", reviewed=0)])
+    short = AlignmentRow("i", "e", "天地", "a b", text_diff=[])
+    rows = [nom_red, black, qn_only, yellow, short]
+    assert red_density(qn_only) == 0.0 and review_queue(rows, "red") == [0, 4]  # the QN-only row is missed there
+    assert review_queue(rows, "any_red") == [0, 2, 4]
+    nom_red.review_status = "accepted_difference"
+    assert review_queue(rows, "any_red", include_reviewed=False) == [2, 4]
+
+
 class _NameLex:
     """Readings for the manual-yellow tests (Tap2 539.8: 臯 has no reading "ti")."""
     READ = {"安": ["an"], "臯": ["cao"], "烏": ["ô"], "姑": ["cô"], "死": ["tử"], "𣩂": ["chết"], "皐": ["cao"]}

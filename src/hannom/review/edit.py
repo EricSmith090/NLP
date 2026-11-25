@@ -364,7 +364,8 @@ def pending_suggests(row: AlignmentRow) -> int:
 
 
 def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_reviewed: bool = True) -> list[int]:
-    """Row indices. mode: red (density desc, plus manual rows), manual (null/short), warn (unreviewed warns), all."""
+    """Row indices. mode: red (density desc, plus manual rows), any_red (reading order: any red element,
+    Nôm or QN side, plus manual rows), manual (null/short), warn (unreviewed warns), all."""
     idx = list(range(len(rows)))
     if not include_reviewed:
         idx = [i for i in idx if not is_reviewed(rows[i])]
@@ -378,6 +379,10 @@ def review_queue(rows: Sequence[AlignmentRow], mode: str = "red", include_review
         return [i for i in idx if any(e.type == "warn" and e.reviewed != 1 for e in (rows[i].text_diff or []))]
     if mode == "suggest":
         return [i for i in range(len(rows)) if pending_suggests(rows[i])]
+    if mode == "any_red":
+        # Reading order; any red element counts, also one with no Nôm char
+        # (∅ <-> extra QN words), which red_density (Nôm chars only) shows as 0 %.
+        return [i for i in idx if needs_manual(rows[i]) or any(e.type == "error" for e in (rows[i].text_diff or []))]
     if mode == "red":
         idx = [i for i in idx if red_density(rows[i]) > 0 or needs_manual(rows[i])]
         return sorted(idx, key=lambda i: (-red_density(rows[i]), i))
