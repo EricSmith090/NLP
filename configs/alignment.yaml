@@ -102,6 +102,83 @@ alignment:
         - {ocr: "〓", suggest: "𱷲", qn: "giê", note: "U+F0482 ×2"}
         - {ocr: "〓", suggest: "𩈘", qn: "mặt", note: "U+F061A ×2"}
         - {ocr: "〓", suggest: "𧘇", qn: "ấy", note: "U+F000E ×2"}
+        # Red pairs the reviewer noted (data/review/note_tap2.txt), real char picked on print crops
+        # (tools/pua_resolve_sheet.py --pairs, 2026-11-26). Not added: "nochange" (攔 trằn, 偃 gìn,
+        # 諫 khiêm, 閒 nhành, 𤑟 rúa, 戞 chát, 潯 dầm, 萬 và), "none" (了 treo, 疇 tĩu, 喂 sởn, 盆 ích),
+        # pick = OCR char (何 hờ, 禮 trễ), 梦 lam (shared rule).
+        - {ocr: "唅", suggest: "吟", qn: "ngắm"}
+        - {ocr: "諱", suggest: "喡", qn: "và"}
+        - {ocr: "搂", suggest: "𢖕", qn: "sau"}
+        - {ocr: "群", suggest: "𤈠", qn: "sốt"}
+        - {ocr: "愧", suggest: "𢤫", qn: "gở"}
+        - {ocr: "闕", suggest: "閉", qn: "bấy"}
+        - {ocr: "核", suggest: "㤥", qn: "hãi"}
+        - {ocr: "謐", suggest: "𬓐", qn: "trễ"}
+        - {ocr: "憫", suggest: "𢠯", qn: "lắng"}
+        - {ocr: "暊", suggest: "𠹚", qn: "van"}
+        - {ocr: "㛪", suggest: "𡢼", qn: "vợ"}
+        - {ocr: "權", suggest: "𣔥", qn: "chanh"}
+        - {ocr: "𫽄", suggest: "極", qn: "cực"}
+        - {ocr: "纏", suggest: "𦇒", qn: "rối"}
+        - {ocr: "聰", suggest: "嚕", qn: "rủa"}
+        - {ocr: "種", suggest: "𢝆", qn: "chuộng"}
+        - {ocr: "反", suggest: "歹", qn: "ngặt"}
+        - {ocr: "唉", suggest: "咳", qn: "cay"}
+        - {ocr: "共", suggest: "戈", qn: "qua"}
+        - {ocr: "𡭧", suggest: "𠽆", qn: "nuốt"}
+        - {ocr: "很", suggest: "哏", qn: "cắn"}
+        - {ocr: "拸", suggest: "哆", qn: "đe"}
+        - {ocr: "洳", suggest: "泑", qn: "ao"}
+        - {ocr: "價", suggest: "𡦫", qn: "chắt"}
+        - {ocr: "𬦳", suggest: "跩", qn: "dậy"}
+        - {ocr: "瘠", suggest: "瘖", qn: "ốm"}
+        - {ocr: "阻", suggest: "咀", qn: "thở"}
+        - {ocr: "答", suggest: "苓", qn: "lành"}
+        - {ocr: "麻", suggest: "𣇞", qn: "giờ"}
+        - {ocr: "牌", suggest: "啤", qn: "tỳ"}
+        - {ocr: "抒", suggest: "汿", qn: "dơ"}
+        - {ocr: "頭", suggest: "朗", qn: "láng"}
+        - {ocr: "英", suggest: "芇", qn: "nào"}
+        - {ocr: "印", suggest: "泖", qn: "máu"}
+        - {ocr: "数", suggest: "𫯍", qn: "đứa"}
+        - {ocr: "魄", suggest: "𤽶", qn: "vía"}
+        - {ocr: "思", suggest: "芯", qn: "tăm"}
+        - {ocr: "擛", suggest: "𢴉", qn: "đùa"}
+        - {ocr: "塘", suggest: "𡑪", qn: "cát"}
+        - {ocr: "懲", suggest: "慾", qn: "dục"}
+        - {ocr: "擛", suggest: "𢯒", qn: "bóp"}
+        - {ocr: "圖", suggest: "𠸼", qn: "mời"}
+        - {ocr: "吔", suggest: "吧", qn: "và"}
+        - {ocr: "參", suggest: "糝", qn: "tóm"}
+        - {ocr: "劎", suggest: "劔", qn: "kém"}
+        - {ocr: "錁", suggest: "鏍", qn: "loa"}
+        - {ocr: "車", suggest: "𦲿", qn: "lá"}
+        - {ocr: "𨢄", suggest: "醜", qn: "xấu"}
+        - {ocr: "𡛔", suggest: "𠰁", qn: "gáy"}
+        - {ocr: "兵", suggest: "𧘇", qn: "ấy"}
+        - {ocr: "𠰘", suggest: "𪡔", qn: "ra"}
+        - {ocr: "焒", suggest: "㷔", qn: "diêm"}
+        - {ocr: "炳", suggest: "𤆈", qn: "nảy"}
+        - {ocr: "炪", suggest: "焒", qn: "lửa"}
+        - {ocr: "𫗁", suggest: "𠺙", qn: "thối"}
+        - {ocr: "𩂟", suggest: "𩆪", qn: "mịt"}
+        - {ocr: "捐", suggest: "損", qn: "tổn"}
+        - {ocr: "吝", suggest: "各", qn: "các"}
+        - {ocr: "𢬗", suggest: "𣑳", qn: "trồi"}
+        - {ocr: "笙", suggest: "性", qn: "xinh"}
+        - {ocr: "厚", suggest: "虖", qn: "hố"}
+        - {ocr: "惠", suggest: "患", qn: "hoạn"}
+        - {ocr: "哩", suggest: "㖏", qn: "nạt"}
+        - {ocr: "洲", suggest: "𣳢", qn: "nguội"}
+        - {ocr: "悶", suggest: "閒", qn: "nhàn"}
+        - {ocr: "㤕", suggest: "𢢄", qn: "ngùng"}
+        - {ocr: "乳", suggest: "𠃷", qn: "út"}
+        - {ocr: "權", suggest: "穊", qn: "cấy"}
+        - {ocr: "稽", suggest: "穞", qn: "lúa"}
+        - {ocr: "波", suggest: "𣳡", qn: "mồ"}
+        - {ocr: "潤", suggest: "濧", qn: "đuối"}
+        - {ocr: "饒", suggest: "曉", qn: "hiểu"}
+        - {ocr: "娄", suggest: "𪧘", qn: "cũ"}
       # Yellow for the differing chars of transliterated names; see Tap1.
       # Turned on 2026-11-22 (khoa/name-warn-rules) in place of the 6 name pairs
       # this branch had added to text_diff_warn_rules: those were chosen from the
